@@ -36,8 +36,22 @@ these two files in sync. Owner perspective is flipped between them.
 
 | Item | Status | Notes |
 |---|---|---|
-| Combined release announcement (bootloader v0.8.4 + toolkit v0.2.0 including PVE subpackage) | ⏳ Not drafted | Ship as one coordinated press release; two repos, three RPM subpackages. |
-| Cross-linked release notes | ⏳ Not drafted | Each repo's CHANGELOG references the other. |
+| lamboot-tools v0.2.0 GitHub release | ✅ **SHIPPED 2026-04-23** | https://github.com/lamco-admin/lamboot-tools/releases/tag/v0.2.0 — four signed assets (lamboot-tools tarball + sig, lamboot-migrate tarball + sig), key `405CB1E36258DA1DA406A852A236DDB84E0EC96E`. Runbook sections §1 through §12 complete. |
+| Dev repo push                       | ✅ **SHIPPED**           | `lamco-admin/lamboot-tools-dev` main @ `0da76d3`, tag `v0.2.0` @ `c073097`. |
+| Public repo population + tag        | ✅ **SHIPPED**           | `lamco-admin/lamboot-tools` main @ `db76d27`, tag `v0.2.0` @ `6a1663d`. Populated from empty-placeholder by modified export-to-public.sh (fix committed post-tag: `f3a3459`). |
+| Combined release announcement (bootloader v0.8.4 + toolkit v0.2.0 including PVE subpackage) | 🟡 **OWNED BY lamco-admin** | Draft at `docs/ANNOUNCEMENTS/v0.2.0.md` with `2026-XX-XX` date placeholder. Blog/social/email distribution is RELEASE.md §14 scope — lamco-admin pipelines. |
+| Cross-linked release notes          | 🟡 **OWNED BY lamco-admin** | CHANGELOG already references the other repo; formal press-release-style cross-linking is lamco-admin scope. |
+| Fedora Copr publishing               | 🟡 **OWNED BY lamco-admin** | RELEASE.md §13. Two Copr projects per R22: `lamco/lamboot-tools` (core + lamboot-migrate subpackage + lamboot-toolkit-pve subpackage from a single build) and `lamco/lamboot-migrate` (standalone, same source tree, `lamboot-migrate-standalone.spec`). Configs in `packaging/copr/*.yml` are current as of this release; corrected R22 stale reference in `0da76d3`. Needs founder Copr account + API token or web-UI webhook configuration — no credentials in this session. |
+| RPM Fusion submission (main)         | 🟡 **OWNED BY lamco-admin** | Per RELEASE.md §4 follow-up. Package review bug + Koji builds. |
+| Debian RFS (standalone migrate)      | 🟡 **OWNED BY lamco-admin** | Per RELEASE.md §5. |
+| AUR update                           | 🟡 **OWNED BY lamco-admin** | Per RELEASE.md §6. |
+| Flathub update                       | 🟡 **OWNED BY lamco-admin** | Deferred — PR #7810 AI-Slop-labeled per CLAUDE.md governance. |
+
+**Handover to lamco-admin:** The dev-repo-scoped release work (§1–§12 of
+`docs/RELEASE.md`) is complete. Remaining §13 (Copr) and §14 (announcement)
+are tracked at `~/lamco-admin/pipelines/lamboot-tools/WORKFLOW.md`.
+A post-release handover document is at
+`docs/STATUS-2026-04-23-POST-RELEASE-HANDOVER.md`.
 
 ---
 

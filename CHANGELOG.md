@@ -12,7 +12,24 @@ Versioning: hybrid model per `SPEC-LAMBOOT-TOOLKIT-V1.md` §8 — unified
 
 ---
 
-## [0.2.0] — UNRELEASED (rehearsal-verified 2026-04-22; release date pending founder approval)
+## [0.2.0] — 2026-04-23
+
+**Released.** Public at
+https://github.com/lamco-admin/lamboot-tools/releases/tag/v0.2.0
+Signed with lamco-admin release key
+`405CB1E36258DA1DA406A852A236DDB84E0EC96E` (Greg Lamberson).
+
+Coordinated with lamboot-dev v0.8.4 (fw_cfg file-reference hookscript
+rewrite — SHIPPED 2026-04-23T04:39Z).
+
+**Release artifact SHA256:**
+- `lamboot-tools-0.2.0.tar.gz` → `0d876863a13c5cd4aabd0e557727f4c49dad517d0eb78b85707df0e40d701e6b`
+- `lamboot-migrate-1.0.0.tar.gz` → `600db8bf9f43019d25e9626dbc70ea717a0cbfd73e4d80b3bc442354d97558b2`
+
+**Post-release distribution channels are owned by lamco-admin** and are
+out of dev-repo scope. Tracked at `~/lamco-admin/pipelines/lamboot-tools/`:
+- Copr publishing (RELEASE.md §13) — two Copr projects per R22 dual-packaging
+- Announcement (RELEASE.md §14) — blog, social, downstream email
 
 **First public release.** Nine core tools + two PVE companion tools, all
 sharing one help-registry pattern, one JSON schema v1, and one Makefile.
