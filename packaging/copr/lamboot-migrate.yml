@@ -3,6 +3,10 @@
 # Per R22 of SPEC-LAMBOOT-TOOLKIT-V1.md: lamboot-migrate ships BOTH as
 # a subpackage of lamboot-tools AND as a standalone distro package.
 # This Copr project publishes the standalone form.
+#
+# R22 is dual-PACKAGING (one source tree → two RPMs), not dual-REPO.
+# Both RPMs build from lamco-admin/lamboot-tools; the standalone uses the
+# lamboot-migrate-standalone.spec in packaging/rpm/.
 
 project: lamco/lamboot-migrate
 package: lamboot-migrate
@@ -20,11 +24,12 @@ chroots:
   - centos-stream-10-x86_64
   - rhel-9-x86_64   # if RH-enabled account
 
-# Source fetched from the dedicated lamboot-migrate standalone repo
-# (created at v1.0 spin-off per R22)
+# Source fetched from the single lamboot-tools repo; standalone builds
+# consume packaging/rpm/lamboot-migrate-standalone.spec from the same tree.
 source_type: git
-source_url: https://github.com/lamco-admin/lamboot-migrate.git
+source_url: https://github.com/lamco-admin/lamboot-tools.git
 source_build_method: make_srpm
+spec: packaging/rpm/lamboot-migrate-standalone.spec
 
 build_hooks:
   webhook_url: https://copr.fedorainfracloud.org/webhooks/custom-rebuild/lamco/lamboot-migrate/

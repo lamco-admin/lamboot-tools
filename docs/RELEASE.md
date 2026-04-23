@@ -306,26 +306,20 @@ Section numbering kept for document stability; no step-11 action.
 
 ## 12. Standalone lamboot-migrate release
 
-If the standalone repo has been created (v1.0 spin-off moment):
+**R22 is dual-PACKAGING, not dual-REPO.** There is no separate
+`lamco-admin/lamboot-migrate` GitHub repo and there never will be —
+both the subpackage and the standalone form build from the single
+`lamco-admin/lamboot-tools` tree. Delivery channels for the standalone
+tarball + signed sig:
 
-```console
-$ cd ~/lamboot-migrate
-# (extract-and-copy build/standalone-migrate/lamboot-migrate-1.0.0.tar.gz here)
-$ git add -A
-$ git commit -m "release: v1.0.0"
-$ git tag -a v1.0.0 -m "lamboot-migrate 1.0.0 — standalone release"
+1. Attached to the same `gh release` as the core tarball (§10 above
+   uploads all four files — both pairs). Users who only want migrate
+   download from there.
+2. Copr builds the standalone RPM from `packaging/rpm/lamboot-migrate-
+   standalone.spec` (§13 below). `packaging/copr/lamboot-migrate.yml`
+   points at `lamco-admin/lamboot-tools.git` + the standalone spec.
 
-# GATE
-$ git push origin main
-$ git push origin v1.0.0
-$ gh release create v1.0.0 \
-    ~/lamboot-tools-dev/build/standalone-migrate/lamboot-migrate-1.0.0.tar.gz \
-    --title "lamboot-migrate 1.0.0 — standalone release" \
-    --notes-file README.md \
-    --repo lamco-admin/lamboot-migrate
-```
-
-(The standalone repo may not yet exist at v0.2.0 toolkit release — in that case, skip this step; it becomes a v1.0 coordinated release deliverable.)
+No step-12 action: the standalone tarball was already uploaded in §10.
 
 ---
 
