@@ -1,0 +1,41 @@
+# Editor
+*~
+*.swp
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+!build/.gitkeep
+
+# Temporary
+/tmp/
+*.tmp
+*.bak
+
+# Test fixtures (large disk images; managed via git-lfs or download script)
+tests/fixtures/*.raw
+tests/fixtures/*.qcow2
+tests/fixtures/*.img
+
+# Coverage + bats output
+.bats-tmp/
+coverage/
+
+# Mirrored files at release-build time (canonical source in lamboot-dev)
+tools/lamboot-inspect
+tools/lamboot_inspect/
+man/lamboot-inspect.1

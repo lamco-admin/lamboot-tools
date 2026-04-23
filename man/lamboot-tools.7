@@ -1,0 +1,220 @@
+.\" lamboot-tools(7) — suite overview
+.\" Hand-authored; companion to registry-generated (1) pages.
+.TH "LAMBOOT-TOOLS" "7" "2026-04-22" "lamboot-tools 0.2.0" "lamboot-tools"
+.SH NAME
+lamboot-tools \- The Linux UEFI boot toolkit
+.SH DESCRIPTION
+The \fBlamboot-tools\fR suite is a comprehensive CLI toolkit for diagnosing,
+repairing, migrating, and maintaining UEFI boot configurations on Linux
+systems. Built by the authors of LamBoot; works on any Linux system
+regardless of installed bootloader.
+.PP
+The toolkit treats GRUB, systemd-boot, rEFInd, Limine, and LamBoot as
+first-class peers. Diagnostic output classifies bootloaders honestly
+without steering users toward any particular choice.
+.SH TOOLS
+.SS Core tools
+.TP
+.BR lamboot-diagnose (1)
+Generic UEFI boot-chain diagnostic scanner (flagship). 11 check categories,
+~30 checks, unified JSON output with remediation URLs for every
+warning+ finding.
+.TP
+.BR lamboot-esp (1)
+EFI System Partition health check, inventory, and cleanup. Bootloader-
+critical-safe file removal.
+.TP
+.BR lamboot-backup (1)
+UEFI boot configuration snapshot and restore. save / restore / show / list
+subcommands with schema v1 JSON snapshots.
+.TP
+.BR lamboot-repair (1)
+Online + offline boot repair. Six-phase flow (diagnose / plan / show /
+confirm / execute / verify) with risk tiers (safe / moderate / destructive).
+.TP
+.BR lamboot-migrate (1)
+Automated BIOS\(->UEFI migration and cross-bootloader migration.
+10-phase pipeline with top-5+2 failure guardrails, distro-aware
+bootloader recipes, verification suite, rollback support.
+.TP
+.BR lamboot-doctor (1)
+Guided diagnose\(->repair\(->verify wrapper. Single sudo escalation
+per run; policy-matrix-driven decisions. Never auto-invokes
+\fBlamboot-migrate\fR \(em BIOS\(->UEFI conversion is always user-initiated.
+.TP
+.BR lamboot-uki-build (1)
+Host-side Unified Kernel Image builder wrapping ukify/objcopy/sbsign.
+build / inspect / sign / verify subcommands.
+.TP
+.BR lamboot-signing-keys (1)
+Dual-mode Secure Boot key lifecycle tool covering both release-engineering
+and user-facing workflows. Enforces RSA-2048 for MOK-enrolled keys per
+Debian bug #1013320.
+.TP
+.BR lamboot-toolkit (1)
+Suite dispatcher and unified entry point. \fBlamboot-toolkit status\fR
+enumerates installed tools; \fBlamboot-toolkit help\fR routes to per-tool
+help.
+.TP
+.BR lamboot-inspect (1)
+LamBoot-specific deep introspection (Python). Mirrored from the LamBoot
+bootloader's own repository. Surfaces only when LamBoot is installed.
+.SS Proxmox VE companion (\fBlamboot-toolkit-pve\fR package)
+.TP
+.BR lamboot-pve-setup (1)
+Per-VM LamBoot integration setup: fw_cfg args: append, hookscript
+attachment, per-VM JSON at
+.IR /var/lib/lamboot/<VMID>.json .
+.TP
+.BR lamboot-pve-fleet (1)
+Fleet-wide inventory, setup, status, and reporting.
+.TP
+.BR lamboot-pve-monitor (1)
+Host-side NVRAM health reader for LamBoot VMs.
+.TP
+.BR lamboot-pve-ovmf-vars (1)
+OVMF variables builder with cert pre-enrollment for Secure Boot pre-enrolled
+VM templates.
+.SH UNIVERSAL FLAGS
+Every tool accepts the universal flags listed in each per-tool (1) page.
+Key flags:
+.TP
+.B \-\-json
+Emit unified JSON output per the schema in
+.BR lamboot-tools-schema (5).
+.TP
+.B \-\-dry-run
+Preview what would change without executing. Mandatory for every tool
+that mutates state.
+.TP
+.B \-\-suggest-next-command
+Print the recommended follow-up command based on output findings.
+.SH UNIFIED JSON OUTPUT
+Every tool emits a consistent envelope when \fB\-\-json\fR is passed:
+.PP
+.RS 4
+.nf
+{
+  "schema_version": "v1",
+  "tool": "lamboot-diagnose",
+  "version": "0.2.0",
+  "toolkit_version": "0.2.0",
+  "timestamp": "...",
+  "host": "...",
+  "run_id": "...",
+  "exit_code": 0,
+  "summary": {"status": "pass", "findings_total": N, "findings_by_severity": {...}},
+  "findings": [...],
+  "actions_taken": [...],
+  "backup_dir": null
+}
+.fi
+.RE
+.PP
+Each finding has a dotted-path \fBid\fR, \fBcategory\fR, \fBseverity\fR
+(critical/error/warning/info), \fBstatus\fR (pass/warn/fail/skip),
+\fBtitle\fR, \fBmessage\fR, \fBcontext\fR (tool-specific data), and a
+\fBremediation\fR object with \fBsummary\fR, \fBcommand\fR, \fBdoc_url\fR
+for every finding at warning severity or above.
+.SH EXIT CODES
+.TP
+.B 0
+Success / healthy state
+.TP
+.B 1
+Fatal error
+.TP
+.B 2
+Partial \- some operations succeeded, some failed
+.TP
+.B 3
+Nothing to do (already in requested state)
+.TP
+.B 4
+Refused due to a safety check (hybrid MBR, Windows present, etc.)
+.TP
+.B 5
+User declined interactive confirmation
+.TP
+.B 6
+Operation does not apply to this system
+.TP
+.B 7
+Required tool or capability is missing
+.SH FILES
+.TP
+.I /usr/lib/lamboot-tools/lamboot-toolkit-lib.sh
+Shared library with common functions (ESP detection, dry-run wrapper,
+JSON emission, offline mode, backup discipline).
+.TP
+.I /usr/lib/lamboot-tools/lamboot-toolkit-help.sh
+Help registry driver.
+.TP
+.I /var/backups/lamboot-*-<timestamp>/
+Backup directory for any mutating tool run. Each contains MANIFEST.json
+plus per-tool artifacts.
+.TP
+.I /etc/lamboot/fleet.toml
+Shared configuration for PVE companion tools and lamboot-dev's hookscript.
+See
+.BR lamboot-pve-setup (1)
+for schema.
+.TP
+.I /var/lib/lamboot/<VMID>.json
+Per-VM state file written by
+.BR lamboot-pve-setup (1)
+and consumed by the lamboot-hookscript.pl at VM pre-start.
+.SH PRIVILEGE MODEL
+Read-only operations run unprivileged where possible. Tools that mutate
+state require root and refuse with a clean error message if invoked
+without sudo. No tool self-escalates mid-run \(em users always type
+\fBsudo\fR explicitly, except
+.BR lamboot-doctor (1)
+which performs a single sudo re-exec per run via
+\fB\-\-doctor-resume <run_id>\fR.
+.SH OFFLINE MODE
+Every tool except
+.BR lamboot-migrate (1)
+supports \fB\-\-offline\fR \fIDISK\fR, which auto-detects raw vs qcow2
+format, sets up loopback or qemu-nbd, and mounts filesystems for read-only
+inspection or read-write repair. Offline mode is essential for Proxmox
+hosts diagnosing or repairing unmounted VM disks.
+.SH RELATED PROJECTS
+.TP
+.B LamBoot
+UEFI bootloader by Lamco Development. Available at
+.UR https://lamboot.dev
+.UE
+and
+.UR https://github.com/lamco-admin/lamboot-dev
+.UE
+.
+.TP
+.B IronRDP
+RDP protocol library. Lamco contributes upstream.
+.SH DOCUMENTATION
+Full documentation at
+.UR https://lamboot.dev/tools/
+.UE
+.
+Per-finding deep-dives at
+.UR https://lamboot.dev/tools/findings/
+.UE
+(the URLs emitted in every remediation.doc_url field).
+.SH SEE ALSO
+.BR lamboot-diagnose (1),
+.BR lamboot-esp (1),
+.BR lamboot-backup (1),
+.BR lamboot-repair (1),
+.BR lamboot-migrate (1),
+.BR lamboot-doctor (1),
+.BR lamboot-uki-build (1),
+.BR lamboot-signing-keys (1),
+.BR lamboot-toolkit (1),
+.BR lamboot-tools-schema (5)
+.SH AUTHORS
+.B Lamco Development
+.UR https://lamco.io
+.UE
+.SH LICENSE
+MIT OR Apache-2.0

@@ -1,0 +1,18 @@
+# Shellcheck configuration for lamboot-tools
+#
+# Policy (per SPEC-LAMBOOT-TOOLKIT-V1.md §9.1):
+#   - Every bash file must pass shellcheck at severity >= style
+#   - Per-line disables require a justification comment at the disable site
+#   - No global severity threshold reductions
+#   - shellcheck-clean is a v0.2 ship gate
+#
+# Global disables below require justification as inline comments when applied.
+
+# Enable the most strict severity level
+severity=style
+
+# External sources are resolved via shell comments (# shellcheck source=...)
+external-sources=true
+
+# Target shell: bash (matches #!/bin/bash across all tools)
+shell=bash

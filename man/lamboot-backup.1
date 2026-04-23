@@ -1,0 +1,383 @@
+.\" lamboot-backup(1) — auto-generated from help registry
+.\" Source: tools/lamboot-backup
+.\" Generated: 2026-04-23T12:02:39Z
+.\" DO NOT EDIT — regenerate via `make man` or `scripts/registry-to-man`.
+.TH "LAMBOOT-BACKUP" "1" "2026-04-23" "lamboot-backup 0.2.0" "lamboot-tools"
+.SH NAME
+lamboot-backup \- part of the lamboot-tools suite
+.SH SYNOPSIS
+.B lamboot-backup
+[\fIGLOBAL FLAGS\fR] [\fISUBCOMMAND\fR] [\fIARGS\fR]
+.SH DESCRIPTION
+lamboot-backup is part of
+.BR lamboot-tools (7),
+"The Linux UEFI boot toolkit." See that page for suite-level conventions
+and cross-tool composition.
+.PP
+This page documents every subcommand registered in lamboot-backup's help
+registry. Every subcommand is also accessible via
+.BI "lamboot-backup help " SUBCOMMAND
+at runtime.
+.SH SUBCOMMANDS
+.SS save
+.PP
+.I Snapshot current NVRAM state to a JSON file
+.PP
+.B Category:
+Backup
+.br
+.B Maturity:
+stable
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-backup save [FILE] [\-\-force] [\-\-vars\-file OVMF_VARS.fd] [\-\-offline DISK]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B FILE
+Output path (default: /var/backups/lamboot\-backup\-<run_id>.json)
+.TP
+.B \-\-force
+Overwrite existing FILE
+.TP
+.B \-\-vars\-file PATH
+Read NVRAM from an OVMF_VARS.fd file (offline mode); requires virt\-fw\-vars
+.TP
+.B \-\-offline DISK
+Also mount DISK to capture LamBoot state files living on the ESP/root (optional; combine with \-\-vars\-file)
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-backup save
+sudo lamboot\-backup save /tmp/before\-migration.json
+lamboot\-backup save snap.json \-\-vars\-file /var/lib/vz/images/201/vm\-201\-disk\-0.fd
+lamboot\-backup save snap.json \-\-vars\-file /path/OVMF_VARS.fd \-\-offline /dev/pve/vm\-201\-disk\-1
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Reads NVRAM via efibootmgr (online) or virt\-fw\-vars (offline via \-\-vars\-file). Never writes NVRAM; read\-only. LamBoot\-specific NVRAM vars (LamBootState, LamBootCrashCount) captured when present. Output is schema\-v1 JSON identical whether source is online or offline.
+.RE
+.PP
+.B OFFLINE:
+Yes \- supports \fB\-\-offline\fR \fIDISK\fR
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+restore, show, list
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/backup/save
+.UE
+.RE
+.PP
+.SS restore
+.PP
+.I Apply a snapshot (boot order + timeout) to NVRAM
+.PP
+.B Category:
+Backup
+.br
+.B Maturity:
+stable
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-backup restore FILE [\-\-force] [\-\-include\-entries] [\-\-vars\-file OVMF_VARS.fd]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B FILE
+Snapshot JSON to restore from
+.TP
+.B \-\-force
+Skip interactive confirmation
+.TP
+.B \-\-include\-entries
+Also attempt to re\-create missing entries (experimental)
+.TP
+.B \-\-vars\-file PATH
+Write NVRAM to an OVMF_VARS.fd file (offline mode); requires virt\-fw\-vars
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-backup restore /tmp/before\-migration.json
+sudo lamboot\-backup restore \-\-dry\-run snapshot.json
+lamboot\-backup restore snap.json \-\-vars\-file /var/lib/vz/images/201/vm\-201\-disk\-0.fd
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Restores BootOrder + Timeout (+ entries with \-\-include\-entries). Writes NVRAM via efibootmgr (online) or virt\-fw\-vars (offline via \-\-vars\-file). Requires root for online write.
+.RE
+.PP
+.B OFFLINE:
+Yes \- supports \fB\-\-offline\fR \fIDISK\fR
+.br
+.B PRIVILEGE:
+Requires root (sudo)
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+save, show
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/backup/restore
+.UE
+.RE
+.PP
+.SS show
+.PP
+.I Display snapshot contents (human or \-\-json)
+.PP
+.B Category:
+Backup
+.br
+.B Maturity:
+stable
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-backup show FILE [\-\-json]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B FILE
+Snapshot JSON to display
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+lamboot\-backup show /var/backups/lamboot\-backup\-2026\-04\-22...json
+lamboot\-backup show snap.json \-\-json
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Read\-only; runs unprivileged. With \-\-json, passes through the snapshot file verbatim (validated against schema v1).
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+save, list
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/backup/show
+.UE
+.RE
+.PP
+.SS list
+.PP
+.I List snapshots in /var/backups/
+.PP
+.B Category:
+Backup
+.br
+.B Maturity:
+stable
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-backup list [\-\-json]
+.fi
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+lamboot\-backup list
+lamboot\-backup list \-\-json 
+ jq .
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Enumerates /var/backups/lamboot\-backup\-*.json sorted by timestamp (newest first).
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+save, show
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/backup/list
+.UE
+.RE
+.PP
+.SH GLOBAL FLAGS
+Every subcommand accepts these universal flags (documented in
+.BR lamboot-tools (7)):
+.TP
+.BR \-\-help ", " \-h
+Show inline help
+.TP
+.B \-\-version
+Print tool and toolkit version
+.TP
+.B \-\-json
+Emit unified JSON output (schema v1)
+.TP
+.B \-\-json-schema
+Print the JSON schema this tool emits
+.TP
+.BR \-\-verbose ", " \-v
+Informational output beyond the default
+.TP
+.BR \-\-quiet ", " \-q
+Only warnings and errors
+.TP
+.B \-\-no-color
+Disable ANSI color (auto on non-TTY)
+.TP
+.B \-\-dry-run
+Print planned actions without executing
+.TP
+.BR \-\-yes ", " \-y
+Answer yes to interactive prompts
+.TP
+.B \-\-force
+Skip safety checks (per-subcommand semantics)
+.TP
+.B \-\-auto
+Non-interactive full automation (implies \fB\-\-yes\fR)
+.TP
+.BI \-\-offline " DISK"
+Operate on an unmounted disk or image
+.TP
+.B \-\-suggest-next-command
+Print the recommended follow-up command
+.SH EXIT STATUS
+.TP
+.B 0
+Success
+.TP
+.B 1
+Fatal error
+.TP
+.B 2
+Partial \- some operations succeeded, some failed
+.TP
+.B 3
+Nothing to do (already in requested state)
+.TP
+.B 4
+Refused due to a safety check
+.TP
+.B 5
+User declined interactive confirmation
+.TP
+.B 6
+Operation does not apply to this system
+.TP
+.B 7
+Required tool or capability is missing
+.SH FILES
+.TP
+.I /usr/lib/lamboot-tools/lamboot-toolkit-lib.sh
+Shared library sourced by every tool
+.TP
+.I /usr/lib/lamboot-tools/lamboot-toolkit-help.sh
+Help registry driver
+.TP
+.I /var/backups/lamboot-*-<timestamp>/
+Per-run backup directory (when a tool mutates state)
+.SH ENVIRONMENT
+.TP
+.B LAMBOOT_LIB_DIR
+Override shared library directory (default:
+.IR /usr/lib/lamboot-tools ).
+.TP
+.B NO_COLOR
+When set (to any value), disables ANSI color (freedesktop convention).
+.SH SEE ALSO
+.BR lamboot-tools (7),
+.BR lamboot-toolkit (1),
+.BR lamboot-diagnose (1),
+.BR lamboot-esp (1),
+.BR lamboot-backup (1),
+.BR lamboot-repair (1),
+.BR lamboot-migrate (1),
+.BR lamboot-doctor (1),
+.BR lamboot-uki-build (1),
+.BR lamboot-signing-keys (1)
+.PP
+Full documentation at
+.UR https://lamboot.dev/tools/
+.UE
+.SH AUTHORS
+The lamboot-tools suite is developed by
+.B Lamco Development
+(https://lamco.io). Source:
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.SH LICENSE
+MIT OR Apache-2.0

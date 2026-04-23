@@ -1,0 +1,71 @@
+#!/usr/bin/env bats
+# lamboot-migrate guardrail unit tests — spec SDS-7 §5
+#
+# Tests the individual guard_* functions for expected refusal behavior
+# without actually invoking the full to-uefi pipeline.
+
+setup() {
+    TOOL="$BATS_TEST_DIRNAME/../tools/lamboot-migrate"
+    LIB_DIR="$BATS_TEST_DIRNAME/../lib"
+    export LAMBOOT_LIB_DIR="$LIB_DIR"
+
+    LIB="$LIB_DIR/lamboot-toolkit-lib.sh"
+    HELP_LIB="$LIB_DIR/lamboot-toolkit-help.sh"
+    [ -f "$LIB" ] || skip "shared library not found"
+    # shellcheck source=../lib/lamboot-toolkit-lib.sh
+    source "$LIB"
+    # shellcheck source=../lib/lamboot-toolkit-help.sh
+    source "$HELP_LIB"
+
+    LAMBOOT_TOOL_NAME="lamboot-migrate"
+    LAMBOOT_TOOL_VERSION="1.0.0-dev"
+}
+
+@test "detect_target_disk returns a /dev/ path on Linux host" {
+    # This test runs on a real system; should always find a root disk.
+    # shellcheck source=../tools/lamboot-migrate
+    # Source just the helper functions we want to test:
+    eval "$(sed -n '/^detect_target_disk()/,/^}/p' "$TOOL")"
+    run detect_target_disk
+    [ "$status" -eq 0 ] || skip "no root disk detectable in this env"
+    [[ "$output" == /dev/* ]]
+}
+
+@test "partition_device_for produces pN suffix for NVMe" {
+    eval "$(sed -n '/^partition_device_for()/,/^}/p' "$TOOL")"
+    result=$(partition_device_for /dev/nvme0n1 3)
+    [ "$result" = "/dev/nvme0n1p3" ]
+}
+
+@test "partition_device_for produces numeric suffix for SCSI" {
+    eval "$(sed -n '/^partition_device_for()/,/^}/p' "$TOOL")"
+    result=$(partition_device_for /dev/sda 3)
+    [ "$result" = "/dev/sda3" ]
+}
+
+@test "partition_device_for handles loop devices with pN" {
+    eval "$(sed -n '/^partition_device_for()/,/^}/p' "$TOOL")"
+    result=$(partition_device_for /dev/loop0 1)
+    [ "$result" = "/dev/loop0p1" ]
+}
+
+@test "partition_device_for handles mmcblk with pN" {
+    eval "$(sed -n '/^partition_device_for()/,/^}/p' "$TOOL")"
+    result=$(partition_device_for /dev/mmcblk0 2)
+    [ "$result" = "/dev/mmcblk0p2" ]
+}
+
+@test "detect_proxmox_method returns A B C or auto-selected single char" {
+    eval "$(sed -n '/^detect_proxmox_method()/,/^}/p' "$TOOL")"
+    OPT_METHOD="A"
+    result=$(detect_proxmox_method)
+    [ "$result" = "A" ]
+
+    OPT_METHOD="b"
+    result=$(detect_proxmox_method)
+    [ "$result" = "B" ]
+
+    OPT_METHOD="auto"
+    result=$(detect_proxmox_method)
+    [[ "$result" == "A" || "$result" == "B" || "$result" == "C" ]]
+}

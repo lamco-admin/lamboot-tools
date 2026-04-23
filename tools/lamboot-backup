@@ -1,0 +1,953 @@
+#!/bin/bash
+# lamboot-backup — UEFI boot configuration backup + restore
+#
+# Snapshots UEFI NVRAM state (boot entries, boot order, timeout, SB posture,
+# LamBoot-specific vars) to a versioned JSON file for disaster recovery
+# and audit.
+#
+# Governed by docs/SPEC-LAMBOOT-BACKUP.md.
+# Part of the lamboot-tools suite (SPEC-LAMBOOT-TOOLKIT-V1.md §3.1).
+
+# shellcheck source=../lib/lamboot-toolkit-lib.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
+# shellcheck source=../lib/lamboot-toolkit-help.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
+
+LAMBOOT_TOOL_NAME="lamboot-backup"
+LAMBOOT_TOOL_VERSION="0.2.0"
+
+readonly DOC_BASE="https://lamboot.dev/tools/findings"
+
+OPT_SUBCOMMAND=""
+OPT_FILE=""
+OPT_INCLUDE_ENTRIES=0
+OPT_VARS_FILE=""   # OVMF_VARS.fd path for offline NVRAM read/write
+
+# ── Help registry ────────────────────────────────────────────────────────
+
+_register_subcommands() {
+    register_subcommand \
+        --name "save" \
+        --category "Backup" \
+        --summary "Snapshot current NVRAM state to a JSON file" \
+        --syntax "lamboot-backup save [FILE] [--force] [--vars-file OVMF_VARS.fd] [--offline DISK]" \
+        --arg "FILE:Output path (default: /var/backups/lamboot-backup-<run_id>.json)" \
+        --arg "--force:Overwrite existing FILE" \
+        --arg "--vars-file PATH:Read NVRAM from an OVMF_VARS.fd file (offline mode); requires virt-fw-vars" \
+        --arg "--offline DISK:Also mount DISK to capture LamBoot state files living on the ESP/root (optional; combine with --vars-file)" \
+        --example "sudo lamboot-backup save" \
+        --example "sudo lamboot-backup save /tmp/before-migration.json" \
+        --example "lamboot-backup save snap.json --vars-file /var/lib/vz/images/201/vm-201-disk-0.fd" \
+        --example "lamboot-backup save snap.json --vars-file /path/OVMF_VARS.fd --offline /dev/pve/vm-201-disk-1" \
+        --notes "Reads NVRAM via efibootmgr (online) or virt-fw-vars (offline via --vars-file). Never writes NVRAM; read-only. LamBoot-specific NVRAM vars (LamBootState, LamBootCrashCount) captured when present. Output is schema-v1 JSON identical whether source is online or offline." \
+        --offline-capable "true" \
+        --requires-root "false" \
+        --see-also "restore, show, list" \
+        --doc-url "https://lamboot.dev/tools/backup/save" \
+        --maturity "stable"
+
+    register_subcommand \
+        --name "restore" \
+        --category "Backup" \
+        --summary "Apply a snapshot (boot order + timeout) to NVRAM" \
+        --syntax "lamboot-backup restore FILE [--force] [--include-entries] [--vars-file OVMF_VARS.fd]" \
+        --arg "FILE:Snapshot JSON to restore from" \
+        --arg "--force:Skip interactive confirmation" \
+        --arg "--include-entries:Also attempt to re-create missing entries (experimental)" \
+        --arg "--vars-file PATH:Write NVRAM to an OVMF_VARS.fd file (offline mode); requires virt-fw-vars" \
+        --example "sudo lamboot-backup restore /tmp/before-migration.json" \
+        --example "sudo lamboot-backup restore --dry-run snapshot.json" \
+        --example "lamboot-backup restore snap.json --vars-file /var/lib/vz/images/201/vm-201-disk-0.fd" \
+        --notes "Restores BootOrder + Timeout (+ entries with --include-entries). Writes NVRAM via efibootmgr (online) or virt-fw-vars (offline via --vars-file). Requires root for online write." \
+        --offline-capable "true" \
+        --requires-root "true" \
+        --see-also "save, show" \
+        --doc-url "https://lamboot.dev/tools/backup/restore" \
+        --maturity "stable"
+
+    register_subcommand \
+        --name "show" \
+        --category "Backup" \
+        --summary "Display snapshot contents (human or --json)" \
+        --syntax "lamboot-backup show FILE [--json]" \
+        --arg "FILE:Snapshot JSON to display" \
+        --example "lamboot-backup show /var/backups/lamboot-backup-2026-04-22...json" \
+        --example "lamboot-backup show snap.json --json" \
+        --notes "Read-only; runs unprivileged. With --json, passes through the snapshot file verbatim (validated against schema v1)." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "save, list" \
+        --doc-url "https://lamboot.dev/tools/backup/show" \
+        --maturity "stable"
+
+    register_subcommand \
+        --name "list" \
+        --category "Backup" \
+        --summary "List snapshots in /var/backups/" \
+        --syntax "lamboot-backup list [--json]" \
+        --example "lamboot-backup list" \
+        --example "lamboot-backup list --json | jq ." \
+        --notes "Enumerates /var/backups/lamboot-backup-*.json sorted by timestamp (newest first)." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "save, show" \
+        --doc-url "https://lamboot.dev/tools/backup/list" \
+        --maturity "stable"
+}
+
+# ── Remediation helper ───────────────────────────────────────────────────
+
+_remediation_json() {
+    local id="$1" summary="$2" cmd="${3:-}"
+    local doc="${DOC_BASE}/${id//.//}"
+    local cmd_field="\"\""
+    [[ -n "$cmd" ]] && cmd_field="\"$(json_escape "$cmd")\""
+    printf '{"summary":"%s","command":%s,"doc_url":"%s"}' \
+        "$(json_escape "$summary")" "$cmd_field" "$doc"
+}
+
+# ── NVRAM read ───────────────────────────────────────────────────────────
+
+# ── Offline helpers: parse OVMF_VARS.fd via virt-fw-vars ─────────────────
+#
+# virt-fw-vars --input FILE.fd --output json emits a JSON array of variables,
+# each with {name, guid, attr, data (hex)}. We cache the whole dump once per
+# invocation (in OFFLINE_VARS_JSON) and grep it for specific variables.
+
+OFFLINE_VARS_JSON=""
+
+_offline_load_vars() {
+    [[ -n "$OPT_VARS_FILE" ]] || return 1
+    [[ -n "$OFFLINE_VARS_JSON" ]] && return 0
+    [[ -f "$OPT_VARS_FILE" ]] || die "vars file not found: $OPT_VARS_FILE"
+    require_tool virt-fw-vars "install virt-firmware (provides virt-fw-vars)"
+    OFFLINE_VARS_JSON=$(virt-fw-vars --input "$OPT_VARS_FILE" --output json 2>/dev/null) \
+        || die "virt-fw-vars could not parse $OPT_VARS_FILE"
+    [[ -n "$OFFLINE_VARS_JSON" ]] || die "virt-fw-vars produced empty output for $OPT_VARS_FILE"
+    return 0
+}
+
+# Extract the hex 'data' field for a variable by name+guid, or empty if absent.
+_offline_var_hex() {
+    local name="$1" guid="$2"
+    _offline_load_vars || return 1
+    # virt-fw-vars JSON has one object per var; pull the data field for the
+    # matching {name, guid} pair. We parse with awk since jq may not be present.
+    # Each var block looks like (pretty-printed):
+    #   {"name":"BootOrder","guid":"8be4df61-...","attr":7,"data":"0100"}
+    printf '%s' "$OFFLINE_VARS_JSON" \
+      | tr '{}' '\n\n' \
+      | awk -v n="$name" -v g="$guid" '
+          /"name"[[:space:]]*:[[:space:]]*"[^"]+"/ {
+              match($0, /"name"[[:space:]]*:[[:space:]]*"([^"]+)"/, m); vname=m[1]
+          }
+          /"guid"[[:space:]]*:[[:space:]]*"[^"]+"/ {
+              match($0, /"guid"[[:space:]]*:[[:space:]]*"([^"]+)"/, m); vguid=m[1]
+          }
+          /"data"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]*"/ {
+              match($0, /"data"[[:space:]]*:[[:space:]]*"([0-9a-fA-F]*)"/, m); vdata=m[1]
+              if (vname==n && tolower(vguid)==tolower(g)) { print vdata; exit }
+          }
+        '
+}
+
+# Boot#### vars are little-endian UTF-16 descriptions prefixed with
+# a 4-byte attributes + 2-byte filepath-list-length header. Extracting the
+# UTF-16 label is nontrivial; for the snapshot we record them verbatim
+# (hex) + a best-effort ASCII label from the UTF-16 portion.
+_offline_decode_boot_entry() {
+    local hex="$1"
+    [[ -z "$hex" ]] && return 0
+    # Skip first 12 bytes (attributes[4] + filepath_list_length[2] + description starts at offset 6)
+    # Actually: EFI_LOAD_OPTION layout = UINT32 Attributes, UINT16 FilePathListLength, CHAR16 Description[], EFI_DEVICE_PATH_PROTOCOL FilePathList[], UINT8 OptionalData[]
+    # Description is UTF-16LE starting at byte offset 6, null-terminated.
+    local ascii=""
+    local i=12   # hex index = byte 6 * 2
+    local total=${#hex}
+    while (( i + 3 < total )); do
+        local lo="${hex:$i:2}" hi="${hex:$((i+2)):2}"
+        [[ "$lo" == "00" ]] && [[ "$hi" == "00" ]] && break
+        # Only accept printable ASCII (hi byte 0x00, lo byte 0x20-0x7e)
+        if [[ "$hi" == "00" ]]; then
+            local b=$((16#$lo))
+            if (( b >= 32 && b <= 126 )); then
+                ascii+=$(printf '\x'"$lo")
+            else
+                ascii+="?"
+            fi
+        else
+            ascii+="?"
+        fi
+        i=$((i + 4))
+    done
+    printf '%s' "$ascii"
+}
+
+_offline_read_boot_order_hex() {
+    _offline_var_hex "BootOrder" "8be4df61-93ca-11d2-aa0d-00e098032b8c"
+}
+
+_offline_read_boot_current_hex() {
+    _offline_var_hex "BootCurrent" "8be4df61-93ca-11d2-aa0d-00e098032b8c"
+}
+
+_offline_read_boot_next_hex() {
+    _offline_var_hex "BootNext" "8be4df61-93ca-11d2-aa0d-00e098032b8c"
+}
+
+_offline_read_timeout_hex() {
+    _offline_var_hex "Timeout" "8be4df61-93ca-11d2-aa0d-00e098032b8c"
+}
+
+# Convert little-endian hex UINT16 list to comma-separated 4-digit uppercase hex
+# ("0001,0003,0005") — matches efibootmgr BootOrder format.
+_offline_hex_u16_list_to_bootnums() {
+    local hex="$1" out=""
+    [[ -z "$hex" ]] && return 0
+    local total=${#hex}
+    local i=0
+    while (( i + 3 < total )); do
+        local lo="${hex:$i:2}" hi="${hex:$((i+2)):2}"
+        local bootnum="${hi^^}${lo^^}"
+        out="${out:+$out,}$bootnum"
+        i=$((i + 4))
+    done
+    printf '%s' "$out"
+}
+
+_offline_hex_u16_to_dec() {
+    local hex="$1"
+    [[ -z "$hex" ]] && return 0
+    [[ ${#hex} -ge 4 ]] || return 0
+    local lo="${hex:0:2}" hi="${hex:2:2}"
+    printf '%d' $((16#$hi * 256 + 16#$lo))
+}
+
+_offline_hex_u16_to_bootnum() {
+    local hex="$1"
+    [[ ${#hex} -ge 4 ]] || return 0
+    local lo="${hex:0:2}" hi="${hex:2:2}"
+    printf '%s%s' "${hi^^}" "${lo^^}"
+}
+
+# Synthesize efibootmgr -v output format from the offline vars JSON so the rest
+# of do_save()'s parsing loop can be source-agnostic. Emits:
+#   BootCurrent: <hex4>
+#   BootOrder: <comma-separated hex4>
+#   Timeout: <n> seconds
+#   Boot<hex4>* <label>
+#   ... one line per Boot#### variable found in the vars file.
+_offline_synthesize_efibootmgr_output() {
+    _offline_load_vars || return 1
+
+    local bc_hex bn_hex bo_hex to_hex
+    bc_hex=$(_offline_read_boot_current_hex)
+    bn_hex=$(_offline_read_boot_next_hex)
+    bo_hex=$(_offline_read_boot_order_hex)
+    to_hex=$(_offline_read_timeout_hex)
+
+    local bc bn bo to
+    bc=$(_offline_hex_u16_to_bootnum "$bc_hex")
+    bn=$(_offline_hex_u16_to_bootnum "$bn_hex")
+    bo=$(_offline_hex_u16_list_to_bootnums "$bo_hex")
+    to=$(_offline_hex_u16_to_dec "$to_hex")
+
+    [[ -n "$bc" ]] && printf 'BootCurrent: %s\n' "$bc"
+    [[ -n "$bn" ]] && printf 'BootNext: %s\n' "$bn"
+    [[ -n "$to" ]] && printf 'Timeout: %s seconds\n' "$to"
+    [[ -n "$bo" ]] && printf 'BootOrder: %s\n' "$bo"
+
+    # Enumerate Boot#### entries. Same efi global GUID.
+    # We stream the vars JSON once and emit one Boot#### line per match.
+    printf '%s' "$OFFLINE_VARS_JSON" \
+      | tr '{}' '\n\n' \
+      | awk '
+          /"name"[[:space:]]*:[[:space:]]*"Boot[0-9A-Fa-f]{4}"/ {
+              match($0, /"name"[[:space:]]*:[[:space:]]*"(Boot[0-9A-Fa-f]{4})"/, m); vname=m[1]
+          }
+          /"data"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]*"/ {
+              match($0, /"data"[[:space:]]*:[[:space:]]*"([0-9a-fA-F]*)"/, m); vdata=m[1]
+              if (vname != "" && vdata != "") {
+                  print vname "\t" vdata
+                  vname=""
+              }
+          }
+        ' | while IFS=$'\t' read -r name hex; do
+            local bootnum="${name#Boot}"
+            local label active_marker="*"
+            # Attributes bytes 0-3 little-endian; LOAD_OPTION_ACTIVE = 1
+            if [[ ${#hex} -ge 8 ]]; then
+                local attr_byte="${hex:0:2}"
+                [[ $((16#$attr_byte & 1)) -eq 0 ]] && active_marker=""
+            fi
+            label=$(_offline_decode_boot_entry "$hex")
+            printf 'Boot%s%s %s\tHD(offline)\n' "$bootnum" "$active_marker" "${label:-<offline>}"
+        done
+}
+
+read_secure_boot_flag() {
+    if [[ -n "$OPT_VARS_FILE" ]]; then
+        local hex
+        hex=$(_offline_var_hex "SecureBoot" "8be4df61-93ca-11d2-aa0d-00e098032b8c")
+        [[ "$hex" == "01" ]] && printf 'true' || printf 'false'
+        return 0
+    fi
+    local sb_var="/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+    if [[ -r "$sb_var" ]]; then
+        local val
+        val=$(od -An -t u1 -j4 -N1 "$sb_var" 2>/dev/null | tr -d ' ' || printf '0')
+        [[ "$val" == "1" ]] && printf 'true' || printf 'false'
+    else
+        printf 'false'
+    fi
+}
+
+read_setup_mode() {
+    if [[ -n "$OPT_VARS_FILE" ]]; then
+        local hex
+        hex=$(_offline_var_hex "SetupMode" "8be4df61-93ca-11d2-aa0d-00e098032b8c")
+        [[ "$hex" == "01" ]] && printf 'true' || printf 'false'
+        return 0
+    fi
+    local sm_var="/sys/firmware/efi/efivars/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+    if [[ -r "$sm_var" ]]; then
+        local val
+        val=$(od -An -t u1 -j4 -N1 "$sm_var" 2>/dev/null | tr -d ' ' || printf '0')
+        [[ "$val" == "1" ]] && printf 'true' || printf 'false'
+    else
+        printf 'false'
+    fi
+}
+
+read_lamboot_nvram_state() {
+    if [[ -n "$OPT_VARS_FILE" ]]; then
+        local state_hex counter_hex
+        state_hex=$(_offline_var_hex "LamBootState" "4c414d42-4f4f-5400-0000-000000000001")
+        counter_hex=$(_offline_var_hex "LamBootCrashCount" "4c414d42-4f4f-5400-0000-000000000001")
+        if [[ -z "$state_hex" ]]; then
+            printf 'null'
+            return 0
+        fi
+        local state=$((16#${state_hex:0:2}))
+        local counter=0
+        [[ -n "$counter_hex" ]] && counter=$((16#${counter_hex:0:2}))
+        local state_name
+        case "$state" in
+            0) state_name="Fresh" ;;
+            1) state_name="Booting" ;;
+            2) state_name="BootedOK" ;;
+            3) state_name="CrashLoop" ;;
+            *) state_name="Unknown" ;;
+        esac
+        printf '{"state":"%s","state_code":%d,"crash_counter":%d}' \
+            "$state_name" "$state" "$counter"
+        return 0
+    fi
+
+    local state_var="/sys/firmware/efi/efivars/LamBootState-4c414d42-4f4f-5400-0000-000000000001"
+    if [[ ! -r "$state_var" ]]; then
+        printf 'null'
+        return 0
+    fi
+
+    local state counter state_name
+    state=$(od -An -t u1 -j4 -N1 "$state_var" 2>/dev/null | tr -d ' ' || printf '0')
+    local counter_var="/sys/firmware/efi/efivars/LamBootCrashCount-4c414d42-4f4f-5400-0000-000000000001"
+    counter=0
+    [[ -r "$counter_var" ]] && counter=$(od -An -t u1 -j4 -N1 "$counter_var" 2>/dev/null | tr -d ' ' || printf '0')
+
+    case "$state" in
+        0) state_name="Fresh" ;;
+        1) state_name="Booting" ;;
+        2) state_name="BootedOK" ;;
+        3) state_name="CrashLoop" ;;
+        *) state_name="Unknown" ;;
+    esac
+
+    printf '{"state":"%s","state_code":%d,"crash_counter":%d}' \
+        "$state_name" "$state" "$counter"
+}
+
+# ── Subcommand: save ─────────────────────────────────────────────────────
+
+do_save() {
+    local using_offline=0
+    [[ -n "$OPT_VARS_FILE" ]] && using_offline=1
+
+    if [[ ! -d /sys/firmware/efi ]] && [[ $using_offline -eq 0 ]]; then
+        emit_finding "backup.save.not_uefi" "backup" "critical" "fail" \
+            "System not in UEFI mode" \
+            "Cannot read NVRAM on a BIOS-booted system. Pass --vars-file OVMF_VARS.fd for an offline snapshot." "{}" \
+            "$(_remediation_json "backup.save.not_uefi" \
+                "Use offline mode or convert system to UEFI first" \
+                "lamboot-backup save snap.json --vars-file /path/OVMF_VARS.fd")"
+        emit_json "$EXIT_NOT_APPLICABLE"
+        exit "$EXIT_NOT_APPLICABLE"
+    fi
+
+    if [[ $using_offline -eq 0 ]]; then
+        require_tool efibootmgr "install efibootmgr via your package manager"
+    else
+        # Preload offline vars so later _offline_var_hex calls don't repeat work.
+        _offline_load_vars
+    fi
+
+    local outfile="${OPT_FILE}"
+    if [[ -z "$outfile" ]]; then
+        [[ -n "$LAMBOOT_RUN_ID" ]] || generate_run_id
+        outfile="/var/backups/lamboot-backup-${LAMBOOT_RUN_ID}.json"
+    fi
+
+    # Dry-run reports the planned action without enforcing overwrite rules —
+    # the file-exists check runs only when we'd actually mutate the target.
+    if [[ -f "$outfile" ]] && [[ $LAMBOOT_FORCE -eq 0 ]] && [[ $LAMBOOT_DRY_RUN -eq 0 ]]; then
+        die "file exists: $outfile (use --force to overwrite)"
+    fi
+
+    info "Snapshotting NVRAM to $outfile$([[ $using_offline -eq 1 ]] && printf ' (offline: %s)' "$OPT_VARS_FILE")"
+
+    # Read NVRAM either from efibootmgr (online) or via virt-fw-vars JSON (offline).
+    # Both paths populate the same set of locals so the rest of the function is
+    # source-agnostic. The offline branch reconstructs efibootmgr's -v output
+    # format so the existing Boot#### parsing loop below works unchanged.
+    local efi_output
+    if [[ $using_offline -eq 1 ]]; then
+        efi_output=$(_offline_synthesize_efibootmgr_output) \
+            || die "failed to synthesize efibootmgr output from $OPT_VARS_FILE"
+    else
+        efi_output=$(efibootmgr -v 2>/dev/null || true)
+    fi
+
+    local boot_order boot_current boot_next timeout
+    boot_order=$(printf '%s' "$efi_output" | grep '^BootOrder:' | cut -d: -f2 | tr -d ' ' || true)
+    boot_current=$(printf '%s' "$efi_output" | grep '^BootCurrent:' | cut -d: -f2 | tr -d ' ' || true)
+    boot_next=$(printf '%s' "$efi_output" | grep '^BootNext:' | cut -d: -f2 | tr -d ' ' || true)
+    timeout=$(printf '%s' "$efi_output" | grep '^Timeout:' | sed 's/Timeout: //;s/ seconds//' | tr -d ' ' || true)
+    [[ -z "$timeout" ]] && timeout="0"
+    [[ "$timeout" =~ ^[0-9]+$ ]] || timeout="0"
+
+    local sb_flag setup_mode lamboot_nv
+    sb_flag=$(read_secure_boot_flag)
+    setup_mode=$(read_setup_mode)
+    lamboot_nv=$(read_lamboot_nvram_state)
+
+    # Build entries JSON array
+    local entries_json="[]"
+    local first=1
+    local entry_count=0
+    entries_json=""
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local bootnum label active devpath
+        bootnum=$(printf '%s' "$line" | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p')
+        [[ -z "$bootnum" ]] && continue
+
+        if printf '%s' "$line" | grep -qE "^Boot${bootnum}\*"; then
+            active="true"
+        else
+            active="false"
+        fi
+
+        label=$(printf '%s' "$line" | sed "s/^Boot${bootnum}[* ]*//" | sed 's/\t.*//')
+        devpath=$(printf '%s' "$line" | grep -oP '\t\K.*$' || printf '')
+
+        local esc_label esc_devpath esc_bootnum
+        esc_label=$(json_escape "$label")
+        esc_devpath=$(json_escape "$devpath")
+        esc_bootnum=$(json_escape "$bootnum")
+
+        local entry="{\"bootnum\":\"${esc_bootnum}\",\"label\":\"${esc_label}\",\"active\":${active},\"devpath\":\"${esc_devpath}\"}"
+        if [[ $first -eq 1 ]]; then
+            entries_json="$entry"
+            first=0
+        else
+            entries_json="${entries_json},${entry}"
+        fi
+        entry_count=$((entry_count + 1))
+    done < <(printf '%s' "$efi_output" | grep '^Boot[0-9A-Fa-f]' || true)
+
+    local boot_next_field='null'
+    [[ -n "$boot_next" ]] && boot_next_field="\"$(json_escape "$boot_next")\""
+
+    [[ -n "$LAMBOOT_RUN_ID" ]] || generate_run_id
+
+    local source_label="online"
+    local vars_file_field='null'
+    if [[ $using_offline -eq 1 ]]; then
+        source_label="offline"
+        vars_file_field="\"$(json_escape "$OPT_VARS_FILE")\""
+    fi
+
+    # Compose the full snapshot JSON
+    local snapshot
+    snapshot=$(cat <<EOF
+{"schema_version":"${LAMBOOT_TOOLKIT_SCHEMA_VERSION}","tool":"lamboot-backup","version":"${LAMBOOT_TOOL_VERSION}","toolkit_version":"${LAMBOOT_TOOLKIT_VERSION}","timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","host":"$(hostname)","run_id":"${LAMBOOT_RUN_ID}","source":"${source_label}","vars_file":${vars_file_field},"nvram":{"boot_order":"$(json_escape "${boot_order:-}")","boot_current":"$(json_escape "${boot_current:-}")","boot_next":${boot_next_field},"timeout_seconds":${timeout},"secure_boot_enabled":${sb_flag},"setup_mode":${setup_mode}},"entries":[${entries_json}],"lamboot_nvram":${lamboot_nv}}
+EOF
+)
+
+    if [[ $LAMBOOT_DRY_RUN -eq 1 ]]; then
+        printf 'DRY-RUN: would write snapshot to %s (%d entries)\n' "$outfile" "$entry_count" >&2
+        printf '%s\n' "$snapshot"
+    else
+        mkdir -p "$(dirname "$outfile")" || die "cannot create $(dirname "$outfile")"
+        printf '%s\n' "$snapshot" > "$outfile" || die "failed to write $outfile"
+        chmod 0600 "$outfile"
+    fi
+
+    record_action "backup.snapshot.write" "$outfile" "ok" "false" \
+        "{\"entries\":${entry_count},\"boot_order\":\"$(json_escape "${boot_order:-}")\"}" \
+        "null"
+
+    emit_finding "backup.save.complete" "backup" "info" "pass" \
+        "Saved $entry_count boot entries to $outfile" \
+        "Secure Boot: ${sb_flag}. Boot order: ${boot_order:-none}." \
+        "{\"path\":\"$(json_escape "$outfile")\",\"entries\":${entry_count},\"boot_order\":\"$(json_escape "${boot_order:-}")\",\"secure_boot\":${sb_flag}}" \
+        '{}'
+
+    success "Saved NVRAM snapshot → $outfile"
+    success "$entry_count boot entries, boot order: ${boot_order:-(none)}"
+
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── Subcommand: show ─────────────────────────────────────────────────────
+
+_parse_snapshot_field() {
+    # Extract a top-level string field from a snapshot file using grep/sed.
+    # Field order in the JSON matters; use a regex that's tolerant.
+    local file="$1" field="$2"
+    grep -oE "\"${field}\":\"[^\"]*\"" "$file" 2>/dev/null | head -1 | cut -d'"' -f4
+}
+
+_parse_snapshot_number() {
+    local file="$1" field="$2"
+    grep -oE "\"${field}\":[0-9]+" "$file" 2>/dev/null | head -1 | cut -d: -f2
+}
+
+_parse_snapshot_bool() {
+    local file="$1" field="$2"
+    grep -oE "\"${field}\":(true|false)" "$file" 2>/dev/null | head -1 | cut -d: -f2
+}
+
+do_show() {
+    local file="${OPT_FILE}"
+    [[ -n "$file" ]] || die "show requires a FILE argument"
+    [[ -f "$file" ]] || die "file not found: $file"
+
+    if [[ $LAMBOOT_JSON -eq 1 ]]; then
+        # Pass-through mode: emit the snapshot's JSON verbatim
+        cat "$file"
+        exit 0
+    fi
+
+    local timestamp host source boot_order boot_current timeout sb setup_mode
+    timestamp=$(_parse_snapshot_field "$file" "timestamp")
+    host=$(_parse_snapshot_field "$file" "host")
+    source=$(_parse_snapshot_field "$file" "source")
+    boot_order=$(_parse_snapshot_field "$file" "boot_order")
+    boot_current=$(_parse_snapshot_field "$file" "boot_current")
+    timeout=$(_parse_snapshot_number "$file" "timeout_seconds")
+    sb=$(_parse_snapshot_bool "$file" "secure_boot_enabled")
+    setup_mode=$(_parse_snapshot_bool "$file" "setup_mode")
+
+    printf '\nBoot Configuration Snapshot: %s\n' "$file"
+    printf '%s\n' "$(printf '=%.0s' {1..72})"
+    printf '  Created:      %s\n' "${timestamp:-unknown}"
+    printf '  Host:         %s\n' "${host:-unknown}"
+    printf '  Source:       %s\n' "${source:-unknown}"
+    printf '  Secure Boot:  %s\n' "${sb:-unknown}"
+    printf '  Setup Mode:   %s\n' "${setup_mode:-unknown}"
+    printf '  Boot Order:   %s\n' "${boot_order:-(none)}"
+    printf '  Boot Current: %s\n' "${boot_current:-(none)}"
+    printf '  Timeout:      %ss\n' "${timeout:-0}"
+    printf '\n  Entries:\n'
+
+    # Parse entries — iterate bootnums and extract nearby label/active
+    # (avoids fragile brace-balancing when devpaths contain `{...}` tokens)
+    local bootnums
+    bootnums=$(grep -oE '"bootnum":"[0-9A-Fa-f]{4}"' "$file" 2>/dev/null | cut -d'"' -f4)
+    if [[ -n "$bootnums" ]]; then
+        # Extract per-entry fields by scanning the full file once and
+        # correlating label+active with each bootnum in order of appearance.
+        local tmp
+        tmp=$(mktemp) || die "mktemp failed"
+        # Reformat: split on },{ so each entry occupies one line
+        sed 's/},{/}\n{/g' "$file" > "$tmp"
+
+        while IFS= read -r bn; do
+            [[ -z "$bn" ]] && continue
+            local line lbl act marker
+            # Find the line containing this bootnum
+            line=$(grep -F "\"bootnum\":\"$bn\"" "$tmp" | head -1)
+            lbl=$(printf '%s' "$line" | grep -oE '"label":"[^"]*"' | head -1 | cut -d'"' -f4)
+            act=$(printf '%s' "$line" | grep -oE '"active":(true|false)' | head -1 | cut -d: -f2)
+            marker=" "
+            [[ "$act" == "true" ]] && marker="*"
+            printf '    Boot%s%s %s\n' "$bn" "$marker" "${lbl:-(unlabeled)}"
+        done <<< "$bootnums"
+        rm -f "$tmp"
+    fi
+
+    # LamBoot NVRAM if present
+    local lamboot_section
+    lamboot_section=$(grep -oE '"lamboot_nvram":\{[^}]*\}' "$file" 2>/dev/null | head -1)
+    if [[ -n "$lamboot_section" ]] && [[ "$lamboot_section" != '"lamboot_nvram":null' ]]; then
+        local state counter
+        state=$(printf '%s' "$lamboot_section" | grep -oE '"state":"[^"]*"' | cut -d'"' -f4)
+        counter=$(printf '%s' "$lamboot_section" | grep -oE '"crash_counter":[0-9]+' | cut -d: -f2)
+        printf '\n  LamBoot NVRAM:\n'
+        printf '    State:         %s\n' "${state:-unknown}"
+        printf '    Crash counter: %s\n' "${counter:-0}"
+    fi
+    printf '\n'
+
+    emit_finding "backup.show.parsed" "backup" "info" "pass" \
+        "Snapshot displayed" "" \
+        "{\"path\":\"$(json_escape "$file")\"}" '{}'
+}
+
+# ── Subcommand: restore ──────────────────────────────────────────────────
+
+# Build the little-endian hex representation of a UINT16 from a decimal.
+_u16_dec_to_hex_le() {
+    local n="$1"
+    local lo=$((n & 0xFF))
+    local hi=$(((n >> 8) & 0xFF))
+    printf '%02x%02x' "$lo" "$hi"
+}
+
+# Build LE hex UINT16 list from "0001,0003,0005" style bootnum list.
+_bootnum_list_to_hex_le() {
+    local list="$1" out=""
+    local IFS=','
+    local bn
+    for bn in $list; do
+        # bn is 4-hex-char bootnum like "0001"
+        [[ ${#bn} -eq 4 ]] || continue
+        # Bootnum is already big-endian hex; convert to LE byte order.
+        local hi_byte="${bn:0:2}" lo_byte="${bn:2:2}"
+        # efibootmgr and firmware store BootOrder as UINT16 LE, so order is:
+        # LSB first. For bootnum 0x0001, bytes are 01 00.
+        out+="${lo_byte,,}${hi_byte,,}"
+    done
+    printf '%s' "$out"
+}
+
+_do_restore_offline() {
+    local file="$1"
+
+    local saved_order saved_timeout
+    saved_order=$(_parse_snapshot_field "$file" "boot_order")
+    saved_timeout=$(_parse_snapshot_number "$file" "timeout_seconds")
+
+    [[ -n "$saved_order" ]] || die "no boot_order in snapshot $file"
+
+    local boot_order_hex
+    boot_order_hex=$(_bootnum_list_to_hex_le "$saved_order")
+    [[ -n "$boot_order_hex" ]] || die "could not convert boot_order '$saved_order' to hex"
+
+    info "Restore plan (offline):"
+    info "  Snapshot:      $file"
+    info "  Vars file:     $OPT_VARS_FILE"
+    info "  Boot order:    $saved_order  (hex: $boot_order_hex)"
+    [[ -n "$saved_timeout" ]] && info "  Timeout:       ${saved_timeout}s"
+
+    if ! confirm "RESTORE NVRAM to $OPT_VARS_FILE" "yes"; then
+        record_action "backup.restore.aborted" "$file" "abort" "false" '{}' "null"
+        emit_json "$EXIT_ABORT"
+        exit "$EXIT_ABORT"
+    fi
+
+    # Back up the vars file before writing
+    local backup
+    backup="${OPT_VARS_FILE}.pre-restore.$(date -u +%Y%m%d-%H%M%S)"
+    cp "$OPT_VARS_FILE" "$backup" || die "cannot back up vars file to $backup"
+    info "Pre-restore vars file backup: $backup"
+
+    # virt-fw-vars writes the var in-place. GUID for global vars:
+    local GUID="8be4df61-93ca-11d2-aa0d-00e098032b8c"
+
+    # BootOrder: raw LE hex bytes
+    lamboot_run virt-fw-vars \
+        --input "$OPT_VARS_FILE" \
+        --output "$OPT_VARS_FILE" \
+        --set-var "BootOrder:${GUID}=${boot_order_hex}" \
+        || { warn "first set-var syntax failed; trying alternate virt-fw-vars syntax"; \
+             lamboot_run virt-fw-vars \
+                --input "$OPT_VARS_FILE" \
+                --output "$OPT_VARS_FILE" \
+                --set-variable-bytes "BootOrder" "$GUID" "$boot_order_hex" \
+                || die "virt-fw-vars set BootOrder failed"; }
+
+    record_action "nvram.boot_order.set_offline" "$saved_order" "ok" "true" \
+        "{\"vars_file\":\"$(json_escape "$OPT_VARS_FILE")\",\"backup\":\"$(json_escape "$backup")\"}" "null"
+
+    if [[ -n "$saved_timeout" ]] && [[ "$saved_timeout" =~ ^[0-9]+$ ]]; then
+        local timeout_hex
+        timeout_hex=$(_u16_dec_to_hex_le "$saved_timeout")
+        lamboot_run virt-fw-vars \
+            --input "$OPT_VARS_FILE" \
+            --output "$OPT_VARS_FILE" \
+            --set-var "Timeout:${GUID}=${timeout_hex}" \
+            || lamboot_run virt-fw-vars \
+                --input "$OPT_VARS_FILE" \
+                --output "$OPT_VARS_FILE" \
+                --set-variable-bytes "Timeout" "$GUID" "$timeout_hex" \
+            || warn "virt-fw-vars set Timeout failed (non-fatal)"
+        record_action "nvram.timeout.set_offline" "$saved_timeout" "ok" "true" \
+            "{\"vars_file\":\"$(json_escape "$OPT_VARS_FILE")\"}" "null"
+    fi
+
+    emit_finding "backup.restore.complete" "backup" "info" "pass" \
+        "Restored boot order + timeout from snapshot (offline)" \
+        "Wrote to: $OPT_VARS_FILE. Pre-restore backup: $backup." \
+        "{\"file\":\"$(json_escape "$file")\",\"vars_file\":\"$(json_escape "$OPT_VARS_FILE")\",\"backup\":\"$(json_escape "$backup")\"}" '{}'
+
+    success "Restored boot order: $saved_order (offline; vars file: $OPT_VARS_FILE)"
+    [[ -n "$saved_timeout" ]] && success "Restored timeout: ${saved_timeout}s"
+
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+do_restore() {
+    local using_offline=0
+    [[ -n "$OPT_VARS_FILE" ]] && using_offline=1
+
+    local file="${OPT_FILE}"
+    [[ -n "$file" ]] || die "restore requires a FILE argument"
+    [[ -f "$file" ]] || die "file not found: $file"
+
+    if [[ $using_offline -eq 1 ]]; then
+        [[ -f "$OPT_VARS_FILE" ]] || die "vars file not found: $OPT_VARS_FILE"
+        [[ -w "$OPT_VARS_FILE" ]] || die "vars file not writable: $OPT_VARS_FILE"
+        require_tool virt-fw-vars "install virt-firmware (provides virt-fw-vars)"
+        _do_restore_offline "$file"
+        return
+    fi
+
+    require_root
+
+    if [[ ! -d /sys/firmware/efi ]]; then
+        emit_finding "backup.restore.not_uefi" "backup" "critical" "fail" \
+            "System not in UEFI mode" \
+            "Cannot write NVRAM on a BIOS-booted system. Pass --vars-file for offline restore." "{}" \
+            "$(_remediation_json "backup.restore.not_uefi" \
+                "Convert to UEFI first or use --vars-file" \
+                "sudo lamboot-migrate to-uefi")"
+        emit_json "$EXIT_NOT_APPLICABLE"
+        exit "$EXIT_NOT_APPLICABLE"
+    fi
+
+    require_tool efibootmgr
+
+    local saved_order saved_timeout
+    saved_order=$(_parse_snapshot_field "$file" "boot_order")
+    saved_timeout=$(_parse_snapshot_number "$file" "timeout_seconds")
+
+    [[ -n "$saved_order" ]] || die "no boot_order in snapshot $file"
+
+    local current_order current_timeout
+    current_order=$(efibootmgr 2>/dev/null | grep '^BootOrder:' | cut -d: -f2 | tr -d ' ' || true)
+    current_timeout=$(efibootmgr 2>/dev/null | grep '^Timeout:' | sed 's/Timeout: //;s/ seconds//' | tr -d ' ' || true)
+    [[ -z "$current_timeout" ]] && current_timeout="0"
+
+    local need_order=0 need_timeout=0
+    [[ "$current_order" != "$saved_order" ]] && need_order=1
+    [[ -n "$saved_timeout" ]] && [[ "$current_timeout" != "$saved_timeout" ]] && need_timeout=1
+
+    if [[ $need_order -eq 0 ]] && [[ $need_timeout -eq 0 ]]; then
+        emit_finding "backup.restore.noop" "backup" "info" "pass" \
+            "Current NVRAM already matches snapshot" \
+            "Boot order and timeout unchanged." "{}" '{}'
+        info "Nothing to restore."
+        emit_json "$EXIT_NOOP"
+        exit "$EXIT_NOOP"
+    fi
+
+    cat <<EOF >&2
+
+Restore plan:
+  Snapshot:       $file
+  Current order:  $current_order
+  Restore order:  $saved_order
+EOF
+    if [[ $need_timeout -eq 1 ]]; then
+        printf '  Current timeout: %s\n' "$current_timeout" >&2
+        printf '  Restore timeout: %s\n' "$saved_timeout" >&2
+    fi
+    printf '\n' >&2
+
+    if ! confirm "RESTORE NVRAM" "yes"; then
+        record_action "backup.restore.aborted" "$file" "abort" "false" '{}' "null"
+        emit_json "$EXIT_ABORT"
+        exit "$EXIT_ABORT"
+    fi
+
+    local missing_entries=""
+    # Warn on entries referenced in saved order but absent from current NVRAM
+    for bn in ${saved_order//,/ }; do
+        if ! efibootmgr 2>/dev/null | grep -qE "^Boot${bn}"; then
+            missing_entries="${missing_entries:+${missing_entries} }$bn"
+        fi
+    done
+
+    if [[ -n "$missing_entries" ]]; then
+        emit_finding "backup.restore.missing_entries" "backup" "warning" "warn" \
+            "Some saved boot entries are missing from NVRAM" \
+            "Missing: $missing_entries. v1.0 does not recreate entries; pass --include-entries (experimental, v0.3+) or recreate manually." \
+            "{\"missing\":\"$(json_escape "$missing_entries")\"}" \
+            "$(_remediation_json "backup.restore.missing_entries" \
+                "Re-create missing boot entries" \
+                "sudo lamboot-repair")"
+    fi
+
+    if [[ $need_order -eq 1 ]]; then
+        lamboot_run efibootmgr --bootorder "$saved_order" --quiet \
+            || die "efibootmgr --bootorder failed"
+        record_action "nvram.boot_order.set" "$saved_order" "ok" "true" \
+            "{\"previous\":\"$(json_escape "$current_order")\"}" "null"
+    fi
+
+    if [[ $need_timeout -eq 1 ]]; then
+        lamboot_run efibootmgr --timeout "$saved_timeout" --quiet \
+            || warn "efibootmgr --timeout failed (non-fatal)"
+        record_action "nvram.timeout.set" "$saved_timeout" "ok" "true" \
+            "{\"previous\":\"$current_timeout\"}" "null"
+    fi
+
+    emit_finding "backup.restore.complete" "backup" "info" "pass" \
+        "Restored boot order + timeout from snapshot" \
+        "Missing entries were warned but not recreated." \
+        "{\"file\":\"$(json_escape "$file")\"}" '{}'
+
+    success "Restored boot order: $saved_order"
+    [[ $need_timeout -eq 1 ]] && success "Restored timeout: ${saved_timeout}s"
+
+    local exit_code="$EXIT_OK"
+    [[ -n "$missing_entries" ]] && exit_code="$EXIT_PARTIAL"
+    emit_json "$exit_code"
+    exit "$exit_code"
+}
+
+# ── Subcommand: list ─────────────────────────────────────────────────────
+
+do_list() {
+    local dir="/var/backups"
+    local found=0
+
+    if [[ ! -d "$dir" ]]; then
+        emit_finding "backup.list.no_dir" "backup" "info" "skip" \
+            "No /var/backups directory" "" "{}" '{}'
+        [[ $LAMBOOT_JSON -eq 1 ]] && emit_json "$EXIT_OK"
+        exit "$EXIT_OK"
+    fi
+
+    [[ $LAMBOOT_JSON -eq 0 ]] && printf '\nSnapshots in %s:\n\n' "$dir"
+
+    # Newest first
+    # shellcheck disable=SC2012
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        [[ -f "$f" ]] || continue
+
+        local ts host entries_count mtime_human
+        ts=$(_parse_snapshot_field "$f" "timestamp")
+        host=$(_parse_snapshot_field "$f" "host")
+        entries_count=$(grep -oE '"bootnum":"[^"]*"' "$f" 2>/dev/null | wc -l | tr -d ' ')
+        [[ "$entries_count" =~ ^[0-9]+$ ]] || entries_count=0
+        mtime_human=$(date -r "$f" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown')
+
+        emit_finding "backup.list.snapshot" "backup" "info" "pass" \
+            "$f" "${ts:-unknown} on ${host:-unknown}; ${entries_count} entries" \
+            "{\"path\":\"$(json_escape "$f")\",\"timestamp\":\"$(json_escape "${ts:-}")\",\"host\":\"$(json_escape "${host:-}")\",\"entry_count\":${entries_count}}" \
+            '{}'
+
+        if [[ $LAMBOOT_JSON -eq 0 ]]; then
+            printf '  %s\n' "$f"
+            printf '    timestamp: %s  host: %s  entries: %s\n\n' \
+                "${ts:-unknown}" "${host:-unknown}" "${entries_count}"
+        fi
+
+        found=$((found + 1))
+    done < <(ls -1t "$dir"/lamboot-backup-*.json 2>/dev/null)
+
+    if [[ $found -eq 0 ]]; then
+        emit_finding "backup.list.empty" "backup" "info" "skip" \
+            "No snapshots found" \
+            "No lamboot-backup-*.json files in $dir." "{}" '{}'
+        [[ $LAMBOOT_JSON -eq 0 ]] && printf '  (none)\n'
+    fi
+
+    [[ $LAMBOOT_JSON -eq 1 ]] && emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── CLI ──────────────────────────────────────────────────────────────────
+
+parse_args() {
+    local positional=()
+    while [[ $# -gt 0 ]]; do
+        parse_common_flag "$1"
+        local rc=$?
+        case $rc in
+            1) shift; continue ;;
+            2) _register_subcommands; dispatch_help; exit 0 ;;
+            3) printf 'lamboot-backup %s (lamboot-tools %s)\n' \
+                "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
+            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            5) shift
+               [[ $# -gt 0 ]] || die "--offline requires a disk path"
+               offline_setup "$1"
+               shift
+               continue ;;
+            0) ;;
+        esac
+
+        case "$1" in
+            --include-entries) OPT_INCLUDE_ENTRIES=1; shift ;;
+            --vars-file)
+                [[ $# -ge 2 ]] || die "--vars-file requires a path argument"
+                OPT_VARS_FILE="$2"; shift 2 ;;
+            save|restore|show|list|help)
+                if [[ -z "$OPT_SUBCOMMAND" ]]; then
+                    OPT_SUBCOMMAND="$1"
+                else
+                    positional+=("$1")
+                fi
+                shift ;;
+            -*)  die "unknown option: $1" ;;
+            *)   positional+=("$1"); shift ;;
+        esac
+    done
+
+    if [[ "$OPT_SUBCOMMAND" == "help" ]]; then
+        _register_subcommands
+        if [[ ${#positional[@]} -gt 0 ]]; then
+            dispatch_help "${positional[0]}"
+        else
+            dispatch_help
+        fi
+        exit 0
+    fi
+
+    # First positional after subcommand becomes OPT_FILE
+    [[ ${#positional[@]} -gt 0 ]] && OPT_FILE="${positional[0]}"
+}
+
+main() {
+    parse_args "$@"
+
+    [[ -z "$OPT_SUBCOMMAND" ]] && die "no subcommand (try: lamboot-backup help)"
+
+    case "$OPT_SUBCOMMAND" in
+        save)    do_save ;;
+        restore) do_restore ;;
+        show)    do_show ;;
+        list)    do_list ;;
+        *)       die "unknown subcommand: $OPT_SUBCOMMAND" ;;
+    esac
+}
+
+main "$@"

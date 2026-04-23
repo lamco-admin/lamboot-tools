@@ -1,0 +1,693 @@
+#!/bin/bash
+# lamboot-pve-setup — per-VM LamBoot integration setup on Proxmox VE
+#
+# Attaches the fw_cfg file-reference pattern (permanent args: line) and
+# the lamboot-hookscript.pl to a Proxmox VM. One-time setup; hookscript
+# handles per-boot data injection.
+#
+# Governed by pve/docs/SPEC-LAMBOOT-PVE-SETUP.md.
+# Part of lamboot-toolkit-pve (SPEC-LAMBOOT-TOOLKIT-V1.md §3.2).
+
+# shellcheck source=../../lib/lamboot-toolkit-lib.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
+# shellcheck source=../../lib/lamboot-toolkit-help.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
+
+LAMBOOT_TOOL_NAME="lamboot-pve-setup"
+LAMBOOT_TOOL_VERSION="0.2.0"
+
+readonly DOC_BASE="https://lamboot.dev/tools/findings"
+readonly FW_CFG_NAME="opt/lamboot/config"
+readonly HOOKSCRIPT_MIN_VERSION="0.8.4"
+readonly STATE_DIR="/var/lib/lamboot"
+readonly DEFAULT_FLEET_CONFIG="/etc/lamboot/fleet.toml"
+
+OPT_SUBCOMMAND=""
+OPT_VMID=""
+OPT_ROLE=""
+OPT_FLEET_ID=""
+OPT_HOOKSCRIPT=""
+OPT_RUNNING_OK=0
+OPT_BIOS_OVERRIDE=0
+OPT_FLEET_CONFIG="$DEFAULT_FLEET_CONFIG"
+
+# ── Help registry ────────────────────────────────────────────────────────
+
+_register_subcommands() {
+    register_subcommand \
+        --name "setup" \
+        --category "VM Integration" \
+        --summary "Set up LamBoot integration for one VM (one-time, idempotent)" \
+        --syntax "lamboot-pve-setup setup VMID [--role ROLE] [--fleet-id ID] [--running-ok] [--bios-override]" \
+        --arg "VMID:Proxmox VMID" \
+        --arg "--role ROLE:Override role (default: from fleet.toml or Proxmox tags)" \
+        --arg "--fleet-id ID:Override fleet ID (default: from fleet.toml)" \
+        --arg "--hookscript PATH:Override hookscript location" \
+        --arg "--running-ok:Proceed even on running VMs (changes take effect next boot)" \
+        --arg "--bios-override:Set up even on non-OVMF VMs (not recommended)" \
+        --example "sudo lamboot-pve-setup setup 100" \
+        --example "sudo lamboot-pve-setup setup 100 --role webserver --fleet-id prod-01" \
+        --example "sudo lamboot-pve-setup setup 100 --dry-run" \
+        --notes "Idempotent: re-running is a no-op if already set up. Appends to existing args (never overwrites). Writes /var/lib/lamboot/<VMID>.json with initial state. Requires rewritten hookscript (lamboot-dev >= 0.8.4) installed on host." \
+        --offline-capable "false" \
+        --requires-root "true" \
+        --see-also "teardown, check, doctor-hookscript, lamboot-pve-fleet" \
+        --doc-url "https://lamboot.dev/tools/pve-setup/setup" \
+        --maturity "beta"
+
+    register_subcommand \
+        --name "teardown" \
+        --category "VM Integration" \
+        --summary "Remove LamBoot integration from a VM" \
+        --syntax "lamboot-pve-setup teardown VMID [--running-ok]" \
+        --arg "VMID:Proxmox VMID" \
+        --example "sudo lamboot-pve-setup teardown 100" \
+        --notes "Strips only our fw_cfg segment from args (preserving other args). Removes hookscript if it matches ours. Leaves /var/lib/lamboot/<VMID>.json for forensic use (rm manually if desired)." \
+        --offline-capable "false" \
+        --requires-root "true" \
+        --see-also "setup" \
+        --doc-url "https://lamboot.dev/tools/pve-setup/teardown" \
+        --maturity "beta"
+
+    register_subcommand \
+        --name "check" \
+        --category "Diagnostics" \
+        --summary "Diagnose integration state for one VM (read-only)" \
+        --syntax "lamboot-pve-setup check VMID [--json]" \
+        --arg "VMID:Proxmox VMID" \
+        --example "lamboot-pve-setup check 100" \
+        --example "lamboot-pve-setup check 100 --json | jq .findings" \
+        --notes "Reports: fw_cfg present, hookscript attached, per-VM JSON exists, VM firmware mode." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "setup, doctor-hookscript" \
+        --doc-url "https://lamboot.dev/tools/pve-setup/check" \
+        --maturity "beta"
+
+    register_subcommand \
+        --name "doctor-hookscript" \
+        --category "Diagnostics" \
+        --summary "Verify rewritten hookscript is installed + version ≥ 0.8.4" \
+        --syntax "lamboot-pve-setup doctor-hookscript [--json]" \
+        --example "lamboot-pve-setup doctor-hookscript" \
+        --notes "Searches known locations: /var/lib/vz/snippets/, /usr/local/bin/, /var/lib/lamboot/snippets/. Extracts version from hookscript header comment." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "setup" \
+        --doc-url "https://lamboot.dev/tools/pve-setup/doctor-hookscript" \
+        --maturity "beta"
+}
+
+# ── Remediation helper ───────────────────────────────────────────────────
+
+_remediation_json() {
+    local id="$1" summary="$2" cmd="${3:-}"
+    local doc="${DOC_BASE}/${id//.//}"
+    local cmd_field="\"\""
+    [[ -n "$cmd" ]] && cmd_field="\"$(json_escape "$cmd")\""
+    printf '{"summary":"%s","command":%s,"doc_url":"%s"}' \
+        "$(json_escape "$summary")" "$cmd_field" "$doc"
+}
+
+# ── Prerequisite checks ──────────────────────────────────────────────────
+
+require_proxmox_host() {
+    if ! command -v qm >/dev/null 2>&1; then
+        die_prerequisite "qm not found; this tool requires a Proxmox VE host"
+    fi
+    if [[ ! -d /etc/pve ]]; then
+        warn "not running on a typical Proxmox host (/etc/pve absent); proceeding anyway"
+    fi
+}
+
+# Search hookscript locations; return path + version or fail
+find_hookscript() {
+    local candidates=(
+        "/var/lib/vz/snippets/lamboot-hookscript.pl"
+        "/usr/local/bin/lamboot-hookscript.pl"
+        "/var/lib/lamboot/snippets/lamboot-hookscript.pl"
+    )
+    [[ -n "$OPT_HOOKSCRIPT" ]] && candidates=("$OPT_HOOKSCRIPT" "${candidates[@]}")
+
+    for path in "${candidates[@]}"; do
+        [[ -f "$path" ]] && { printf '%s' "$path"; return 0; }
+    done
+    return 1
+}
+
+hookscript_version() {
+    local path="$1"
+    # Expect "# version: X.Y.Z" somewhere in the first 30 lines
+    head -30 "$path" 2>/dev/null | grep -oE '# version: [0-9]+\.[0-9]+\.[0-9]+' | head -1 | cut -d' ' -f3
+}
+
+version_ge() {
+    # Compare X.Y.Z >= A.B.C using sort -V
+    local actual="$1" required="$2"
+    [[ "$(printf '%s\n%s' "$required" "$actual" | sort -V | head -1)" == "$required" ]]
+}
+
+# ── VM state helpers ─────────────────────────────────────────────────────
+
+vm_exists() {
+    local vmid="$1"
+    qm status "$vmid" >/dev/null 2>&1
+}
+
+vm_is_running() {
+    local vmid="$1"
+    local st
+    st=$(qm status "$vmid" 2>/dev/null | awk '/^status/{print $2}')
+    [[ "$st" == "running" ]]
+}
+
+vm_bios() {
+    local vmid="$1"
+    qm config "$vmid" 2>/dev/null | awk -F: '/^bios:/{sub(/^ */,"",$2); print $2}'
+}
+
+vm_args() {
+    local vmid="$1"
+    qm config "$vmid" 2>/dev/null | sed -n 's/^args: //p' | head -1
+}
+
+vm_hookscript() {
+    local vmid="$1"
+    qm config "$vmid" 2>/dev/null | sed -n 's/^hookscript: //p' | head -1
+}
+
+vm_tags() {
+    local vmid="$1"
+    qm config "$vmid" 2>/dev/null | sed -n 's/^tags: //p' | head -1 | tr ',' ' '
+}
+
+# ── fleet.toml parsing (tolerant bash parser) ────────────────────────────
+
+read_fleet_config_value() {
+    local section="$1" key="$2" file="${3:-$OPT_FLEET_CONFIG}"
+    [[ ! -f "$file" ]] && return 1
+    # Extract value following `key = ` in the given section
+    awk -v section="$section" -v key="$key" '
+        /^\[.*\]$/ { in_sec = ($0 == "[" section "]") ? 1 : 0; next }
+        in_sec && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            # Strip leading key=, trim whitespace, strip surrounding quotes
+            sub(/^[[:space:]]*[^=]+=[[:space:]]*/, "")
+            gsub(/^"|"$/, "")
+            gsub(/^'\''|'\''$/, "")
+            print
+            exit
+        }
+    ' "$file"
+}
+
+read_fleet_role_for_vmid() {
+    local vmid="$1" file="${2:-$OPT_FLEET_CONFIG}"
+    [[ ! -f "$file" ]] && return 1
+    read_fleet_config_value "roles" "\"$vmid\"" "$file"
+}
+
+# ── Determine role for a VM ──────────────────────────────────────────────
+
+determine_role() {
+    local vmid="$1"
+    [[ -n "$OPT_ROLE" ]] && { printf '%s' "$OPT_ROLE"; return; }
+
+    # Try explicit role mapping in fleet.toml
+    local role
+    role=$(read_fleet_role_for_vmid "$vmid" 2>/dev/null || true)
+    [[ -n "$role" ]] && { printf '%s' "$role"; return; }
+
+    # Try tag-based inference from [tags] in fleet.toml + Proxmox tags
+    local vm_tag_list
+    vm_tag_list=$(vm_tags "$vmid" 2>/dev/null || true)
+    if [[ -n "$vm_tag_list" ]] && [[ -f "$OPT_FLEET_CONFIG" ]]; then
+        # Parse [tags] section — each role = ["tag1", "tag2"]
+        local line in_tags=0
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^\[.*\]$ ]]; then
+                [[ "$line" == "[tags]" ]] && in_tags=1 || in_tags=0
+                continue
+            fi
+            [[ $in_tags -eq 0 ]] && continue
+            # Line format:  rolename = ["tag1", "tag2"]
+            if [[ "$line" =~ ^([a-zA-Z_][a-zA-Z0-9_-]*)[[:space:]]*=[[:space:]]*\[(.*)\] ]]; then
+                local role_candidate="${BASH_REMATCH[1]}"
+                local tags_list="${BASH_REMATCH[2]}"
+                # Check if any of tags_list appears in vm_tag_list
+                local t
+                for t in $(printf '%s' "$tags_list" | tr -d ' "'\''' | tr ',' ' '); do
+                    for vt in $vm_tag_list; do
+                        if [[ "$t" == "$vt" ]]; then
+                            printf '%s' "$role_candidate"
+                            return
+                        fi
+                    done
+                done
+            fi
+        done < "$OPT_FLEET_CONFIG"
+    fi
+
+    # Final fallback: role is first Proxmox tag, or "unassigned"
+    local first_tag
+    first_tag=$(printf '%s' "$vm_tag_list" | awk '{print $1}')
+    printf '%s' "${first_tag:-unassigned}"
+}
+
+determine_fleet_id() {
+    [[ -n "$OPT_FLEET_ID" ]] && { printf '%s' "$OPT_FLEET_ID"; return; }
+    local id
+    id=$(read_fleet_config_value "fleet" "id" 2>/dev/null || true)
+    printf '%s' "${id:-default-fleet}"
+}
+
+# ── Subcommand: doctor-hookscript ────────────────────────────────────────
+
+do_doctor_hookscript() {
+    local path
+    if ! path=$(find_hookscript); then
+        warn "lamboot-hookscript.pl not found on this host"
+        warn "Required: lamboot-dev >= $HOOKSCRIPT_MIN_VERSION (fw_cfg file-reference pattern)"
+        warn "Install lamboot-dev release, or see ~/lamboot-dev/docs/PROXMOX-INTEGRATION-ROADMAP.md"
+        emit_finding "pve.hookscript.missing" "pve_hookscript" "critical" "fail" \
+            "lamboot-hookscript.pl not found on this host" \
+            "Install lamboot-dev >= ${HOOKSCRIPT_MIN_VERSION} with the rewritten hookscript (fw_cfg file-reference pattern)." \
+            "{}" \
+            "$(_remediation_json "pve.hookscript.missing" \
+                "Install lamboot-dev v0.8.4 or later" \
+                "See ~/lamboot-dev/docs/PROXMOX-INTEGRATION-ROADMAP.md Phase 1")"
+        emit_json "$EXIT_PREREQUISITE"
+        exit "$EXIT_PREREQUISITE"
+    fi
+
+    local version
+    version=$(hookscript_version "$path" 2>/dev/null || true)
+
+    if [[ -z "$version" ]]; then
+        warn "Hookscript found but version unreadable: $path"
+        emit_finding "pve.hookscript.unversioned" "pve_hookscript" "warning" "warn" \
+            "Hookscript found but version unreadable" \
+            "Path: $path. Header comment missing '# version: X.Y.Z' line." \
+            "{\"path\":\"$(json_escape "$path")\"}" \
+            "$(_remediation_json "pve.hookscript.unversioned" \
+                "Update to a versioned hookscript" \
+                "See ~/lamboot-dev/docs/PROXMOX-INTEGRATION-ROADMAP.md")"
+        emit_json "$EXIT_PARTIAL"
+        exit "$EXIT_PARTIAL"
+    fi
+
+    if ! version_ge "$version" "$HOOKSCRIPT_MIN_VERSION"; then
+        warn "Hookscript version $version is too old (need >= $HOOKSCRIPT_MIN_VERSION)"
+        warn "Path: $path"
+        emit_finding "pve.hookscript.outdated" "pve_hookscript" "critical" "fail" \
+            "Hookscript version $version is too old" \
+            "Minimum required: $HOOKSCRIPT_MIN_VERSION (fw_cfg file-reference pattern). Current versions prior to 0.8.4 call 'qm set' during pre-start which config-locks." \
+            "{\"path\":\"$(json_escape "$path")\",\"version\":\"$(json_escape "$version")\",\"required\":\"$HOOKSCRIPT_MIN_VERSION\"}" \
+            "$(_remediation_json "pve.hookscript.outdated" \
+                "Update lamboot-dev to >= ${HOOKSCRIPT_MIN_VERSION}" \
+                "Install latest lamboot-dev release")"
+        emit_json "$EXIT_PREREQUISITE"
+        exit "$EXIT_PREREQUISITE"
+    fi
+
+    emit_finding "pve.hookscript.ok" "pve_hookscript" "info" "pass" \
+        "Hookscript present and version OK" \
+        "Path: $path. Version: $version (>= $HOOKSCRIPT_MIN_VERSION)." \
+        "{\"path\":\"$(json_escape "$path")\",\"version\":\"$(json_escape "$version")\"}" \
+        '{}'
+
+    success "Hookscript $version at $path"
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── Subcommand: check ────────────────────────────────────────────────────
+
+do_check() {
+    [[ -n "$OPT_VMID" ]] || die "check requires VMID as first positional argument"
+    require_proxmox_host
+
+    if ! vm_exists "$OPT_VMID"; then
+        emit_finding "pve.vm.not_found" "pve_vm" "critical" "fail" \
+            "VM $OPT_VMID not found" \
+            "qm status $OPT_VMID returned non-zero." \
+            "{\"vmid\":\"$OPT_VMID\"}" '{}'
+        emit_json "$EXIT_NOT_APPLICABLE"
+        exit "$EXIT_NOT_APPLICABLE"
+    fi
+
+    local bios args hook
+    bios=$(vm_bios "$OPT_VMID")
+    args=$(vm_args "$OPT_VMID")
+    hook=$(vm_hookscript "$OPT_VMID")
+
+    emit_finding "pve.vm.bios" "pve_vm" "info" "pass" \
+        "VM $OPT_VMID firmware: ${bios:-seabios}" "" \
+        "{\"vmid\":\"$OPT_VMID\",\"bios\":\"$(json_escape "${bios:-seabios}")\"}" '{}'
+
+    if [[ "$bios" != "ovmf" ]]; then
+        emit_finding "pve.vm.not_ovmf" "pve_vm" "warning" "warn" \
+            "VM $OPT_VMID is not OVMF" \
+            "LamBoot integration requires UEFI (OVMF). Convert via Proxmox UI or qm set." \
+            "{\"vmid\":\"$OPT_VMID\",\"bios\":\"$(json_escape "${bios:-seabios}")\"}" \
+            "$(_remediation_json "pve.vm.not_ovmf" \
+                "Switch VM firmware to OVMF" \
+                "qm set $OPT_VMID --bios ovmf --efidisk0 local-zfs:1,efitype=4m")"
+    fi
+
+    if printf '%s' "$args" | grep -q "$FW_CFG_NAME"; then
+        emit_finding "pve.integration.fw_cfg" "pve_integration" "info" "pass" \
+            "fw_cfg integration present" "" \
+            "{\"vmid\":\"$OPT_VMID\"}" '{}'
+    else
+        emit_finding "pve.integration.fw_cfg_missing" "pve_integration" "warning" "fail" \
+            "fw_cfg integration not present on VM $OPT_VMID" "" \
+            "{\"vmid\":\"$OPT_VMID\"}" \
+            "$(_remediation_json "pve.integration.fw_cfg_missing" \
+                "Run setup for this VM" \
+                "sudo lamboot-pve-setup setup $OPT_VMID")"
+    fi
+
+    if printf '%s' "$hook" | grep -q "lamboot-hookscript"; then
+        emit_finding "pve.integration.hookscript_attached" "pve_integration" "info" "pass" \
+            "Hookscript attached: $hook" "" \
+            "{\"vmid\":\"$OPT_VMID\",\"hookscript\":\"$(json_escape "$hook")\"}" '{}'
+    else
+        emit_finding "pve.integration.hookscript_missing" "pve_integration" "warning" "fail" \
+            "Hookscript not attached to VM $OPT_VMID" "" \
+            "{\"vmid\":\"$OPT_VMID\"}" \
+            "$(_remediation_json "pve.integration.hookscript_missing" \
+                "Run setup for this VM" \
+                "sudo lamboot-pve-setup setup $OPT_VMID")"
+    fi
+
+    local json_file="${STATE_DIR}/${OPT_VMID}.json"
+    if [[ -f "$json_file" ]]; then
+        emit_finding "pve.integration.json_file" "pve_integration" "info" "pass" \
+            "Per-VM JSON file present: $json_file" "" \
+            "{\"vmid\":\"$OPT_VMID\",\"path\":\"$(json_escape "$json_file")\"}" '{}'
+    else
+        emit_finding "pve.integration.json_file_missing" "pve_integration" "warning" "fail" \
+            "Per-VM JSON file missing: $json_file" "" \
+            "{\"vmid\":\"$OPT_VMID\"}" '{}'
+    fi
+
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── Subcommand: setup ────────────────────────────────────────────────────
+
+do_setup() {
+    [[ -n "$OPT_VMID" ]] || die "setup requires VMID as first positional argument"
+    require_root
+    require_proxmox_host
+
+    # Prerequisite: hookscript present + new enough
+    local hookscript_path
+    if ! hookscript_path=$(find_hookscript); then
+        die_prerequisite "lamboot-hookscript.pl missing; install lamboot-dev >= ${HOOKSCRIPT_MIN_VERSION}"
+    fi
+    local hook_ver
+    hook_ver=$(hookscript_version "$hookscript_path" 2>/dev/null || true)
+    if [[ -n "$hook_ver" ]] && ! version_ge "$hook_ver" "$HOOKSCRIPT_MIN_VERSION"; then
+        die_prerequisite "hookscript $hook_ver < $HOOKSCRIPT_MIN_VERSION (broken fw_cfg pattern)"
+    fi
+
+    # VM exists
+    vm_exists "$OPT_VMID" || die "VM $OPT_VMID not found"
+
+    # VM firmware check
+    local bios
+    bios=$(vm_bios "$OPT_VMID")
+    if [[ "$bios" != "ovmf" ]] && [[ $OPT_BIOS_OVERRIDE -eq 0 ]]; then
+        emit_finding "pve.setup.not_ovmf" "pve_setup" "error" "fail" \
+            "VM $OPT_VMID is not OVMF (${bios:-seabios})" \
+            "LamBoot integration requires UEFI. Use --bios-override to force, or convert firmware first." \
+            "{\"vmid\":\"$OPT_VMID\",\"bios\":\"${bios:-seabios}\"}" \
+            "$(_remediation_json "pve.setup.not_ovmf" \
+                "Convert firmware to OVMF first" \
+                "qm set $OPT_VMID --bios ovmf --efidisk0 local-zfs:1,efitype=4m")"
+        emit_json "$EXIT_NOT_APPLICABLE"
+        exit "$EXIT_NOT_APPLICABLE"
+    fi
+
+    # Running check
+    if vm_is_running "$OPT_VMID" && [[ $OPT_RUNNING_OK -eq 0 ]]; then
+        emit_finding "pve.setup.vm_running" "pve_setup" "error" "fail" \
+            "VM $OPT_VMID is running" \
+            "qm set on a running VM won't affect this boot. Use --running-ok if that's intended." \
+            "{\"vmid\":\"$OPT_VMID\"}" \
+            "$(_remediation_json "pve.setup.vm_running" \
+                "Stop VM or use --running-ok" \
+                "qm stop $OPT_VMID")"
+        emit_json "$EXIT_UNSAFE"
+        exit "$EXIT_UNSAFE"
+    fi
+
+    # Determine role + fleet ID
+    local role fleet_id
+    role=$(determine_role "$OPT_VMID")
+    fleet_id=$(determine_fleet_id)
+
+    info "Setting up VM $OPT_VMID: fleet=$fleet_id role=$role"
+
+    # Check for idempotency
+    local current_args current_hook
+    current_args=$(vm_args "$OPT_VMID" 2>/dev/null || true)
+    current_hook=$(vm_hookscript "$OPT_VMID" 2>/dev/null || true)
+
+    local need_args=1 need_hook=1 need_json=1
+    if printf '%s' "$current_args" | grep -q "$FW_CFG_NAME"; then
+        need_args=0
+        verbose "args already contains fw_cfg — skipping"
+    fi
+    if [[ -n "$current_hook" ]] && printf '%s' "$current_hook" | grep -q "lamboot-hookscript"; then
+        need_hook=0
+        verbose "hookscript already attached — skipping"
+    fi
+
+    local json_file="${STATE_DIR}/${OPT_VMID}.json"
+    if [[ -f "$json_file" ]] && grep -q "\"vmid\":\"$OPT_VMID\"" "$json_file" 2>/dev/null; then
+        need_json=0
+        verbose "per-VM JSON already present — will rewrite"
+        # Always rewrite JSON (fresh timestamp); don't count as noop based on this
+        need_json=1
+    fi
+
+    if [[ $need_args -eq 0 ]] && [[ $need_hook -eq 0 ]] && [[ -f "$json_file" ]]; then
+        emit_finding "pve.setup.already_done" "pve_setup" "info" "pass" \
+            "VM $OPT_VMID is already fully set up" "" \
+            "{\"vmid\":\"$OPT_VMID\"}" '{}'
+        info "Nothing to do — VM $OPT_VMID is already set up"
+        emit_json "$EXIT_NOOP"
+        exit "$EXIT_NOOP"
+    fi
+
+    # Plan summary
+    info "Plan:"
+    [[ $need_json -eq 1 ]] && info "  write $json_file"
+    [[ $need_args -eq 1 ]] && info "  qm set $OPT_VMID --args '<preserved>-fw_cfg name=$FW_CFG_NAME,file=$json_file'"
+    [[ $need_hook -eq 1 ]] && info "  qm set $OPT_VMID --hookscript $hookscript_path"
+
+    # Execute
+    if [[ $LAMBOOT_DRY_RUN -eq 1 ]]; then
+        record_action "pve.setup.dry_run" "$OPT_VMID" "ok" "false" \
+            "{\"vmid\":\"$OPT_VMID\"}" "null"
+        success "DRY-RUN: setup planned for VM $OPT_VMID"
+        emit_json "$EXIT_OK"
+        exit "$EXIT_OK"
+    fi
+
+    # 1. Write per-VM JSON
+    if [[ $need_json -eq 1 ]]; then
+        mkdir -p "$STATE_DIR" || die "cannot create $STATE_DIR"
+        chmod 0755 "$STATE_DIR"
+
+        local tags_array="[]"
+        local vm_tag_list
+        vm_tag_list=$(vm_tags "$OPT_VMID" 2>/dev/null || true)
+        if [[ -n "$vm_tag_list" ]]; then
+            local tags_json=""
+            for t in $vm_tag_list; do
+                tags_json="${tags_json:+${tags_json},}\"$(json_escape "$t")\""
+            done
+            tags_array="[${tags_json}]"
+        fi
+
+        cat > "$json_file" <<EOF
+{
+  "schema_version": "${LAMBOOT_TOOLKIT_SCHEMA_VERSION}",
+  "vmid": "$OPT_VMID",
+  "hostname": "$(hostname)",
+  "fleet_id": "$(json_escape "$fleet_id")",
+  "role": "$(json_escape "$role")",
+  "written_by": "lamboot-pve-setup ${LAMBOOT_TOOL_VERSION}",
+  "written_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "tags_at_setup": $tags_array
+}
+EOF
+        chmod 0644 "$json_file"
+        record_action "pve.setup.json_written" "$json_file" "ok" "false" \
+            "{\"vmid\":\"$OPT_VMID\",\"role\":\"$role\",\"fleet_id\":\"$fleet_id\"}" "null"
+    fi
+
+    # 2. Append args:
+    if [[ $need_args -eq 1 ]]; then
+        local fw_cfg_segment="-fw_cfg name=${FW_CFG_NAME},file=${json_file}"
+        local new_args
+        if [[ -n "$current_args" ]]; then
+            new_args="${current_args} ${fw_cfg_segment}"
+        else
+            new_args="$fw_cfg_segment"
+        fi
+        lamboot_run qm set "$OPT_VMID" --args "$new_args" \
+            || die "qm set --args failed"
+        record_action "pve.setup.args_appended" "$OPT_VMID" "ok" "true" \
+            "{\"vmid\":\"$OPT_VMID\",\"appended\":\"$(json_escape "$fw_cfg_segment")\"}" "null"
+    fi
+
+    # 3. Attach hookscript
+    if [[ $need_hook -eq 1 ]]; then
+        local hook_ref
+        # Convert absolute path to Proxmox storage form if under snippets/
+        if [[ "$hookscript_path" == /var/lib/vz/snippets/* ]]; then
+            hook_ref="local:snippets/$(basename "$hookscript_path")"
+        else
+            hook_ref="$hookscript_path"
+        fi
+        lamboot_run qm set "$OPT_VMID" --hookscript "$hook_ref" \
+            || die "qm set --hookscript failed"
+        record_action "pve.setup.hookscript_attached" "$OPT_VMID" "ok" "true" \
+            "{\"vmid\":\"$OPT_VMID\",\"hookscript\":\"$(json_escape "$hook_ref")\"}" "null"
+    fi
+
+    emit_finding "pve.setup.complete" "pve_setup" "info" "pass" \
+        "VM $OPT_VMID set up with LamBoot integration" \
+        "Fleet: $fleet_id, role: $role. Will activate on next VM start." \
+        "{\"vmid\":\"$OPT_VMID\",\"fleet_id\":\"$fleet_id\",\"role\":\"$role\"}" \
+        '{}'
+
+    success "Setup complete for VM $OPT_VMID (fleet=$fleet_id role=$role)"
+
+    if vm_is_running "$OPT_VMID"; then
+        info "VM is running — changes take effect on next restart"
+    fi
+
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── Subcommand: teardown ─────────────────────────────────────────────────
+
+do_teardown() {
+    [[ -n "$OPT_VMID" ]] || die "teardown requires VMID as first positional argument"
+    require_root
+    require_proxmox_host
+
+    vm_exists "$OPT_VMID" || die "VM $OPT_VMID not found"
+
+    if vm_is_running "$OPT_VMID" && [[ $OPT_RUNNING_OK -eq 0 ]]; then
+        die_unsafe "VM $OPT_VMID is running; use --running-ok to proceed"
+    fi
+
+    local current_args current_hook
+    current_args=$(vm_args "$OPT_VMID" 2>/dev/null || true)
+    current_hook=$(vm_hookscript "$OPT_VMID" 2>/dev/null || true)
+
+    # Strip our fw_cfg segment from args
+    if printf '%s' "$current_args" | grep -q "$FW_CFG_NAME"; then
+        local new_args
+        # Remove `-fw_cfg name=opt/lamboot/config,file=...` (match until next space or EOL)
+        new_args=$(printf '%s' "$current_args" | sed -E "s@-fw_cfg name=${FW_CFG_NAME},file=[^ ]*@@g" | sed 's/  */ /g; s/^ //; s/ $//')
+
+        if [[ -n "$new_args" ]]; then
+            lamboot_run qm set "$OPT_VMID" --args "$new_args"
+        else
+            lamboot_run qm set "$OPT_VMID" --delete args
+        fi
+        record_action "pve.teardown.args_stripped" "$OPT_VMID" "ok" "true" '{}' "null"
+    fi
+
+    # Remove hookscript if ours
+    if printf '%s' "$current_hook" | grep -q "lamboot-hookscript"; then
+        lamboot_run qm set "$OPT_VMID" --delete hookscript
+        record_action "pve.teardown.hookscript_removed" "$OPT_VMID" "ok" "true" '{}' "null"
+    fi
+
+    emit_finding "pve.teardown.complete" "pve_teardown" "info" "pass" \
+        "VM $OPT_VMID integration removed" \
+        "Per-VM JSON at ${STATE_DIR}/${OPT_VMID}.json left for forensic use." \
+        "{\"vmid\":\"$OPT_VMID\"}" '{}'
+
+    success "Teardown complete for VM $OPT_VMID"
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── CLI ──────────────────────────────────────────────────────────────────
+
+parse_args() {
+    local positional=()
+    while [[ $# -gt 0 ]]; do
+        parse_common_flag "$1"
+        local rc=$?
+        case $rc in
+            1) shift; continue ;;
+            2) _register_subcommands; dispatch_help; exit 0 ;;
+            3) printf 'lamboot-pve-setup %s (lamboot-tools %s)\n' \
+                "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
+            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            5) shift; shift; continue ;;  # --offline accepted but not used
+            0) ;;
+        esac
+
+        case "$1" in
+            --role)           OPT_ROLE="${2:-}"; shift 2 ;;
+            --fleet-id)       OPT_FLEET_ID="${2:-}"; shift 2 ;;
+            --hookscript)     OPT_HOOKSCRIPT="${2:-}"; shift 2 ;;
+            --running-ok)     OPT_RUNNING_OK=1; shift ;;
+            --bios-override)  OPT_BIOS_OVERRIDE=1; shift ;;
+            --config)         OPT_FLEET_CONFIG="${2:-}"; shift 2 ;;
+            setup|teardown|check|doctor-hookscript|help)
+                if [[ -z "$OPT_SUBCOMMAND" ]]; then
+                    OPT_SUBCOMMAND="$1"
+                else
+                    positional+=("$1")
+                fi
+                shift ;;
+            -*)               die "unknown option: $1" ;;
+            *)                positional+=("$1"); shift ;;
+        esac
+    done
+
+    if [[ "$OPT_SUBCOMMAND" == "help" ]]; then
+        _register_subcommands
+        if [[ ${#positional[@]} -gt 0 ]]; then
+            dispatch_help "${positional[0]}"
+        else
+            dispatch_help
+        fi
+        exit 0
+    fi
+
+    # First positional after subcommand is VMID
+    if [[ ${#positional[@]} -gt 0 ]]; then
+        OPT_VMID="${positional[0]}"
+    fi
+}
+
+main() {
+    parse_args "$@"
+
+    [[ -z "$OPT_SUBCOMMAND" ]] && die "no subcommand (try: lamboot-pve-setup help)"
+
+    case "$OPT_SUBCOMMAND" in
+        setup)             do_setup ;;
+        teardown)          do_teardown ;;
+        check)             do_check ;;
+        doctor-hookscript) do_doctor_hookscript ;;
+        *)                 die "unknown subcommand: $OPT_SUBCOMMAND" ;;
+    esac
+}
+
+main "$@"

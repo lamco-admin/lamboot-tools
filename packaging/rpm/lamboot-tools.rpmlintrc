@@ -1,0 +1,41 @@
+# rpmlintrc for lamboot-tools, lamboot-migrate, lamboot-toolkit-pve
+#
+# Filters findings that are false positives for this package's architecture.
+
+# Spelling errors in package descriptions: this is a technical UEFI/systemd
+# boot toolkit — nearly every flagged term (systemd, UKI, rEFInd, OVMF, TOML,
+# fw_cfg, hookscript, etc.) is a proper noun or term of art. rpmlint's English
+# dictionary can't evaluate them. Filter the category entirely. Genuine typos
+# are still caught by shellcheck, spec review, and man page / website linting.
+addFilter(r"spelling-error")
+
+# The shared library files at /usr/lib/lamboot-tools/lamboot-toolkit-*.sh are
+# sourced, not executed. They carry #!/bin/bash for shellcheck and editor
+# recognition only. Mode 644 (non-executable) is intentional — executing them
+# directly would do nothing meaningful.
+addFilter(r"non-executable-script /usr/lib/lamboot-tools/lamboot-toolkit-(lib|help)\.sh")
+
+# lamboot-pve-monitor and lamboot-pve-ovmf-vars are mirrored from lamboot-dev
+# at release-build time. Their man pages are pending lamboot-dev v0.9.x work.
+# Documented in docs/CROSS-REPO-STATUS.md.
+addFilter(r"no-manual-page-for-binary lamboot-pve-monitor")
+addFilter(r"no-manual-page-for-binary lamboot-pve-ovmf-vars")
+
+# noarch package with only shell scripts in /usr/lib is the correct FHS layout
+# for a tool suite sharing runtime library files. See SPEC-LAMBOOT-TOOLKIT-V1
+# section 6.1 (shared library contract).
+addFilter(r"only-non-binary-in-usr-lib")
+
+# (Removed dangling/absolute symlink filter — the current symlink target
+# passes rpmlint as-is. Re-add if a future rpmlint version flags it.)
+
+# Spec filename vs. package name: standalone-migrate spec is named
+# lamboot-migrate-standalone.spec but produces Name: lamboot-migrate. This
+# is intentional — the "standalone" qualifier distinguishes it from the
+# subpackage built by lamboot-tools.spec.
+addFilter(r"invalid-spec-name")
+
+# A single rpmlintrc serves three RPMs (lamboot-tools + subpackage + migrate-
+# standalone). Filters that don't apply to every RPM surface as "unused" —
+# that is acceptable; invoke rpmlint with --ignore-unused-rpmlintrc to
+# suppress them. See docs/RELEASE.md §5 for the exact command.

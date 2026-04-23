@@ -1,0 +1,410 @@
+.\" lamboot-uki-build(1) — auto-generated from help registry
+.\" Source: tools/lamboot-uki-build
+.\" Generated: 2026-04-23T12:02:40Z
+.\" DO NOT EDIT — regenerate via `make man` or `scripts/registry-to-man`.
+.TH "LAMBOOT-UKI-BUILD" "1" "2026-04-23" "lamboot-uki-build 0.2.0" "lamboot-tools"
+.SH NAME
+lamboot-uki-build \- part of the lamboot-tools suite
+.SH SYNOPSIS
+.B lamboot-uki-build
+[\fIGLOBAL FLAGS\fR] [\fISUBCOMMAND\fR] [\fIARGS\fR]
+.SH DESCRIPTION
+lamboot-uki-build is part of
+.BR lamboot-tools (7),
+"The Linux UEFI boot toolkit." See that page for suite-level conventions
+and cross-tool composition.
+.PP
+This page documents every subcommand registered in lamboot-uki-build's help
+registry. Every subcommand is also accessible via
+.BI "lamboot-uki-build help " SUBCOMMAND
+at runtime.
+.SH SUBCOMMANDS
+.SS build
+.PP
+.I Compose a Unified Kernel Image from a kernel + initrd + cmdline
+.PP
+.B Category:
+UKI
+.br
+.B Maturity:
+beta
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-uki\-build build OUTPUT.efi \-\-kernel PATH [\-\-initrd PATH]... [\-\-cmdline STR] [\-\-osrel PATH] [\-\-splash PATH] [\-\-backend ukify|objcopy]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B OUTPUT.efi
+Output UKI path
+.TP
+.B \-\-kernel PATH
+Source kernel vmlinuz (required)
+.TP
+.B \-\-initrd PATH
+Source initrd (repeatable for multi\-initrd concat)
+.TP
+.B \-\-cmdline STR
+Kernel cmdline to embed (default: empty)
+.TP
+.B \-\-osrel PATH
+os\-release file (default: /etc/os\-release)
+.TP
+.B \-\-uname STR
+Kernel version for .uname
+.TP
+.B \-\-splash PATH
+BMP splash image (optional)
+.TP
+.B \-\-dtb PATH
+Device tree blob (optional)
+.TP
+.B \-\-stub PATH
+EFI stub binary (default: auto\-detect systemd\-stub)
+.TP
+.B \-\-backend ukify
+\-\-backend ukify
+.TP
+.B objcopy
+Build backend (default: auto — ukify if available)
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-uki\-build build /boot/efi/EFI/Linux/custom.efi \-\-kernel /boot/vmlinuz\-6.12 \-\-initrd /boot/initramfs\-6.12.img \-\-cmdline \'root=UUID=abc ro quiet\'
+lamboot\-uki\-build build /tmp/test.efi \-\-kernel /boot/vmlinuz\-$(uname \-r) \-\-initrd /boot/initrd.img\-$(uname \-r)
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Wraps ukify (preferred) or objcopy (fallback). Produces UKIs per UAPI.5 spec that work with any UKI\-aware bootloader.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+inspect, sign, verify, lamboot\-signing\-keys
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/uki-build/build
+.UE
+.RE
+.PP
+.SS inspect
+.PP
+.I Parse an existing UKI and display its PE sections
+.PP
+.B Category:
+UKI
+.br
+.B Maturity:
+beta
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-uki\-build inspect UKI.efi [\-\-json]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B UKI.efi
+Input UKI file
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+lamboot\-uki\-build inspect /boot/efi/EFI/Linux/linux.efi
+lamboot\-uki\-build inspect uki.efi \-\-json 
+ jq .findings
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Read\-only. Parses PE headers without external dependency. Extracts text content of .osrel, .cmdline, .uname sections.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+build, sign, verify
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/uki-build/inspect
+.UE
+.RE
+.PP
+.SS sign
+.PP
+.I Sign a UKI with sbsign
+.PP
+.B Category:
+UKI
+.br
+.B Maturity:
+beta
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-uki\-build sign UKI.efi \-\-key KEY \-\-cert CERT [\-\-output OUT]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B UKI.efi
+UKI file to sign
+.TP
+.B \-\-key PATH
+Private key
+.TP
+.B \-\-cert PATH
+Signing certificate
+.TP
+.B \-\-output PATH
+Output file (default: overwrite input)
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-uki\-build sign linux.efi \-\-key /etc/keys/db.key \-\-cert /etc/keys/db.crt
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Wraps sbsign. Signed UKIs verify against the cert via sbverify or any Secure Boot chain that trusts the cert.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+build, verify, lamboot\-signing\-keys
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/uki-build/sign
+.UE
+.RE
+.PP
+.SS verify
+.PP
+.I Verify a UKI\'s signature against a cert
+.PP
+.B Category:
+UKI
+.br
+.B Maturity:
+beta
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-uki\-build verify UKI.efi \-\-cert CERT
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B UKI.efi
+UKI file to verify
+.TP
+.B \-\-cert PATH
+Certificate to verify against
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+lamboot\-uki\-build verify linux.efi \-\-cert /etc/keys/db.crt
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Wraps sbverify. Exit 0 on valid signature, non\-zero on failure.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+build, sign
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/uki-build/verify
+.UE
+.RE
+.PP
+.SH GLOBAL FLAGS
+Every subcommand accepts these universal flags (documented in
+.BR lamboot-tools (7)):
+.TP
+.BR \-\-help ", " \-h
+Show inline help
+.TP
+.B \-\-version
+Print tool and toolkit version
+.TP
+.B \-\-json
+Emit unified JSON output (schema v1)
+.TP
+.B \-\-json-schema
+Print the JSON schema this tool emits
+.TP
+.BR \-\-verbose ", " \-v
+Informational output beyond the default
+.TP
+.BR \-\-quiet ", " \-q
+Only warnings and errors
+.TP
+.B \-\-no-color
+Disable ANSI color (auto on non-TTY)
+.TP
+.B \-\-dry-run
+Print planned actions without executing
+.TP
+.BR \-\-yes ", " \-y
+Answer yes to interactive prompts
+.TP
+.B \-\-force
+Skip safety checks (per-subcommand semantics)
+.TP
+.B \-\-auto
+Non-interactive full automation (implies \fB\-\-yes\fR)
+.TP
+.BI \-\-offline " DISK"
+Operate on an unmounted disk or image
+.TP
+.B \-\-suggest-next-command
+Print the recommended follow-up command
+.SH EXIT STATUS
+.TP
+.B 0
+Success
+.TP
+.B 1
+Fatal error
+.TP
+.B 2
+Partial \- some operations succeeded, some failed
+.TP
+.B 3
+Nothing to do (already in requested state)
+.TP
+.B 4
+Refused due to a safety check
+.TP
+.B 5
+User declined interactive confirmation
+.TP
+.B 6
+Operation does not apply to this system
+.TP
+.B 7
+Required tool or capability is missing
+.SH FILES
+.TP
+.I /usr/lib/lamboot-tools/lamboot-toolkit-lib.sh
+Shared library sourced by every tool
+.TP
+.I /usr/lib/lamboot-tools/lamboot-toolkit-help.sh
+Help registry driver
+.TP
+.I /var/backups/lamboot-*-<timestamp>/
+Per-run backup directory (when a tool mutates state)
+.SH ENVIRONMENT
+.TP
+.B LAMBOOT_LIB_DIR
+Override shared library directory (default:
+.IR /usr/lib/lamboot-tools ).
+.TP
+.B NO_COLOR
+When set (to any value), disables ANSI color (freedesktop convention).
+.SH SEE ALSO
+.BR lamboot-tools (7),
+.BR lamboot-toolkit (1),
+.BR lamboot-diagnose (1),
+.BR lamboot-esp (1),
+.BR lamboot-backup (1),
+.BR lamboot-repair (1),
+.BR lamboot-migrate (1),
+.BR lamboot-doctor (1),
+.BR lamboot-uki-build (1),
+.BR lamboot-signing-keys (1)
+.PP
+Full documentation at
+.UR https://lamboot.dev/tools/
+.UE
+.SH AUTHORS
+The lamboot-tools suite is developed by
+.B Lamco Development
+(https://lamco.io). Source:
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.SH LICENSE
+MIT OR Apache-2.0

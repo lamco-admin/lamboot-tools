@@ -1,0 +1,45 @@
+# Copr package configuration for standalone lamboot-migrate
+#
+# Per R22 of SPEC-LAMBOOT-TOOLKIT-V1.md: lamboot-migrate ships BOTH as
+# a subpackage of lamboot-tools AND as a standalone distro package.
+# This Copr project publishes the standalone form.
+
+project: lamco/lamboot-migrate
+package: lamboot-migrate
+
+# Broader chroot matrix — lamboot-migrate is a crossover target for
+# users who want just BIOS→UEFI migration without the rest of the toolkit.
+chroots:
+  - fedora-44-x86_64
+  - fedora-44-aarch64
+  - fedora-45-x86_64
+  - fedora-rawhide-x86_64
+  - epel-9-x86_64
+  - epel-10-x86_64
+  - centos-stream-9-x86_64
+  - centos-stream-10-x86_64
+  - rhel-9-x86_64   # if RH-enabled account
+
+# Source fetched from the dedicated lamboot-migrate standalone repo
+# (created at v1.0 spin-off per R22)
+source_type: git
+source_url: https://github.com/lamco-admin/lamboot-migrate.git
+source_build_method: make_srpm
+
+build_hooks:
+  webhook_url: https://copr.fedorainfracloud.org/webhooks/custom-rebuild/lamco/lamboot-migrate/
+  webhook_events: [tag]
+
+description: |
+  Automated Linux BIOS→UEFI migration and cross-bootloader migration tool.
+  Converts MBR → GPT, creates an ESP, installs a UEFI bootloader,
+  rewrites fstab, and verifies — with seven preflight safety guardrails.
+  Works with GRUB, systemd-boot, rEFInd, and LamBoot.
+instructions: |
+  After install:
+    sudo lamboot-migrate status                       # assess current state
+    sudo lamboot-migrate to-uefi --dry-run            # preview migration
+    sudo lamboot-migrate to-uefi --disk /dev/sda      # migrate
+    sudo lamboot-migrate verify                       # post-migration verify
+
+  See: https://lamboot.dev/migrate/

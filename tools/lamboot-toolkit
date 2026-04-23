@@ -1,0 +1,215 @@
+#!/bin/bash
+# lamboot-toolkit — suite dispatcher + unified entry point
+#
+# Provides a canonical "what is this suite" surface alongside per-tool
+# entry points. Matches rdpdo's two-model help structure (spec §6.6 + §10).
+#
+# Subcommands:
+#   status            List tools present + their versions + maturity
+#   help [<tool>]     Show suite help, or a tool's help
+#   run <tool> [...]  Invoke a tool (scripting uniformity)
+#   version           Print toolkit version and every tool's version
+#   verify            Sanity-check the install
+#
+# Governed by SPEC-LAMBOOT-TOOLKIT-V1.md §6.6.
+
+# shellcheck source=../lib/lamboot-toolkit-lib.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
+
+LAMBOOT_TOOL_NAME="lamboot-toolkit"
+LAMBOOT_TOOL_VERSION="0.2.0"
+
+readonly KNOWN_CORE_TOOLS=(
+    "lamboot-diagnose"
+    "lamboot-esp"
+    "lamboot-backup"
+    "lamboot-repair"
+    "lamboot-migrate"
+    "lamboot-doctor"
+    "lamboot-inspect"
+    "lamboot-uki-build"
+    "lamboot-signing-keys"
+)
+
+readonly KNOWN_PVE_TOOLS=(
+    "lamboot-pve-setup"
+    "lamboot-pve-fleet"
+    "lamboot-pve-monitor"
+    "lamboot-pve-ovmf-vars"
+)
+
+cmd_status() {
+    printf 'lamboot-toolkit %s\n' "$LAMBOOT_TOOLKIT_VERSION"
+    printf 'schema: %s\n\n' "$LAMBOOT_TOOLKIT_SCHEMA_VERSION"
+
+    printf 'Core tools:\n'
+    for tool in "${KNOWN_CORE_TOOLS[@]}"; do
+        _status_line "$tool"
+    done
+
+    printf '\nProxmox VE companion tools:\n'
+    for tool in "${KNOWN_PVE_TOOLS[@]}"; do
+        _status_line "$tool"
+    done
+}
+
+_status_line() {
+    local tool="$1"
+    local ver maturity
+    if command -v "$tool" >/dev/null 2>&1; then
+        ver=$("$tool" --version 2>/dev/null | head -1 || printf 'version unknown')
+        printf '  %-26s installed   %s\n' "$tool" "$ver"
+    else
+        printf '  %-26s not present\n' "$tool"
+    fi
+}
+
+cmd_help() {
+    if [[ $# -eq 0 ]]; then
+        _suite_help
+        return 0
+    fi
+
+    local target="$1"
+    shift
+
+    # Resolve short-form ("migrate" → "lamboot-migrate") and also try the
+    # script-relative path for dev-tree invocation before install.
+    local candidates=("$target" "lamboot-$target")
+    local script_dir
+    script_dir=$(cd "$(dirname "$0")" && pwd)
+    candidates+=("$script_dir/$target" "$script_dir/lamboot-$target")
+
+    for candidate in "${candidates[@]}"; do
+        if command -v "$candidate" >/dev/null 2>&1 || [[ -x "$candidate" ]]; then
+            exec "$candidate" help "$@"
+        fi
+    done
+
+    die "unknown tool: $target"
+}
+
+_suite_help() {
+    cat <<'EOF'
+lamboot-toolkit — The Linux UEFI boot toolkit
+
+USAGE:
+    lamboot-toolkit <subcommand> [args...]
+    lamboot-<tool> [args...]
+
+SUBCOMMANDS:
+    status              List installed tools with versions and maturity
+    help [<tool>]       Show suite help, or per-tool help
+    run <tool> [...]    Invoke a tool (scripting uniformity)
+    version             Print toolkit + per-tool versions
+    verify              Sanity-check the installation
+    --help, -h          This help
+
+CORE TOOLS (install `lamboot-tools`):
+    lamboot-diagnose    Scan UEFI boot chain for issues
+    lamboot-esp         ESP health, inventory, cleanup
+    lamboot-backup      UEFI boot config save + restore
+    lamboot-repair      Online + offline boot repair
+    lamboot-migrate     BIOS→UEFI + cross-bootloader migration
+    lamboot-doctor      Guided diagnose→repair→verify wrapper
+    lamboot-inspect     LamBoot-specific deep introspection
+    lamboot-uki-build   Host-side Unified Kernel Image builder
+    lamboot-signing-keys Secure Boot key lifecycle helper
+
+PROXMOX VE COMPANION (install `lamboot-toolkit-pve`):
+    lamboot-pve-setup     Per-VM LamBoot integration setup
+    lamboot-pve-fleet     Fleet-wide inventory + setup + reporting
+    lamboot-pve-monitor   Host-side NVRAM health reader
+    lamboot-pve-ovmf-vars OVMF VARS builder with cert enrollment
+
+Each tool has its own `help`, `--help`, and man page. Start with:
+
+    lamboot-toolkit status              # see what's installed
+    lamboot-diagnose --help             # diagnose help
+    lamboot-toolkit help diagnose       # same, via dispatcher
+    man lamboot-tools                   # suite overview
+
+Documentation: https://lamboot.dev/tools/
+EOF
+}
+
+cmd_run() {
+    [[ $# -ge 1 ]] || die "run: tool name required"
+    local tool="$1"
+    shift
+
+    local candidate
+    for candidate in "$tool" "lamboot-$tool"; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            exec "$candidate" "$@"
+        fi
+    done
+
+    die "unknown tool: $tool"
+}
+
+cmd_version() {
+    printf 'lamboot-toolkit %s (schema %s)\n' \
+        "$LAMBOOT_TOOLKIT_VERSION" "$LAMBOOT_TOOLKIT_SCHEMA_VERSION"
+    printf '\nInstalled tool versions:\n'
+    for tool in "${KNOWN_CORE_TOOLS[@]}" "${KNOWN_PVE_TOOLS[@]}"; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            local ver
+            ver=$("$tool" --version 2>/dev/null | head -1 || printf 'version unknown')
+            printf '  %-26s %s\n' "$tool" "$ver"
+        fi
+    done
+}
+
+cmd_verify() {
+    local exit_code=0
+
+    local lib="${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
+    if [[ ! -f "$lib" ]]; then
+        printf 'fail: shared library not found at %s\n' "$lib" >&2
+        exit_code=1
+    else
+        printf 'ok: shared library present (%s)\n' "$lib"
+    fi
+
+    local help_lib="${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
+    if [[ ! -f "$help_lib" ]]; then
+        printf 'fail: help registry library not found at %s\n' "$help_lib" >&2
+        exit_code=1
+    else
+        printf 'ok: help registry library present (%s)\n' "$help_lib"
+    fi
+
+    local found=0
+    for tool in "${KNOWN_CORE_TOOLS[@]}"; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            found=$((found + 1))
+            if ! "$tool" --version >/dev/null 2>&1; then
+                printf 'fail: %s --version failed\n' "$tool" >&2
+                exit_code=1
+            fi
+        fi
+    done
+    printf 'ok: %d core tools installed and responsive\n' "$found"
+
+    return $exit_code
+}
+
+main() {
+    local subcommand="${1:-help}"
+    [[ $# -gt 0 ]] && shift
+
+    case "$subcommand" in
+        status)    cmd_status "$@" ;;
+        help)      cmd_help "$@" ;;
+        --help|-h) cmd_help "$@" ;;
+        run)       cmd_run "$@" ;;
+        version|--version) cmd_version ;;
+        verify)    cmd_verify "$@" ;;
+        *)
+            die "unknown subcommand: $subcommand (try: lamboot-toolkit help)"
+            ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,47 @@
+name: Fleet Test (Tier 1 matrix)
+
+# Runs on the founder's self-hosted runner (Proxmox host).
+# Not GitHub-Actions-hosted — fleet testing needs real VMs.
+#
+# Per SPEC-LAMBOOT-TOOLKIT-V1.md §9.4.
+#
+# STATUS (2026-04-22): DARK. Self-hosted Proxmox runner not yet registered;
+# this workflow will wait-for-runner until it is. Tier 1 baseline capture
+# is ops-pending on founder's infrastructure; see CHANGELOG v0.2.0
+# "Known limits" section and ROADMAP "Ops-pending" list.
+
+on:
+  schedule:
+    - cron: '17 3 * * *'  # Daily at 03:17 UTC; off-peak minute per scheduling best practice
+  workflow_dispatch:
+
+jobs:
+  tier1-matrix:
+    name: Tier 1 fleet test
+    runs-on: [self-hosted, pve-host]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build inlined tools
+        run: make build-inlined
+
+      - name: Run fleet test driver (Tier 1)
+        run: scripts/fleet-test.sh --tier 1
+        env:
+          TOOLKIT_TARBALL: ${{ github.workspace }}/build/lamboot-tools-latest.tar.gz
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleet-test-results-${{ github.run_id }}
+          path: tests/results/
+          retention-days: 30
+
+      - name: Publish results to lamboot.dev/tools/nightly/
+        if: success()
+        run: scripts/publish-nightly.sh
+        env:
+          FLEET_PUBLISH_URL: https://lamboot.dev/tools/nightly/upload
+          FLEET_PUBLISH_TOKEN: ${{ secrets.FLEET_PUBLISH_TOKEN }}

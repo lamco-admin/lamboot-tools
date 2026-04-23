@@ -1,0 +1,625 @@
+#!/bin/bash
+# lamboot-repair — guided boot-repair tool, online + offline
+#
+# Canonical implementation of the toolkit's six-phase mutating-operation flow:
+# diagnose → plan → show → confirm → execute → verify. Each plan step has
+# a risk tier; destructive steps require extra confirmation regardless of --yes.
+#
+# Governed by docs/SPEC-LAMBOOT-REPAIR.md.
+# Part of the lamboot-tools suite (SPEC-LAMBOOT-TOOLKIT-V1.md §3.1).
+
+# shellcheck source=../lib/lamboot-toolkit-lib.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
+# shellcheck source=../lib/lamboot-toolkit-help.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
+
+LAMBOOT_TOOL_NAME="lamboot-repair"
+LAMBOOT_TOOL_VERSION="0.2.0"
+
+readonly DOC_BASE="https://lamboot.dev/tools/findings"
+
+# Tool-specific flags
+OPT_FIX_FSTAB_ONLY=0
+OPT_PLAN_ONLY=0
+OPT_RISK_LIMIT="moderate"  # safe | moderate | destructive
+
+# Repair plan — three parallel arrays (v1.0 — could become JSON in v0.3+)
+PLAN_IDS=()
+PLAN_DESCS=()
+PLAN_CMDS=()
+PLAN_RISKS=()
+
+# State
+ESP_MOUNT=""
+ESP_DEV=""
+FIXES_APPLIED=0
+FIXES_FAILED=0
+
+# ── Help registry ────────────────────────────────────────────────────────
+
+_register_subcommands() {
+    register_subcommand \
+        --name "repair" \
+        --category "Repair" \
+        --summary "Diagnose and repair boot issues (default action)" \
+        --syntax "lamboot-repair [--offline DISK] [--auto] [--risk-limit LEVEL] [--fix-fstab] [--plan-only|--dry-run]" \
+        --arg "--offline DISK:Operate on unmounted disk or image" \
+        --arg "--auto:Execute without interactive confirmation (implies --yes)" \
+        --arg "--risk-limit LEVEL:safe|moderate|destructive (default: moderate)" \
+        --arg "--fix-fstab:Only run fstab-repair actions" \
+        --arg "--plan-only:Equivalent to --dry-run for this tool" \
+        --example "sudo lamboot-repair" \
+        --example "sudo lamboot-repair --dry-run" \
+        --example "sudo lamboot-repair --auto --yes" \
+        --example "sudo lamboot-repair --offline /dev/pve/vm-201-disk-1" \
+        --example "sudo lamboot-repair --fix-fstab --auto" \
+        --notes "Six-phase flow: diagnose, plan, show, confirm, execute, verify. Each plan step has a risk tier. Destructive steps always require typed 'yes' confirmation regardless of --auto. Offline NVRAM operations deferred to v0.3+." \
+        --offline-capable "true" \
+        --requires-root "true" \
+        --see-also "lamboot-diagnose, lamboot-esp, lamboot-migrate, lamboot-doctor" \
+        --doc-url "https://lamboot.dev/tools/repair" \
+        --maturity "stable"
+}
+
+# ── Remediation helper ───────────────────────────────────────────────────
+
+_remediation_json() {
+    local id="$1" summary="$2" cmd="${3:-}"
+    local doc="${DOC_BASE}/${id//.//}"
+    local cmd_field="\"\""
+    [[ -n "$cmd" ]] && cmd_field="\"$(json_escape "$cmd")\""
+    printf '{"summary":"%s","command":%s,"doc_url":"%s"}' \
+        "$(json_escape "$summary")" "$cmd_field" "$doc"
+}
+
+# ── Plan management ──────────────────────────────────────────────────────
+
+plan_add() {
+    local id="$1" desc="$2" cmd="$3" risk="${4:-safe}"
+    PLAN_IDS+=("$id")
+    PLAN_DESCS+=("$desc")
+    PLAN_CMDS+=("$cmd")
+    PLAN_RISKS+=("$risk")
+}
+
+risk_tier_ok() {
+    local step_risk="$1"
+    case "$OPT_RISK_LIMIT" in
+        safe)
+            [[ "$step_risk" == "safe" ]]
+            ;;
+        moderate)
+            [[ "$step_risk" == "safe" ]] || [[ "$step_risk" == "moderate" ]]
+            ;;
+        destructive)
+            true
+            ;;
+        *)
+            die "invalid --risk-limit: $OPT_RISK_LIMIT"
+            ;;
+    esac
+}
+
+# ── Phase 1: Diagnose (online) ───────────────────────────────────────────
+
+diagnose_online() {
+    info "Phase 1 — Diagnose (online)"
+
+    # Boot mode
+    if [[ ! -d /sys/firmware/efi ]]; then
+        emit_finding "repair.boot_mode.bios" "repair" "critical" "fail" \
+            "System is in BIOS mode, not UEFI" \
+            "Cannot manage UEFI NVRAM without UEFI boot. Repair ESP-level issues is still possible; NVRAM fixes will be skipped." \
+            "{}" \
+            "$(_remediation_json "repair.boot_mode.bios" \
+                "Convert BIOS to UEFI" \
+                "sudo lamboot-migrate to-uefi")"
+    fi
+
+    # ESP
+    ESP_MOUNT=$(detect_esp 2>/dev/null || true)
+
+    if [[ -z "$ESP_MOUNT" ]]; then
+        # ESP exists but unmounted?
+        local esp_part
+        esp_part=$(lsblk -nrpo NAME,PARTTYPE 2>/dev/null \
+            | grep -i "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" \
+            | awk '{print $1}' | head -1 || true)
+
+        if [[ -n "$esp_part" ]]; then
+            emit_finding "repair.esp.unmounted" "repair_esp" "warning" "fail" \
+                "ESP exists at $esp_part but is not mounted" "" \
+                "{\"device\":\"$(json_escape "$esp_part")\"}" \
+                "$(_remediation_json "repair.esp.unmounted" \
+                    "Mount the ESP" \
+                    "sudo mount $esp_part /boot/efi")"
+
+            plan_add "repair.esp.mount" \
+                "Mount ESP ($esp_part) at /boot/efi" \
+                "mkdir -p /boot/efi && mount $esp_part /boot/efi" \
+                "safe"
+            # Try to proceed — set ESP_MOUNT assuming we'll mount it
+            ESP_MOUNT="/boot/efi"
+            ESP_DEV="$esp_part"
+            return 0
+        else
+            emit_finding "repair.esp.not_found" "repair_esp" "critical" "fail" \
+                "No ESP found on any disk" \
+                "Cannot repair without an ESP; use lamboot-migrate to-uefi to create one." \
+                "{}" \
+                "$(_remediation_json "repair.esp.not_found" \
+                    "Create an ESP" \
+                    "sudo lamboot-migrate to-uefi")"
+            return 1
+        fi
+    fi
+
+    ESP_DEV=$(findmnt -n -o SOURCE "$ESP_MOUNT" 2>/dev/null || true)
+
+    # ESP filesystem integrity
+    if [[ -n "$ESP_DEV" ]] && command -v fsck.fat >/dev/null 2>&1; then
+        if ! fsck.fat -n "$ESP_DEV" >/dev/null 2>&1; then
+            emit_finding "repair.esp.fs_issues" "repair_esp" "warning" "fail" \
+                "ESP filesystem has issues" \
+                "fsck.fat -n reported problems." \
+                "{\"device\":\"$(json_escape "$ESP_DEV")\"}" \
+                "$(_remediation_json "repair.esp.fs_issues" \
+                    "Run fsck with --auto fix" \
+                    "sudo lamboot-repair --auto")"
+
+            plan_add "repair.esp.fsck" \
+                "Repair ESP filesystem" \
+                "umount $ESP_MOUNT && fsck.fat -a $ESP_DEV && mount $ESP_DEV $ESP_MOUNT" \
+                "moderate"
+        fi
+    fi
+
+    # Fallback bootloader
+    if [[ ! -f "${ESP_MOUNT}/EFI/BOOT/BOOTX64.EFI" ]] && [[ ! -f "${ESP_MOUNT}/EFI/BOOT/bootx64.efi" ]]; then
+        local fb_src=""
+        for candidate in \
+            "${ESP_MOUNT}/EFI/LamBoot/lambootx64.efi" \
+            "${ESP_MOUNT}"/EFI/*/shimx64.efi \
+            "${ESP_MOUNT}"/EFI/*/grubx64.efi \
+            "${ESP_MOUNT}/EFI/systemd/systemd-bootx64.efi"; do
+            if [[ -f "$candidate" ]]; then
+                fb_src="$candidate"
+                break
+            fi
+        done
+
+        if [[ -n "$fb_src" ]]; then
+            emit_finding "repair.fallback.missing" "repair_fallback" "warning" "fail" \
+                "Fallback loader EFI/BOOT/BOOTX64.EFI missing" \
+                "Will copy from $(basename "$fb_src")." \
+                "{\"source\":\"$(json_escape "$fb_src")\"}" \
+                "$(_remediation_json "repair.fallback.missing" \
+                    "Install fallback from existing bootloader" \
+                    "sudo lamboot-repair --auto")"
+
+            plan_add "repair.fallback.install" \
+                "Install fallback bootloader from $(basename "$fb_src")" \
+                "mkdir -p ${ESP_MOUNT}/EFI/BOOT && cp '$fb_src' '${ESP_MOUNT}/EFI/BOOT/BOOTX64.EFI'" \
+                "safe"
+        else
+            emit_finding "repair.fallback.no_source" "repair_fallback" "warning" "skip" \
+                "Fallback loader missing; no existing bootloader to copy from" \
+                "Install a bootloader (LamBoot / GRUB / sd-boot / rEFInd) first." "{}" '{}'
+        fi
+    fi
+
+    # UEFI boot entries
+    if [[ -d /sys/firmware/efi ]] && command -v efibootmgr >/dev/null 2>&1; then
+        local entries
+        entries=$(efibootmgr 2>/dev/null | grep -cE '^Boot[0-9A-Fa-f]{4}' || true)
+        [[ -z "$entries" ]] && entries=0
+
+        if [[ "$entries" -eq 0 ]] && [[ -f "${ESP_MOUNT}/EFI/LamBoot/lambootx64.efi" ]]; then
+            local disk partnum
+            disk=$(lsblk -nro PKNAME "$ESP_DEV" 2>/dev/null | head -1 || true)
+            partnum=$(lsblk -nro PARTN "$ESP_DEV" 2>/dev/null | head -1 || true)
+
+            if [[ -n "$disk" ]] && [[ -n "$partnum" ]]; then
+                emit_finding "repair.nvram.no_entries" "repair_nvram" "error" "fail" \
+                    "No UEFI boot entries in NVRAM" \
+                    "Can create a LamBoot entry on /dev/$disk partition $partnum." \
+                    "{\"entries\":0,\"disk\":\"/dev/$disk\",\"part\":${partnum}}" \
+                    "$(_remediation_json "repair.nvram.no_entries" \
+                        "Create a LamBoot NVRAM entry" \
+                        "sudo lamboot-repair --auto")"
+
+                plan_add "repair.nvram.create_lamboot" \
+                    "Create LamBoot UEFI boot entry" \
+                    "efibootmgr --create --disk /dev/$disk --part $partnum --loader '\\EFI\\LamBoot\\lambootx64.efi' --label LamBoot --quiet" \
+                    "safe"
+            fi
+        else
+            # Check BootOrder
+            local bootorder
+            bootorder=$(efibootmgr 2>/dev/null | grep '^BootOrder:' | cut -d: -f2 | tr -d ' ' || true)
+            if [[ -z "$bootorder" ]] && [[ "$entries" -gt 0 ]]; then
+                local discovered
+                discovered=$(efibootmgr 2>/dev/null | grep -oE '^Boot[0-9A-Fa-f]{4}' | sed 's/Boot//' | tr '\n' ',' | sed 's/,$//')
+                if [[ -n "$discovered" ]]; then
+                    emit_finding "repair.nvram.bootorder_unset" "repair_nvram" "warning" "fail" \
+                        "BootOrder variable not set" \
+                        "Discovered entries: $discovered." \
+                        "{\"discovered\":\"$(json_escape "$discovered")\"}" \
+                        "$(_remediation_json "repair.nvram.bootorder_unset" \
+                            "Set BootOrder" \
+                            "sudo lamboot-repair --auto")"
+                    plan_add "repair.nvram.set_bootorder" \
+                        "Set BootOrder to $discovered" \
+                        "efibootmgr --bootorder $discovered --quiet" \
+                        "safe"
+                fi
+            fi
+        fi
+    fi
+
+    # fstab ESP entry
+    if ! grep -q "$ESP_MOUNT" /etc/fstab 2>/dev/null && [[ -n "$ESP_DEV" ]]; then
+        local uuid
+        uuid=$(blkid -s UUID -o value "$ESP_DEV" 2>/dev/null || true)
+        if [[ -n "$uuid" ]]; then
+            emit_finding "repair.fstab.missing_esp" "repair_fstab" "warning" "fail" \
+                "ESP entry missing from /etc/fstab" \
+                "$ESP_MOUNT will not mount automatically on boot." \
+                "{\"esp_mount\":\"$ESP_MOUNT\",\"uuid\":\"$uuid\"}" \
+                "$(_remediation_json "repair.fstab.missing_esp" \
+                    "Add ESP entry to fstab" \
+                    "sudo lamboot-repair --fix-fstab --auto")"
+            plan_add "repair.fstab.add_esp" \
+                "Add ESP to /etc/fstab" \
+                "echo 'UUID=$uuid $ESP_MOUNT vfat umask=0077,shortname=winnt 0 1' >> /etc/fstab" \
+                "safe"
+        fi
+    fi
+
+    # LamBoot health state — only actionable if CrashLoop or stuck Booting
+    local state_var="/sys/firmware/efi/efivars/LamBootState-4c414d42-4f4f-5400-0000-000000000001"
+    if [[ -r "$state_var" ]]; then
+        local state
+        state=$(od -An -t u1 -j4 -N1 "$state_var" 2>/dev/null | tr -d ' ' || printf '0')
+        if [[ "$state" == "3" ]]; then
+            emit_finding "repair.lamboot.crash_loop" "repair_lamboot" "critical" "fail" \
+                "LamBoot in CrashLoop state" \
+                "Boot counter exceeded threshold; LamBoot is refusing to try the last entry." \
+                "{\"state\":3}" \
+                "$(_remediation_json "repair.lamboot.crash_loop" \
+                    "Reset crash counter + state" \
+                    "sudo lamboot-repair --auto")"
+            plan_add "repair.lamboot.reset_crash" \
+                "Reset LamBoot crash counter + state" \
+                "chattr -i '${state_var}' 2>/dev/null; printf '\\x07\\x00\\x00\\x00\\x02' > '${state_var}'" \
+                "safe"
+        elif [[ "$state" == "1" ]]; then
+            emit_finding "repair.lamboot.stuck_booting" "repair_lamboot" "warning" "warn" \
+                "LamBoot stuck in Booting state" \
+                "Previous boot may not have reached mark-success." \
+                "{\"state\":1}" \
+                "$(_remediation_json "repair.lamboot.stuck_booting" \
+                    "Reset state to BootedOK" \
+                    "sudo lamboot-repair --auto")"
+            plan_add "repair.lamboot.reset_state" \
+                "Reset LamBoot state to BootedOK" \
+                "chattr -i '${state_var}' 2>/dev/null; printf '\\x07\\x00\\x00\\x00\\x02' > '${state_var}'" \
+                "safe"
+        fi
+    fi
+
+    # mark-success service
+    if [[ -f /usr/lib/systemd/system/lamboot-mark-success.service ]]; then
+        if command -v systemctl >/dev/null 2>&1 && ! systemctl is-enabled lamboot-mark-success.service >/dev/null 2>&1; then
+            emit_finding "repair.lamboot.mark_success_disabled" "repair_lamboot" "warning" "fail" \
+                "lamboot-mark-success.service not enabled" \
+                "Crash-loop recovery won't work until the service runs on boot." "{}" \
+                "$(_remediation_json "repair.lamboot.mark_success_disabled" \
+                    "Enable the service" \
+                    "sudo systemctl enable lamboot-mark-success.service")"
+            plan_add "repair.lamboot.enable_mark_success" \
+                "Enable lamboot-mark-success.service" \
+                "systemctl enable lamboot-mark-success.service" \
+                "safe"
+        fi
+    fi
+}
+
+# ── Phase 1 (offline) ────────────────────────────────────────────────────
+
+diagnose_offline() {
+    info "Phase 1 — Diagnose (offline)"
+
+    if [[ $LAMBOOT_OFFLINE_ACTIVE -ne 1 ]]; then
+        die "offline mode not active (internal error)"
+    fi
+
+    if [[ -z "$LAMBOOT_OFFLINE_ESP" ]]; then
+        emit_finding "repair.offline.no_esp" "repair_esp" "critical" "fail" \
+            "No ESP detected on offline disk" \
+            "Disk layout may be non-UEFI or corrupted." \
+            "{\"disk\":\"$(json_escape "$LAMBOOT_OFFLINE_LOOP_DEV")\"}" \
+            "$(_remediation_json "repair.offline.no_esp" \
+                "Inspect with lamboot-esp inventory" \
+                "sudo lamboot-esp inventory --offline <disk>")"
+        return 1
+    fi
+
+    ESP_MOUNT="$LAMBOOT_OFFLINE_ESP"
+
+    # Fallback loader check (offline, read-only mount — can identify but can't always repair)
+    if [[ ! -f "${ESP_MOUNT}/EFI/BOOT/BOOTX64.EFI" ]] && [[ ! -f "${ESP_MOUNT}/EFI/BOOT/bootx64.efi" ]]; then
+        emit_finding "repair.offline.fallback_missing" "repair_fallback" "warning" "fail" \
+            "Offline ESP missing fallback loader" \
+            "Offline ESP mount is read-only in v0.2 — cannot autofix; remount rw manually." "{}" \
+            "$(_remediation_json "repair.offline.fallback_missing" \
+                "Remount rw and copy bootloader manually" \
+                "sudo mount -o remount,rw $ESP_MOUNT && cp <source> $ESP_MOUNT/EFI/BOOT/BOOTX64.EFI")"
+    fi
+
+    # NVRAM operations all skipped offline — virt-fw-vars integration is v0.3+
+    emit_finding "repair.offline.nvram_skipped" "repair_nvram" "info" "skip" \
+        "NVRAM repairs skipped in offline mode" \
+        "Offline NVRAM editing requires virt-fw-vars integration (v0.3+)." "{}" '{}'
+}
+
+# ── Phase 2: Show plan ───────────────────────────────────────────────────
+
+show_plan() {
+    info "Phase 2 — Plan"
+
+    local count=${#PLAN_IDS[@]}
+    if [[ $count -eq 0 ]]; then
+        info "No repair actions needed."
+        return 0
+    fi
+
+    printf '\nProposed repair plan (%d step%s):\n\n' "$count" "$([[ $count -ne 1 ]] && printf 's' || true)" >&2
+
+    local i
+    for i in "${!PLAN_IDS[@]}"; do
+        local risk_tag=""
+        case "${PLAN_RISKS[$i]}" in
+            safe)        risk_tag="[safe]" ;;
+            moderate)    risk_tag="[MODERATE]" ;;
+            destructive) risk_tag="[DESTRUCTIVE]" ;;
+        esac
+        printf '  %d. %s %s\n' "$((i + 1))" "${PLAN_DESCS[$i]}" "$risk_tag" >&2
+        if [[ $LAMBOOT_VERBOSE -eq 1 ]]; then
+            printf '       cmd: %s\n' "${PLAN_CMDS[$i]}" >&2
+        fi
+    done
+    printf '\n' >&2
+}
+
+# ── Phase 3: Confirm ─────────────────────────────────────────────────────
+
+phase_confirm() {
+    local count=${#PLAN_IDS[@]}
+    [[ $count -eq 0 ]] && return 0
+
+    # Destructive steps always require typed yes, regardless of --auto/--yes
+    local has_destructive=0
+    for risk in "${PLAN_RISKS[@]}"; do
+        [[ "$risk" == "destructive" ]] && has_destructive=1
+    done
+
+    if [[ $has_destructive -eq 1 ]]; then
+        info "Plan contains destructive steps — typed confirmation required"
+        if ! confirm "PROCEED WITH DESTRUCTIVE REPAIRS" "yes"; then
+            return 1
+        fi
+    elif [[ $LAMBOOT_AUTO -eq 1 ]] || [[ $LAMBOOT_YES -eq 1 ]]; then
+        verbose "auto-confirmed plan"
+        return 0
+    else
+        if ! confirm "PROCEED WITH REPAIRS" "yes"; then
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# ── Phase 4: Execute ─────────────────────────────────────────────────────
+
+execute_plan() {
+    info "Phase 4 — Execute"
+
+    local count=${#PLAN_IDS[@]}
+    [[ $count -eq 0 ]] && return 0
+
+    local i
+    for i in "${!PLAN_IDS[@]}"; do
+        local id="${PLAN_IDS[$i]}"
+        local desc="${PLAN_DESCS[$i]}"
+        local cmd="${PLAN_CMDS[$i]}"
+        local risk="${PLAN_RISKS[$i]}"
+
+        if ! risk_tier_ok "$risk"; then
+            warn "skipping $id (risk=$risk exceeds --risk-limit=$OPT_RISK_LIMIT)"
+            record_action "$id" "$desc" "skipped" "false" \
+                "{\"reason\":\"risk_limit\"}" "null"
+            continue
+        fi
+
+        # --fix-fstab filter
+        if [[ $OPT_FIX_FSTAB_ONLY -eq 1 ]] && [[ "$id" != *fstab* ]]; then
+            verbose "skipping $id (not an fstab action, --fix-fstab set)"
+            continue
+        fi
+
+        info "  [$((i + 1))/$count] $desc"
+
+        if [[ $LAMBOOT_DRY_RUN -eq 1 ]]; then
+            printf 'DRY-RUN: would exec: %s\n' "$cmd" >&2
+            record_action "$id" "$desc" "ok" "true" \
+                "{\"risk\":\"$risk\",\"dry_run\":true}" "null"
+            continue
+        fi
+
+        if eval "$cmd" 2>&1; then
+            success "applied: $desc"
+            record_action "$id" "$desc" "ok" "true" \
+                "{\"risk\":\"$risk\"}" "null"
+            FIXES_APPLIED=$((FIXES_APPLIED + 1))
+        else
+            warn "failed: $desc"
+            record_action "$id" "$desc" "fail" "true" \
+                "{\"risk\":\"$risk\"}" "null"
+            FIXES_FAILED=$((FIXES_FAILED + 1))
+        fi
+    done
+}
+
+# ── Phase 5: Verify ──────────────────────────────────────────────────────
+
+verify_repairs() {
+    info "Phase 5 — Verify"
+
+    [[ $FIXES_APPLIED -eq 0 ]] && [[ $LAMBOOT_DRY_RUN -eq 0 ]] && return 0
+
+    local pass=0 fail=0
+
+    # ESP mounted
+    if [[ $LAMBOOT_OFFLINE_ACTIVE -eq 0 ]]; then
+        local current_esp
+        current_esp=$(detect_esp 2>/dev/null || true)
+        if [[ -n "$current_esp" ]]; then
+            pass=$((pass + 1))
+            verbose "verify: ESP mounted at $current_esp"
+        fi
+    fi
+
+    # Fallback loader
+    if [[ -n "$ESP_MOUNT" ]]; then
+        if [[ -f "${ESP_MOUNT}/EFI/BOOT/BOOTX64.EFI" ]] || [[ -f "${ESP_MOUNT}/EFI/BOOT/bootx64.efi" ]]; then
+            pass=$((pass + 1))
+            verbose "verify: fallback loader present"
+        fi
+    fi
+
+    # Boot entries
+    if [[ $LAMBOOT_OFFLINE_ACTIVE -eq 0 ]] && [[ -d /sys/firmware/efi ]] && command -v efibootmgr >/dev/null 2>&1; then
+        local n
+        n=$(efibootmgr 2>/dev/null | grep -cE '^Boot[0-9A-Fa-f]{4}' || true)
+        [[ -z "$n" ]] && n=0
+        if [[ "$n" -gt 0 ]]; then
+            pass=$((pass + 1))
+            verbose "verify: $n UEFI boot entries in NVRAM"
+        fi
+    fi
+
+    # LamBoot state
+    local state_var="/sys/firmware/efi/efivars/LamBootState-4c414d42-4f4f-5400-0000-000000000001"
+    if [[ -r "$state_var" ]]; then
+        local state
+        state=$(od -An -t u1 -j4 -N1 "$state_var" 2>/dev/null | tr -d ' ' || printf '0')
+        if [[ "$state" == "2" ]]; then
+            pass=$((pass + 1))
+            verbose "verify: LamBoot state BootedOK"
+        fi
+    fi
+
+    emit_finding "repair.verify.summary" "repair" "info" "pass" \
+        "Verification: $pass checks passed, $fail failed" "" \
+        "{\"passed\":$pass,\"failed\":$fail,\"applied\":${FIXES_APPLIED},\"plan_failed\":${FIXES_FAILED}}" \
+        '{}'
+}
+
+# ── Main flow ────────────────────────────────────────────────────────────
+
+do_repair() {
+    require_root
+
+    if [[ $LAMBOOT_OFFLINE_ACTIVE -eq 1 ]]; then
+        diagnose_offline || true
+    else
+        diagnose_online || true
+    fi
+
+    show_plan
+
+    local count=${#PLAN_IDS[@]}
+    if [[ $count -eq 0 ]]; then
+        info "No repair actions needed — system appears healthy."
+        emit_json "$EXIT_NOOP"
+        exit "$EXIT_NOOP"
+    fi
+
+    # Plan-only / dry-run: show and exit without executing
+    if [[ $OPT_PLAN_ONLY -eq 1 ]] || [[ $LAMBOOT_DRY_RUN -eq 1 ]]; then
+        info "Dry-run: plan shown, not executed"
+        execute_plan  # Dry-run branch inside records would-be actions
+        emit_json "$EXIT_OK"
+        exit "$EXIT_OK"
+    fi
+
+    # Confirm (phase 3)
+    if ! phase_confirm; then
+        info "Aborted by user"
+        emit_json "$EXIT_ABORT"
+        exit "$EXIT_ABORT"
+    fi
+
+    # Execute (phase 4)
+    execute_plan
+
+    # Verify (phase 5)
+    verify_repairs
+
+    local exit_code="$EXIT_OK"
+    if [[ $FIXES_FAILED -gt 0 ]] && [[ $FIXES_APPLIED -gt 0 ]]; then
+        exit_code="$EXIT_PARTIAL"
+    elif [[ $FIXES_FAILED -gt 0 ]]; then
+        exit_code="$EXIT_ERROR"
+    fi
+
+    success "Applied $FIXES_APPLIED of $count repair action(s); $FIXES_FAILED failed"
+    emit_json "$exit_code"
+    exit "$exit_code"
+}
+
+# ── CLI ──────────────────────────────────────────────────────────────────
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        parse_common_flag "$1"
+        local rc=$?
+        case $rc in
+            1) shift; continue ;;
+            2) _register_subcommands; dispatch_help; exit 0 ;;
+            3) printf 'lamboot-repair %s (lamboot-tools %s)\n' \
+                "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
+            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            5) shift
+               [[ $# -gt 0 ]] || die "--offline requires a disk path"
+               offline_setup "$1"
+               shift
+               continue ;;
+            0) ;;
+        esac
+
+        case "$1" in
+            --fix-fstab)    OPT_FIX_FSTAB_ONLY=1; shift ;;
+            --plan-only)    OPT_PLAN_ONLY=1; LAMBOOT_DRY_RUN=1; shift ;;
+            --risk-limit)   OPT_RISK_LIMIT="${2:-moderate}"; shift 2 ;;
+            help)           _register_subcommands
+                            if [[ -n "${2:-}" ]]; then
+                                dispatch_help "$2"
+                            else
+                                dispatch_help
+                            fi
+                            exit 0 ;;
+            repair)         shift ;;
+            -*)             die "unknown option: $1" ;;
+            *)              die "unknown argument: $1" ;;
+        esac
+    done
+}
+
+main() {
+    parse_args "$@"
+    do_repair
+}
+
+main "$@"

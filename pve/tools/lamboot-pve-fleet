@@ -1,0 +1,549 @@
+#!/bin/bash
+# lamboot-pve-fleet — fleet-wide LamBoot integration management on Proxmox VE
+#
+# Orchestration layer over lamboot-pve-setup. Enumerates OVMF VMs, applies
+# filters, invokes per-VM setup serially. Reads /etc/lamboot/fleet.toml for
+# defaults.
+#
+# Governed by pve/docs/SPEC-LAMBOOT-PVE-FLEET.md.
+# Part of lamboot-toolkit-pve (SPEC-LAMBOOT-TOOLKIT-V1.md §3.2).
+
+# shellcheck source=../../lib/lamboot-toolkit-lib.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
+# shellcheck source=../../lib/lamboot-toolkit-help.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
+
+LAMBOOT_TOOL_NAME="lamboot-pve-fleet"
+LAMBOOT_TOOL_VERSION="0.2.0"
+
+readonly DOC_BASE="https://lamboot.dev/tools/findings"
+readonly DEFAULT_FLEET_CONFIG="/etc/lamboot/fleet.toml"
+readonly FW_CFG_NAME="opt/lamboot/config"
+
+OPT_SUBCOMMAND=""
+OPT_ALL=0
+OPT_TAGS=()
+OPT_VMIDS=()
+OPT_EXCLUDE=()
+OPT_CONFIG="$DEFAULT_FLEET_CONFIG"
+OPT_RUNNING_OK=0
+OPT_CONTINUE_ON_ERROR=1
+
+# Result tallies for fleet setup
+FLEET_SUCCESS=0
+FLEET_FAILED=0
+FLEET_SKIPPED=0
+
+# ── Help registry ────────────────────────────────────────────────────────
+
+_register_subcommands() {
+    register_subcommand \
+        --name "inventory" \
+        --category "Fleet" \
+        --summary "List all OVMF VMs + LamBoot integration state" \
+        --syntax "lamboot-pve-fleet inventory [--json]" \
+        --example "lamboot-pve-fleet inventory" \
+        --example "lamboot-pve-fleet inventory --json | jq '.findings[] | select(.category == \"fleet_vm\")'" \
+        --notes "Read-only scan. Reports state per VM: full, partial, not_set_up, not_applicable (BIOS)." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "setup, status, report" \
+        --doc-url "https://lamboot.dev/tools/pve-fleet/inventory" \
+        --maturity "experimental"
+
+    register_subcommand \
+        --name "setup" \
+        --category "Fleet" \
+        --summary "Setup integration across multiple VMs" \
+        --syntax "lamboot-pve-fleet setup (--all | --vmid VMID... | --tag TAG...) [--exclude VMID]... [--continue-on-error]" \
+        --arg "--all:Process every OVMF VM" \
+        --arg "--vmid VMID:Specific VMID (repeatable; overrides --all)" \
+        --arg "--tag TAG:Filter to VMs with Proxmox tag (repeatable)" \
+        --arg "--exclude VMID:Exclude specific VMIDs (repeatable)" \
+        --arg "--running-ok:Pass --running-ok to each per-VM setup" \
+        --arg "--continue-on-error:Don't abort batch on first failure (default: on)" \
+        --example "sudo lamboot-pve-fleet setup --all" \
+        --example "sudo lamboot-pve-fleet setup --all --tag webserver --exclude 100" \
+        --example "sudo lamboot-pve-fleet setup --vmid 100 --vmid 101" \
+        --notes "Invokes lamboot-pve-setup for each target VM serially. Skips already-set-up VMs. v0.2 is serial; parallel mode deferred to v0.3+." \
+        --offline-capable "false" \
+        --requires-root "true" \
+        --see-also "inventory, status, lamboot-pve-setup" \
+        --doc-url "https://lamboot.dev/tools/pve-fleet/setup" \
+        --maturity "experimental"
+
+    register_subcommand \
+        --name "status" \
+        --category "Fleet" \
+        --summary "Fleet-wide health + integration summary" \
+        --syntax "lamboot-pve-fleet status [--json]" \
+        --example "lamboot-pve-fleet status" \
+        --notes "Human-readable rollup of integration states, role distribution, recent issues (if lamboot-pve-monitor available)." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "inventory, report" \
+        --doc-url "https://lamboot.dev/tools/pve-fleet/status" \
+        --maturity "experimental"
+
+    register_subcommand \
+        --name "report" \
+        --category "Fleet" \
+        --summary "Structured JSON report for external consumers" \
+        --syntax "lamboot-pve-fleet report [--json]" \
+        --example "lamboot-pve-fleet report --json | jq ." \
+        --notes "Machine-consumable envelope combining per-VM state + fleet totals + timestamp. For Grafana/Prometheus/Splunk integration." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "status, inventory" \
+        --doc-url "https://lamboot.dev/tools/pve-fleet/report" \
+        --maturity "experimental"
+}
+
+# ── Remediation helper ───────────────────────────────────────────────────
+
+_remediation_json() {
+    local id="$1" summary="$2" cmd="${3:-}"
+    local doc="${DOC_BASE}/${id//.//}"
+    local cmd_field="\"\""
+    [[ -n "$cmd" ]] && cmd_field="\"$(json_escape "$cmd")\""
+    printf '{"summary":"%s","command":%s,"doc_url":"%s"}' \
+        "$(json_escape "$summary")" "$cmd_field" "$doc"
+}
+
+# ── Proxmox + qm helpers ─────────────────────────────────────────────────
+
+require_proxmox_host() {
+    if ! command -v qm >/dev/null 2>&1; then
+        die_prerequisite "qm not found; this tool requires a Proxmox VE host"
+    fi
+}
+
+# List all VMIDs on the host
+qm_list_vmids() {
+    qm list 2>/dev/null | awk 'NR>1 {print $1}'
+}
+
+qm_config_line() {
+    local vmid="$1" key="$2"
+    qm config "$vmid" 2>/dev/null | sed -n "s/^${key}: //p" | head -1
+}
+
+# Determine integration state for a VMID
+determine_state() {
+    local vmid="$1"
+
+    local bios
+    bios=$(qm_config_line "$vmid" "bios")
+    if [[ "$bios" != "ovmf" ]]; then
+        printf 'not_applicable'
+        return
+    fi
+
+    local args hook
+    args=$(qm_config_line "$vmid" "args")
+    hook=$(qm_config_line "$vmid" "hookscript")
+
+    local has_args=0 has_hook=0 has_json=0
+    printf '%s' "$args" | grep -q "$FW_CFG_NAME" && has_args=1
+    printf '%s' "$hook" | grep -q 'lamboot-hookscript' && has_hook=1
+    [[ -f "/var/lib/lamboot/${vmid}.json" ]] && has_json=1
+
+    local score=$((has_args + has_hook + has_json))
+    case "$score" in
+        3) printf 'full' ;;
+        0) printf 'not_set_up' ;;
+        *) printf 'partial' ;;
+    esac
+}
+
+# Apply filters to a list of VMIDs
+filter_vmids() {
+    local all_vmids="$1"
+    local filtered=""
+
+    while IFS= read -r vmid; do
+        [[ -z "$vmid" ]] && continue
+
+        # Exclude filter
+        local excluded=0
+        for ex in "${OPT_EXCLUDE[@]+${OPT_EXCLUDE[@]}}"; do
+            [[ "$vmid" == "$ex" ]] && { excluded=1; break; }
+        done
+        [[ $excluded -eq 1 ]] && continue
+
+        # Explicit VMID list — only those match
+        if [[ ${#OPT_VMIDS[@]} -gt 0 ]]; then
+            local matched=0
+            for want in "${OPT_VMIDS[@]}"; do
+                [[ "$vmid" == "$want" ]] && { matched=1; break; }
+            done
+            [[ $matched -eq 0 ]] && continue
+        fi
+
+        # Tag filter
+        if [[ ${#OPT_TAGS[@]} -gt 0 ]]; then
+            local vm_tags
+            vm_tags=$(qm_config_line "$vmid" "tags")
+            local tag_matched=0
+            for want_tag in "${OPT_TAGS[@]}"; do
+                # Tags are comma-separated in qm config
+                if printf '%s' "$vm_tags" | tr ',' '\n' | grep -qxF "$want_tag"; then
+                    tag_matched=1
+                    break
+                fi
+            done
+            [[ $tag_matched -eq 0 ]] && continue
+        fi
+
+        filtered="${filtered:+${filtered}
+}${vmid}"
+    done <<< "$all_vmids"
+
+    printf '%s' "$filtered"
+}
+
+# ── Find pve-setup sibling ───────────────────────────────────────────────
+
+find_pve_setup() {
+    local candidates=("lamboot-pve-setup")
+    local script_dir
+    script_dir=$(cd "$(dirname "$0")" && pwd)
+    candidates+=("$script_dir/lamboot-pve-setup")
+
+    for c in "${candidates[@]}"; do
+        if command -v "$c" >/dev/null 2>&1; then
+            command -v "$c"
+            return 0
+        elif [[ -x "$c" ]]; then
+            printf '%s' "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ── Subcommand: inventory ────────────────────────────────────────────────
+
+do_inventory() {
+    require_proxmox_host
+
+    local vmids
+    vmids=$(qm_list_vmids)
+
+    local total=0 full=0 partial=0 not_set_up=0 not_applicable=0
+
+    [[ $LAMBOOT_JSON -eq 0 ]] && printf '\n%s\n' 'Fleet inventory'
+
+    while IFS= read -r vmid; do
+        [[ -z "$vmid" ]] && continue
+        total=$((total + 1))
+
+        local state role tags
+        state=$(determine_state "$vmid")
+        role=$(qm_config_line "$vmid" "name")  # VM name as proxy for "role" label
+        tags=$(qm_config_line "$vmid" "tags")
+
+        case "$state" in
+            full)           full=$((full + 1)) ;;
+            partial)        partial=$((partial + 1)) ;;
+            not_set_up)     not_set_up=$((not_set_up + 1)) ;;
+            not_applicable) not_applicable=$((not_applicable + 1)) ;;
+        esac
+
+        emit_finding "fleet.vm.${vmid}.integration" "fleet_vm" "info" "pass" \
+            "VM $vmid ($role): $state" "" \
+            "{\"vmid\":\"$vmid\",\"name\":\"$(json_escape "$role")\",\"state\":\"$state\",\"tags\":\"$(json_escape "$tags")\"}" \
+            '{}'
+
+        [[ $LAMBOOT_JSON -eq 0 ]] && printf '  VM %-6s [%-14s] %s\n' "$vmid" "$state" "$role"
+    done <<< "$vmids"
+
+    emit_finding "fleet.inventory.summary" "fleet" "info" "pass" \
+        "Inventory: $total VM(s)" \
+        "$full full, $partial partial, $not_set_up not set up, $not_applicable not applicable" \
+        "{\"total\":$total,\"full\":$full,\"partial\":$partial,\"not_set_up\":$not_set_up,\"not_applicable\":$not_applicable}" \
+        '{}'
+
+    if [[ $LAMBOOT_JSON -eq 0 ]]; then
+        printf '\nSummary: %d VM(s) — %d full, %d partial, %d not_set_up, %d not_applicable\n\n' \
+            "$total" "$full" "$partial" "$not_set_up" "$not_applicable"
+    fi
+
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── Subcommand: setup ────────────────────────────────────────────────────
+
+do_setup() {
+    require_root
+    require_proxmox_host
+
+    local pve_setup
+    pve_setup=$(find_pve_setup) || die_prerequisite "lamboot-pve-setup not found; install lamboot-toolkit-pve"
+
+    if [[ $OPT_ALL -eq 0 ]] && [[ ${#OPT_VMIDS[@]} -eq 0 ]] && [[ ${#OPT_TAGS[@]} -eq 0 ]]; then
+        die "setup requires --all, --vmid, or --tag"
+    fi
+
+    local vmids
+    vmids=$(qm_list_vmids)
+    vmids=$(filter_vmids "$vmids")
+
+    if [[ -z "$vmids" ]]; then
+        emit_finding "fleet.setup.no_match" "fleet" "info" "pass" \
+            "No VMs match filter" "" "{}" '{}'
+        info "No VMs to process."
+        emit_json "$EXIT_NOOP"
+        exit "$EXIT_NOOP"
+    fi
+
+    local count
+    count=$(printf '%s\n' "$vmids" | wc -l | tr -d ' ')
+
+    info "Fleet setup across $count VM(s)"
+
+    local setup_args=()
+    [[ $LAMBOOT_DRY_RUN -eq 1 ]] && setup_args+=("--dry-run")
+    [[ $LAMBOOT_YES -eq 1 ]] && setup_args+=("--yes")
+    [[ $LAMBOOT_FORCE -eq 1 ]] && setup_args+=("--force")
+    [[ $OPT_RUNNING_OK -eq 1 ]] && setup_args+=("--running-ok")
+    [[ -n "${OPT_CONFIG:-}" ]] && setup_args+=("--config" "$OPT_CONFIG")
+
+    while IFS= read -r vmid; do
+        [[ -z "$vmid" ]] && continue
+
+        local state
+        state=$(determine_state "$vmid")
+
+        if [[ "$state" == "not_applicable" ]]; then
+            FLEET_SKIPPED=$((FLEET_SKIPPED + 1))
+            record_action "fleet.vm.skipped" "$vmid" "skipped" "false" \
+                "{\"reason\":\"not_applicable\",\"state\":\"$state\"}" "null"
+            verbose "skip VM $vmid: not applicable (BIOS)"
+            continue
+        fi
+
+        if [[ "$state" == "full" ]]; then
+            FLEET_SKIPPED=$((FLEET_SKIPPED + 1))
+            record_action "fleet.vm.skipped" "$vmid" "skipped" "false" \
+                "{\"reason\":\"already_set_up\"}" "null"
+            verbose "skip VM $vmid: already set up"
+            continue
+        fi
+
+        info "Setting up VM $vmid ($state)..."
+        if LAMBOOT_LIB_DIR="${LAMBOOT_LIB_DIR:-}" "$pve_setup" setup "$vmid" "${setup_args[@]+${setup_args[@]}}" >/dev/null 2>&1; then
+            FLEET_SUCCESS=$((FLEET_SUCCESS + 1))
+            record_action "fleet.vm.setup_ok" "$vmid" "ok" "true" '{}' "null"
+            success "  VM $vmid: OK"
+        else
+            local rc=$?
+            FLEET_FAILED=$((FLEET_FAILED + 1))
+            record_action "fleet.vm.setup_failed" "$vmid" "fail" "false" \
+                "{\"exit_code\":$rc}" "null"
+            warn "  VM $vmid: FAILED (exit $rc)"
+            if [[ $OPT_CONTINUE_ON_ERROR -eq 0 ]]; then
+                break
+            fi
+        fi
+    done <<< "$vmids"
+
+    emit_finding "fleet.setup.summary" "fleet" "info" "pass" \
+        "Fleet setup: $FLEET_SUCCESS succeeded, $FLEET_FAILED failed, $FLEET_SKIPPED skipped" "" \
+        "{\"success\":$FLEET_SUCCESS,\"failed\":$FLEET_FAILED,\"skipped\":$FLEET_SKIPPED}" \
+        '{}'
+
+    local exit_code="$EXIT_OK"
+    [[ $FLEET_FAILED -gt 0 ]] && [[ $FLEET_SUCCESS -gt 0 ]] && exit_code="$EXIT_PARTIAL"
+    [[ $FLEET_FAILED -gt 0 ]] && [[ $FLEET_SUCCESS -eq 0 ]] && exit_code="$EXIT_ERROR"
+
+    success "$FLEET_SUCCESS setup / $FLEET_SKIPPED skipped / $FLEET_FAILED failed"
+    emit_json "$exit_code"
+    exit "$exit_code"
+}
+
+# ── Subcommand: status ───────────────────────────────────────────────────
+
+do_status() {
+    require_proxmox_host
+
+    local vmids
+    vmids=$(qm_list_vmids)
+
+    local total=0 full=0 partial=0 not_set_up=0 not_applicable=0
+    local -A role_counts=()
+
+    while IFS= read -r vmid; do
+        [[ -z "$vmid" ]] && continue
+        total=$((total + 1))
+        local state
+        state=$(determine_state "$vmid")
+        case "$state" in
+            full)           full=$((full + 1)) ;;
+            partial)        partial=$((partial + 1)) ;;
+            not_set_up)     not_set_up=$((not_set_up + 1)) ;;
+            not_applicable) not_applicable=$((not_applicable + 1)) ;;
+        esac
+
+        # Role extraction: prefer per-VM JSON, fallback to first tag
+        local role=""
+        local json_file="/var/lib/lamboot/${vmid}.json"
+        if [[ -f "$json_file" ]]; then
+            role=$(grep -oE '"role":"[^"]*"' "$json_file" 2>/dev/null | head -1 | cut -d'"' -f4)
+        fi
+        if [[ -z "$role" ]]; then
+            role=$(qm_config_line "$vmid" "tags" | tr ',' ' ' | awk '{print $1}')
+        fi
+        [[ -z "$role" ]] && role="(untagged)"
+
+        if [[ -n "${role_counts[$role]+x}" ]]; then
+            role_counts[$role]=$((role_counts[$role] + 1))
+        else
+            role_counts[$role]=1
+        fi
+    done <<< "$vmids"
+
+    local fleet_id
+    fleet_id=$(awk '/^\[fleet\]/{in_s=1; next} /^\[/{in_s=0} in_s && /^id/{sub(/^id[[:space:]]*=[[:space:]]*/,""); gsub(/"/,""); print; exit}' "$OPT_CONFIG" 2>/dev/null || printf 'default-fleet')
+
+    if [[ $LAMBOOT_JSON -eq 0 ]]; then
+        cat <<EOF
+
+Fleet: $fleet_id ($total VM(s))
+
+Integration state:
+  Fully set up:       $full
+  Partially set up:   $partial
+  Not set up:         $not_set_up
+  Not applicable:     $not_applicable (BIOS)
+
+Role distribution:
+EOF
+        for role in "${!role_counts[@]}"; do
+            printf '  %-20s %d\n' "$role:" "${role_counts[$role]}"
+        done
+        printf '\n'
+    fi
+
+    emit_finding "fleet.status.integration" "fleet" "info" "pass" \
+        "$full fully set up, $partial partial, $not_set_up not set up, $not_applicable not applicable" "" \
+        "{\"total\":$total,\"full\":$full,\"partial\":$partial,\"not_set_up\":$not_set_up,\"not_applicable\":$not_applicable}" \
+        '{}'
+
+    if [[ $partial -gt 0 ]]; then
+        emit_finding "fleet.status.partial_found" "fleet" "warning" "warn" \
+            "$partial VM(s) partially set up" \
+            "Integration drift — some components present, others missing. Run 'lamboot-pve-fleet setup --all' to repair." \
+            "{\"count\":$partial}" \
+            "$(_remediation_json "fleet.status.partial_found" \
+                "Repair partial setups" \
+                "sudo lamboot-pve-fleet setup --all")"
+    fi
+
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── Subcommand: report ───────────────────────────────────────────────────
+
+do_report() {
+    require_proxmox_host
+
+    local vmids
+    vmids=$(qm_list_vmids)
+
+    while IFS= read -r vmid; do
+        [[ -z "$vmid" ]] && continue
+
+        local state name tags bios
+        state=$(determine_state "$vmid")
+        name=$(qm_config_line "$vmid" "name")
+        tags=$(qm_config_line "$vmid" "tags")
+        bios=$(qm_config_line "$vmid" "bios")
+
+        local role=""
+        local json_file="/var/lib/lamboot/${vmid}.json"
+        if [[ -f "$json_file" ]]; then
+            role=$(grep -oE '"role":"[^"]*"' "$json_file" 2>/dev/null | head -1 | cut -d'"' -f4)
+        fi
+
+        emit_finding "fleet.report.vm" "fleet_report" "info" "pass" \
+            "VM $vmid ($name)" "" \
+            "{\"vmid\":\"$vmid\",\"name\":\"$(json_escape "$name")\",\"state\":\"$state\",\"tags\":\"$(json_escape "$tags")\",\"bios\":\"$(json_escape "$bios")\",\"role\":\"$(json_escape "${role:-}")\"}" \
+            '{}'
+    done <<< "$vmids"
+
+    emit_finding "fleet.report.generated" "fleet_report" "info" "pass" \
+        "Fleet report generated" \
+        "Use --json for machine-consumable output." \
+        "{\"hostname\":\"$(hostname)\",\"generated_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
+        '{}'
+
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── CLI ──────────────────────────────────────────────────────────────────
+
+parse_args() {
+    local positional=()
+    while [[ $# -gt 0 ]]; do
+        parse_common_flag "$1"
+        local rc=$?
+        case $rc in
+            1) shift; continue ;;
+            2) _register_subcommands; dispatch_help; exit 0 ;;
+            3) printf 'lamboot-pve-fleet %s (lamboot-tools %s)\n' \
+                "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
+            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            5) shift; shift; continue ;;
+            0) ;;
+        esac
+
+        case "$1" in
+            --all)                  OPT_ALL=1; shift ;;
+            --vmid)                 OPT_VMIDS+=("${2:-}"); shift 2 ;;
+            --tag)                  OPT_TAGS+=("${2:-}"); shift 2 ;;
+            --exclude)              OPT_EXCLUDE+=("${2:-}"); shift 2 ;;
+            --config)               OPT_CONFIG="${2:-}"; shift 2 ;;
+            --running-ok)           OPT_RUNNING_OK=1; shift ;;
+            --continue-on-error)    OPT_CONTINUE_ON_ERROR=1; shift ;;
+            --no-continue-on-error) OPT_CONTINUE_ON_ERROR=0; shift ;;
+            inventory|setup|status|report|help)
+                if [[ -z "$OPT_SUBCOMMAND" ]]; then
+                    OPT_SUBCOMMAND="$1"
+                else
+                    positional+=("$1")
+                fi
+                shift ;;
+            -*) die "unknown option: $1" ;;
+            *)  positional+=("$1"); shift ;;
+        esac
+    done
+
+    if [[ "$OPT_SUBCOMMAND" == "help" ]]; then
+        _register_subcommands
+        if [[ ${#positional[@]} -gt 0 ]]; then
+            dispatch_help "${positional[0]}"
+        else
+            dispatch_help
+        fi
+        exit 0
+    fi
+}
+
+main() {
+    parse_args "$@"
+    [[ -z "$OPT_SUBCOMMAND" ]] && die "no subcommand (try: lamboot-pve-fleet help)"
+
+    case "$OPT_SUBCOMMAND" in
+        inventory) do_inventory ;;
+        setup)     do_setup ;;
+        status)    do_status ;;
+        report)    do_report ;;
+        *)         die "unknown subcommand: $OPT_SUBCOMMAND" ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,39 @@
+# Copr package configuration for lamboot-tools
+#
+# Referenced by Copr webhook for auto-rebuild on tag push to GitHub.
+# See PACKAGING.md for the full release-engineering runbook.
+
+project: lamco/lamboot-tools
+package: lamboot-tools
+
+# Which Fedora releases to build for.
+# Fedora stable + Fedora Rawhide + RHEL/Rocky/Alma 9+.
+chroots:
+  - fedora-44-x86_64
+  - fedora-44-aarch64
+  - fedora-45-x86_64
+  - fedora-rawhide-x86_64
+  - epel-9-x86_64
+  - epel-10-x86_64
+  - centos-stream-9-x86_64
+  - centos-stream-10-x86_64
+
+# Source fetcher: git clone + checkout tag + tarball
+source_type: git
+source_url: https://github.com/lamco-admin/lamboot-tools.git
+source_build_method: make_srpm
+
+# Build hooks
+build_hooks:
+  webhook_url: https://copr.fedorainfracloud.org/webhooks/custom-rebuild/lamco/lamboot-tools/
+  webhook_events: [tag]
+
+# Copr-side metadata
+description: |
+  lamboot-tools is a comprehensive CLI suite for diagnosing, repairing,
+  migrating, and maintaining UEFI boot configurations on Linux systems.
+instructions: |
+  After install:
+    1. `lamboot-toolkit status` to verify installation
+    2. `sudo lamboot-diagnose` for initial health check
+    3. `man lamboot-tools` for suite overview

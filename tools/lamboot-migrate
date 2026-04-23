@@ -1,0 +1,1564 @@
+#!/bin/bash
+# lamboot-migrate — BIOS→UEFI migration and cross-bootloader migration.
+#
+# The first automated end-to-end BIOS→UEFI migration tool for Linux.
+# Handles: MBR→GPT conversion, ESP creation, bootloader installation,
+# fstab rewrite, UEFI boot entry creation, verification, and rollback.
+#
+# Subcommands:
+#   to-uefi [OPTIONS]    Convert BIOS/MBR system to UEFI/GPT (10-phase pipeline)
+#   to-lamboot [OPTIONS] Migrate UEFI system from competing bootloader to LamBoot
+#   verify [OPTIONS]     Run 11-check post-conversion verification
+#   rollback [OPTIONS]   Revert the most recent to-uefi run using backup dir
+#   status               Show current boot configuration
+#
+# Governed by ~/lamboot-dev/docs/specs/SPEC-LAMBOOT-MIGRATE.md (SDS-7).
+# Part of the lamboot-tools suite; see SPEC-LAMBOOT-TOOLKIT-V1.md §3.1.
+
+# shellcheck source=../lib/lamboot-toolkit-lib.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
+# shellcheck source=../lib/lamboot-toolkit-help.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
+
+LAMBOOT_TOOL_NAME="lamboot-migrate"
+LAMBOOT_TOOL_VERSION="1.0.0"
+
+# ── Tool-specific options ────────────────────────────────────────────────
+OPT_SUBCOMMAND=""
+OPT_DISK=""
+OPT_ESP_SIZE_MB=550
+OPT_BOOTLOADER="grub-efi"
+OPT_CMDLINE=""
+OPT_BACKUP_DIR=""
+OPT_METHOD="auto"
+OPT_SKIP_VERIFY=0
+OPT_KEEP_LEGACY_MBR=1
+OPT_PRESERVE_GRUB=1
+OPT_REMOVE_GRUB=0
+OPT_VERIFY_ALL=0
+OPT_VERIFY_PATH=""
+
+# ── Help registry (§10, three-surface rendering) ─────────────────────────
+_register_subcommands() {
+    register_subcommand \
+        --name "to-uefi" \
+        --category "Migration" \
+        --summary "Convert BIOS/MBR system to UEFI/GPT" \
+        --syntax "lamboot-migrate to-uefi [--disk DEV] [--esp-size MB] [--bootloader NAME] [--method A|B|C|auto] [--cmdline STR] [--backup-dir PATH] [--skip-verify] [--keep-legacy-mbr]" \
+        --arg "--disk DEV:Target disk (default: auto-detect root disk)" \
+        --arg "--esp-size MB:ESP partition size in MB (default: 550)" \
+        --arg "--bootloader NAME:grub-efi (default), lamboot, or systemd-boot" \
+        --arg "--method A|B|C|auto:Proxmox VM method selector (default: auto)" \
+        --arg "--cmdline STR:Override kernel cmdline for new BLS entries" \
+        --arg "--backup-dir PATH:Where to store the backup (default: /var/backups/lamboot-migrate-<ts>/)" \
+        --arg "--skip-verify:Don't run verification suite after conversion" \
+        --arg "--keep-legacy-mbr:Leave MBR boot code (protective) — default" \
+        --example "sudo lamboot-migrate to-uefi --disk /dev/sda" \
+        --example "sudo lamboot-migrate to-uefi --dry-run" \
+        --example "sudo lamboot-migrate to-uefi --bootloader lamboot --esp-size 1024" \
+        --notes "Runs a 10-phase pipeline with safety gates at each step. The first 6 phases are reversible with no disk changes (rollback runs a diff). After Phase 4 (MBR→GPT), rollback requires the backup dir. Always back up your system before running. For boot disk migration on physical hardware, run from live media." \
+        --offline-capable "false" \
+        --requires-root "true" \
+        --see-also "to-lamboot, verify, rollback, status" \
+        --doc-url "https://lamboot.dev/tools/migrate/to-uefi" \
+        --maturity "stable"
+
+    register_subcommand \
+        --name "to-lamboot" \
+        --category "Migration" \
+        --summary "Migrate UEFI system from another bootloader to LamBoot" \
+        --syntax "lamboot-migrate to-lamboot [--esp PATH] [--preserve-grub|--remove-grub] [--force]" \
+        --arg "--esp PATH:ESP mount point (default: auto-detect)" \
+        --arg "--preserve-grub:Keep existing bootloader as fallback (default)" \
+        --arg "--remove-grub:Remove GRUB packages + ESP files + NVRAM entries after verify passes (DANGEROUS)" \
+        --arg "--force:Skip typed-yes confirmation when --remove-grub is used" \
+        --example "sudo lamboot-migrate to-lamboot" \
+        --example "sudo lamboot-migrate to-lamboot --preserve-grub" \
+        --example "sudo lamboot-migrate to-lamboot --remove-grub    # asks for confirmation" \
+        --example "sudo lamboot-migrate to-lamboot --remove-grub --force" \
+        --notes "Invokes lamboot-install. With --preserve-grub (default) the prior bootloader stays as a UEFI fallback. With --remove-grub the tool runs verify first; if all 11 checks pass, it uninstalls the distro's GRUB packages, removes GRUB files from the ESP, and deletes GRUB Boot#### entries from NVRAM. Refuses to remove if verify fails. Requires typed-yes confirmation unless --force." \
+        --offline-capable "false" \
+        --requires-root "true" \
+        --see-also "to-uefi, rollback" \
+        --doc-url "https://lamboot.dev/tools/migrate/to-lamboot" \
+        --maturity "stable"
+
+    register_subcommand \
+        --name "verify" \
+        --category "Verification" \
+        --summary "Run the 11-check post-conversion verification suite" \
+        --syntax "lamboot-migrate verify [--all] [--path BACKUP-DIR] [--json]" \
+        --arg "--all:Run all checks (default)" \
+        --arg "--path PATH:Verify a backup directory produced by --backup-dir" \
+        --example "sudo lamboot-migrate verify" \
+        --example "sudo lamboot-migrate verify --json" \
+        --example "sudo lamboot-migrate verify --path /var/backups/lamboot-migrate-2026-04-22..." \
+        --notes "Runs 11 independent checks per SDS-7 §9. Exits 0 if all pass, 1 if any fail. Safe to run repeatedly. Read-only — does not modify state." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "to-uefi, rollback" \
+        --doc-url "https://lamboot.dev/tools/migrate/verify" \
+        --maturity "stable"
+
+    register_subcommand \
+        --name "rollback" \
+        --category "Recovery" \
+        --summary "Revert the most recent to-uefi run using its backup" \
+        --syntax "lamboot-migrate rollback [--backup-dir PATH]" \
+        --arg "--backup-dir PATH:Specific backup to restore (default: most recent)" \
+        --example "sudo lamboot-migrate rollback" \
+        --example "sudo lamboot-migrate rollback --backup-dir /var/backups/lamboot-migrate-2026-04-22..." \
+        --example "sudo lamboot-migrate rollback --dry-run" \
+        --notes "Restores the original MBR partition table, original fstab, and original /etc/default/grub. Removes the UEFI boot entry created during to-uefi. You will need to switch firmware back to Legacy/CSM after rollback to boot off the restored MBR." \
+        --offline-capable "false" \
+        --requires-root "true" \
+        --see-also "to-uefi, verify" \
+        --doc-url "https://lamboot.dev/tools/migrate/rollback" \
+        --maturity "stable"
+
+    register_subcommand \
+        --name "status" \
+        --category "Information" \
+        --summary "Show current boot configuration and migration readiness" \
+        --syntax "lamboot-migrate status [--json]" \
+        --example "lamboot-migrate status" \
+        --example "lamboot-migrate status --json | jq .findings" \
+        --notes "Read-only; runs unprivileged. Reports boot mode, partition table type, ESP state, installed bootloaders, fstab form, and migration readiness." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "to-uefi, verify" \
+        --doc-url "https://lamboot.dev/tools/migrate/status" \
+        --maturity "stable"
+}
+
+# ── Phase 1 preflight guardrails (SDS-7 §5) ──────────────────────────────
+
+guard_boot_mode_is_bios() {
+    if [[ -d /sys/firmware/efi ]]; then
+        emit_finding "migrate.boot_mode.already_uefi" "firmware" "info" "pass" \
+            "System is already UEFI" \
+            "No BIOS→UEFI conversion needed; boot mode is UEFI." \
+            "{}" '{"summary":"Run lamboot-migrate to-lamboot if you want to switch to LamBoot","command":"lamboot-migrate to-lamboot","doc_url":"https://lamboot.dev/tools/migrate/to-lamboot"}'
+        die_noop "system is already UEFI"
+    fi
+}
+
+guard_required_tools() {
+    local missing=()
+    for tool in sgdisk mkfs.vfat efibootmgr blkid lsblk findmnt rsync; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        emit_finding "migrate.preflight.tools_missing" "preflight" "critical" "fail" \
+            "Required tools not found" \
+            "Missing: ${missing[*]}. Install gdisk + dosfstools + efibootmgr + util-linux." \
+            "{\"missing\":[\"$(printf '%s' "${missing[*]}" | sed 's/ /","/g')\"]}" \
+            '{"summary":"Install required tools via your package manager","command":"sudo apt install gdisk dosfstools efibootmgr || sudo dnf install gdisk dosfstools efibootmgr","doc_url":"https://lamboot.dev/tools/migrate/prerequisites"}'
+        die_prerequisite "required tools missing: ${missing[*]}"
+    fi
+}
+
+guard_root_not_on_lvm_or_crypt() {
+    local root_source
+    root_source=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/\[.*\]//')
+
+    if [[ "$root_source" == /dev/mapper/* ]]; then
+        if command -v cryptsetup >/dev/null 2>&1 && cryptsetup status "$(basename "$root_source")" >/dev/null 2>&1; then
+            emit_finding "migrate.preflight.encrypted_root" "preflight" "critical" "fail" \
+                "Root filesystem is on dm-crypt" \
+                "Encrypted-root BIOS→UEFI migration is not automated in v1.0 (too much risk)." \
+                "{}" \
+                '{"summary":"Manual migration path — see documentation","doc_url":"https://lamboot.dev/tools/migrate/encrypted-root"}'
+            die_unsafe "root on dm-crypt — automated conversion refused"
+        fi
+
+        if command -v lvdisplay >/dev/null 2>&1 && lvdisplay "$root_source" >/dev/null 2>&1; then
+            emit_finding "migrate.preflight.lvm_root" "preflight" "critical" "fail" \
+                "Root filesystem is on LVM" \
+                "LVM-root BIOS→UEFI migration is not automated in v1.0." \
+                "{}" \
+                '{"summary":"Manual migration path — see documentation","doc_url":"https://lamboot.dev/tools/migrate/lvm-root"}'
+            die_unsafe "root on LVM — automated conversion refused"
+        fi
+    fi
+}
+
+guard_no_hybrid_mbr() {
+    local disk="$1"
+    local mbr_output
+    mbr_output=$(sgdisk --print-mbr-only "$disk" 2>/dev/null || true)
+    local mbr_partitions
+    mbr_partitions=$(printf '%s' "$mbr_output" | grep -cE '^\s+[0-9]+\s+' || true)
+    mbr_partitions="${mbr_partitions:-0}"
+
+    local pttype
+    pttype=$(blkid -o value -s PTTYPE "$disk" 2>/dev/null || true)
+
+    if [[ "$pttype" == "gpt" ]] && [[ "$mbr_partitions" -gt 1 ]]; then
+        emit_finding "migrate.preflight.hybrid_mbr" "preflight" "critical" "fail" \
+            "Hybrid MBR detected" \
+            "The disk has both GPT and non-protective MBR partitions. Rod Smith calls hybrid MBRs 'flaky and dangerous.'" \
+            "{\"disk\":\"$(json_escape "$disk")\",\"mbr_partition_count\":${mbr_partitions}}" \
+            '{"summary":"Manual cleanup required","doc_url":"https://www.rodsbooks.com/gdisk/hybrid.html"}'
+        die_unsafe "hybrid MBR detected on $disk — refusing automated conversion"
+    fi
+}
+
+guard_no_windows() {
+    local disk="$1"
+    local parts
+    parts=$(lsblk -nr -o NAME,FSTYPE "$disk" 2>/dev/null || true)
+
+    if printf '%s' "$parts" | awk '{print $2}' | grep -qi 'ntfs'; then
+        local ntfs_part
+        ntfs_part=$(printf '%s' "$parts" | awk '$2 ~ /ntfs|NTFS/ {print $1; exit}')
+        local bmgr=""
+        if [[ -n "$ntfs_part" ]]; then
+            local mp
+            mp=$(mktemp -d -t lamboot-migrate-check.XXXXXX)
+            if mount -o ro,noexec,nodev "/dev/$ntfs_part" "$mp" 2>/dev/null; then
+                [[ -d "$mp/Windows/Boot" ]] && bmgr="detected"
+                umount "$mp" 2>/dev/null || true
+            fi
+            rmdir "$mp" 2>/dev/null || true
+        fi
+
+        if [[ "$bmgr" == "detected" ]]; then
+            emit_finding "migrate.preflight.windows_present" "preflight" "critical" "fail" \
+                "Windows install detected on target disk" \
+                "Windows dual-boot with MBR→GPT conversion requires BCD rewriting, not automated in v1.0." \
+                "{\"disk\":\"$(json_escape "$disk")\",\"ntfs_partition\":\"$(json_escape "$ntfs_part")\"}" \
+                '{"summary":"Manual dual-boot migration","doc_url":"https://lamboot.dev/tools/migrate/dual-boot"}'
+            die_unsafe "Windows present on $disk — refusing automated conversion"
+        fi
+    fi
+}
+
+guard_fstab_uuid_form() {
+    local dev_entries
+    dev_entries=$(grep -cE '^\s*/dev/sd[a-z]|^\s*/dev/nvme|^\s*/dev/hd[a-z]' /etc/fstab 2>/dev/null || true)
+    dev_entries="${dev_entries:-0}"
+
+    if [[ "$dev_entries" -gt 0 ]]; then
+        emit_finding "migrate.preflight.fstab_device_paths" "preflight" "warning" "warn" \
+            "fstab contains device-path entries" \
+            "${dev_entries} fstab entries use /dev/ paths. These may break after MBR→GPT conversion. Phase 6 will rewrite them to UUID= form." \
+            "{\"count\":${dev_entries}}" \
+            '{"summary":"Phase 6 rewrites automatically; nothing to do","doc_url":"https://lamboot.dev/tools/migrate/fstab"}'
+    fi
+}
+
+guard_disk_free_space() {
+    local disk="$1"
+    local need_mb="$2"
+    local size_sectors last_sector
+    size_sectors=$(blockdev --getsz "$disk" 2>/dev/null || printf '0')
+    last_sector=$(sgdisk -p "$disk" 2>/dev/null | tail -1 | awk '{print $3}' || printf '0')
+    last_sector="${last_sector:-0}"
+
+    if [[ "$size_sectors" == "0" ]] || [[ "$last_sector" == "0" ]]; then
+        verbose "disk space check inconclusive — will attempt creation anyway"
+        return 0
+    fi
+
+    local free_sectors=$((size_sectors - last_sector))
+    local free_mb=$((free_sectors * 512 / 1024 / 1024))
+
+    if [[ "$free_mb" -lt "$need_mb" ]]; then
+        emit_finding "migrate.preflight.insufficient_free_space" "preflight" "error" "fail" \
+            "Insufficient free space at end of disk" \
+            "Need ${need_mb} MB for ESP; only ${free_mb} MB available at end of $disk." \
+            "{\"disk\":\"$(json_escape "$disk")\",\"free_mb\":${free_mb},\"need_mb\":${need_mb}}" \
+            '{"summary":"Shrink the last partition or use a smaller --esp-size","doc_url":"https://lamboot.dev/tools/migrate/disk-space"}'
+
+        if [[ $LAMBOOT_FORCE -eq 0 ]]; then
+            die "insufficient free space for ESP ($free_mb MB free, need $need_mb MB)"
+        fi
+        warn "continuing despite insufficient space (--force)"
+    fi
+}
+
+guard_existing_esp_collision() {
+    local disk="$1"
+    local existing_esp
+    existing_esp=$(sgdisk -p "$disk" 2>/dev/null | awk '$6 == "EF00" {print $1}' | head -1 || true)
+    if [[ -n "$existing_esp" ]]; then
+        verbose "existing ESP on $disk at partition $existing_esp — will reuse"
+    fi
+    printf '%s' "$existing_esp"
+}
+
+# ── Disk + partition utilities ───────────────────────────────────────────
+
+partition_device_for() {
+    local disk="$1"
+    local partnum="$2"
+    if [[ "$disk" =~ nvme|mmcblk|loop ]]; then
+        printf '%sp%s' "$disk" "$partnum"
+    else
+        printf '%s%s' "$disk" "$partnum"
+    fi
+}
+
+detect_target_disk() {
+    if [[ -n "$OPT_DISK" ]]; then
+        printf '%s' "$OPT_DISK"
+        return 0
+    fi
+    local root_source
+    root_source=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/\[.*\]//' || true)
+    [[ -z "$root_source" ]] && return 1
+    local parent
+    parent=$(lsblk -nro PKNAME "$root_source" 2>/dev/null | head -1 || true)
+    [[ -z "$parent" ]] && return 1
+    printf '/dev/%s' "$parent"
+}
+
+# ── Proxmox method detection (SDS-7 §4) ──────────────────────────────────
+
+detect_proxmox_method() {
+    case "$OPT_METHOD" in
+        a|A) printf 'A'; return 0 ;;
+        b|B) printf 'B'; return 0 ;;
+        c|C) printf 'C'; return 0 ;;
+        auto) ;;
+        *) die "invalid --method: $OPT_METHOD (use auto, A, B, or C)" ;;
+    esac
+
+    # Auto-select heuristic per SDS-7 §4.4
+    if [[ -n "${PROXMOX_VM_ID:-}" ]] && command -v qm >/dev/null 2>&1; then
+        printf 'A'
+        return 0
+    fi
+
+    if [[ -d /run/initramfs ]] && grep -q 'live' /proc/cmdline 2>/dev/null; then
+        printf 'B'
+        return 0
+    fi
+
+    printf 'A'
+}
+
+# ── Distro-specific bootloader install (SDS-7 §3 Phase 8) ─────────────────
+
+install_grub_by_distro() {
+    local esp_mount="$1"
+    local distro
+    distro=$(detect_distro)
+
+    case "$distro" in
+        ubuntu|debian|linuxmint|pop|elementary|kali)
+            install_grub_apt "$esp_mount"
+            ;;
+        fedora|rhel|centos|rocky|almalinux|ol)
+            install_grub_dnf "$esp_mount"
+            ;;
+        arch|endeavouros|manjaro|cachyos|artix)
+            install_grub_pacman "$esp_mount"
+            ;;
+        opensuse*|sles|suse)
+            install_grub_zypper "$esp_mount"
+            ;;
+        alpine)
+            warn "Alpine Linux detected — GRUB install not automated in v1.0; install manually"
+            return 1
+            ;;
+        *)
+            warn "unknown distro: $distro — attempting generic grub-install"
+            install_grub_generic "$esp_mount"
+            ;;
+    esac
+}
+
+install_grub_apt() {
+    local esp_mount="$1"
+    lamboot_run apt-get install -y grub-efi-amd64 shim-signed \
+        || die "apt install grub-efi-amd64 failed"
+    lamboot_run grub-install --target=x86_64-efi \
+        --efi-directory="$esp_mount" \
+        --bootloader-id=ubuntu \
+        || die "grub-install failed"
+    if command -v update-grub >/dev/null 2>&1; then
+        lamboot_run update-grub
+    fi
+    record_action "bootloader.grub_efi.install" "apt" "ok" "false" '{"target":"x86_64-efi"}' "null"
+}
+
+install_grub_dnf() {
+    local esp_mount="$1"
+    lamboot_run dnf install -y grub2-efi-x64 grub2-efi-x64-modules shim-x64 \
+        || die "dnf install grub2-efi-x64 failed"
+    lamboot_run grub2-install --target=x86_64-efi \
+        --efi-directory="$esp_mount" \
+        --bootloader-id=fedora \
+        || die "grub2-install failed"
+
+    local distro
+    distro=$(detect_distro)
+    lamboot_run grub2-mkconfig -o "${esp_mount}/EFI/${distro}/grub.cfg"
+    record_action "bootloader.grub_efi.install" "dnf" "ok" "false" '{"target":"x86_64-efi"}' "null"
+}
+
+install_grub_pacman() {
+    local esp_mount="$1"
+    lamboot_run pacman -S --noconfirm grub efibootmgr \
+        || die "pacman install grub failed"
+    lamboot_run grub-install --target=x86_64-efi \
+        --efi-directory="$esp_mount" \
+        --bootloader-id=arch \
+        || die "grub-install failed"
+    lamboot_run grub-mkconfig -o /boot/grub/grub.cfg
+    record_action "bootloader.grub_efi.install" "pacman" "ok" "false" '{"target":"x86_64-efi"}' "null"
+}
+
+install_grub_zypper() {
+    local esp_mount="$1"
+    lamboot_run zypper install -y grub2-x86_64-efi shim \
+        || die "zypper install grub2-x86_64-efi failed"
+    lamboot_run grub2-install --target=x86_64-efi \
+        --efi-directory="$esp_mount" \
+        --bootloader-id=opensuse \
+        || die "grub2-install failed"
+    if command -v update-bootloader >/dev/null 2>&1; then
+        lamboot_run update-bootloader
+    fi
+    record_action "bootloader.grub_efi.install" "zypper" "ok" "false" '{"target":"x86_64-efi"}' "null"
+}
+
+install_grub_generic() {
+    local esp_mount="$1"
+    require_tool grub-install "install GRUB via your distro's package manager"
+    lamboot_run grub-install --target=x86_64-efi \
+        --efi-directory="$esp_mount" \
+        || die "generic grub-install failed"
+    record_action "bootloader.grub_efi.install" "generic" "ok" "false" '{"target":"x86_64-efi"}' "null"
+}
+
+# ── to-uefi 10-phase pipeline (SDS-7 §3) ─────────────────────────────────
+
+to_uefi_phase_1_preflight() {
+    info "Phase 1 — Preflight"
+
+    guard_boot_mode_is_bios
+    guard_required_tools
+
+    local disk
+    disk=$(detect_target_disk) || die "cannot auto-detect target disk; use --disk"
+    OPT_DISK="$disk"
+    verbose "target disk: $OPT_DISK"
+
+    [[ -b "$OPT_DISK" ]] || die "not a block device: $OPT_DISK"
+
+    guard_root_not_on_lvm_or_crypt
+    guard_no_hybrid_mbr "$OPT_DISK"
+    guard_no_windows "$OPT_DISK"
+    guard_fstab_uuid_form
+    guard_disk_free_space "$OPT_DISK" "$OPT_ESP_SIZE_MB"
+    guard_existing_esp_collision "$OPT_DISK" >/dev/null
+
+    emit_finding "migrate.phase1.complete" "preflight" "info" "pass" \
+        "Preflight checks passed" \
+        "All safety gates cleared for $OPT_DISK." \
+        "{\"disk\":\"$(json_escape "$OPT_DISK")\",\"esp_size_mb\":${OPT_ESP_SIZE_MB}}" \
+        '{}'
+    success "Phase 1 passed"
+}
+
+to_uefi_phase_2_confirm() {
+    info "Phase 2 — Interactive confirmation"
+
+    cat <<EOF >&2
+
+Planned actions:
+  Target disk:        $OPT_DISK
+  ESP size:           ${OPT_ESP_SIZE_MB} MB
+  Bootloader:         $OPT_BOOTLOADER
+  Backup directory:   ${OPT_BACKUP_DIR:-/var/backups/lamboot-migrate-<auto>}
+  Method:             $(detect_proxmox_method)
+
+Point of no return is Phase 4 (MBR→GPT). Everything before that is reversible
+without backup. Phase 5+ require backup for rollback.
+
+EOF
+
+    if ! confirm "CONVERT TO UEFI" "yes"; then
+        record_action "migrate.user_aborted" "$OPT_DISK" "abort" "false" '{}' "null"
+        emit_json "$EXIT_ABORT"
+        exit "$EXIT_ABORT"
+    fi
+}
+
+to_uefi_phase_3_backup() {
+    info "Phase 3 — Backup"
+
+    local backup_dir
+    backup_dir="${OPT_BACKUP_DIR:-$(backup_dir_new migrate)}"
+    OPT_BACKUP_DIR="$backup_dir"
+
+    lamboot_run dd if="$OPT_DISK" "of=${backup_dir}/mbr-raw.bin" bs=1M count=1 status=none \
+        || die "MBR backup failed"
+
+    lamboot_run sgdisk "--backup=${backup_dir}/partition-table.gpt" "$OPT_DISK" \
+        || die "partition table backup failed"
+
+    backup_file_to "$backup_dir" /etc/fstab "fstab.pre-rewrite"
+    backup_file_to "$backup_dir" /etc/default/grub "default-grub"
+    backup_file_to "$backup_dir" /boot/grub/grub.cfg "grub.cfg"
+
+    # Capture efivarfs state (may be empty on BIOS)
+    if command -v efibootmgr >/dev/null 2>&1; then
+        efibootmgr -v > "${backup_dir}/efi-vars.txt" 2>/dev/null || true
+    fi
+
+    record_action "migrate.backup_created" "$backup_dir" "ok" "true" \
+        "{\"mbr_raw\":\"${backup_dir}/mbr-raw.bin\",\"disk\":\"$(json_escape "$OPT_DISK")\"}" \
+        "$backup_dir"
+
+    success "Phase 3 — backup saved: $backup_dir"
+}
+
+to_uefi_phase_4_mbr_to_gpt() {
+    info "Phase 4 — MBR→GPT conversion (point of no return for partition table)"
+
+    local pttype
+    pttype=$(blkid -o value -s PTTYPE "$OPT_DISK" 2>/dev/null || true)
+
+    if [[ "$pttype" == "gpt" ]]; then
+        verbose "disk is already GPT — skipping conversion"
+        record_action "partition.mbrtogpt" "$OPT_DISK" "skipped" "false" '{"reason":"already_gpt"}' "null"
+        return 0
+    fi
+
+    lamboot_run sgdisk --mbrtogpt "$OPT_DISK" \
+        || die "sgdisk --mbrtogpt failed for $OPT_DISK"
+
+    record_action "partition.mbrtogpt" "$OPT_DISK" "ok" "true" '{}' "$OPT_BACKUP_DIR"
+    success "Phase 4 — partition table converted to GPT"
+}
+
+to_uefi_phase_5_create_esp() {
+    info "Phase 5 — Create ESP"
+
+    local existing_esp
+    existing_esp=$(sgdisk -p "$OPT_DISK" 2>/dev/null | awk '$6 == "EF00" {print $1}' | head -1 || true)
+
+    local esp_partnum
+    if [[ -n "$existing_esp" ]]; then
+        esp_partnum="$existing_esp"
+        verbose "reusing existing ESP partition $esp_partnum"
+    else
+        lamboot_run sgdisk --new="0:0:+${OPT_ESP_SIZE_MB}M" \
+            --typecode="0:ef00" \
+            --change-name="0:EFI System" \
+            "$OPT_DISK" \
+            || die "sgdisk --new for ESP failed"
+
+        esp_partnum=$(sgdisk -p "$OPT_DISK" 2>/dev/null | awk '$6 == "EF00" {print $1}' | head -1 || true)
+        [[ -n "$esp_partnum" ]] || die "ESP partition created but not detectable"
+
+        record_action "partition.create_esp" "$OPT_DISK" "ok" "true" \
+            "{\"partition\":${esp_partnum},\"size_mb\":${OPT_ESP_SIZE_MB}}" "$OPT_BACKUP_DIR"
+    fi
+
+    local esp_dev
+    esp_dev=$(partition_device_for "$OPT_DISK" "$esp_partnum")
+
+    lamboot_run partprobe "$OPT_DISK" 2>/dev/null || true
+
+    if [[ -z "$existing_esp" ]]; then
+        lamboot_run mkfs.vfat -F 32 -n ESP "$esp_dev" \
+            || die "mkfs.vfat failed for $esp_dev"
+        record_action "filesystem.format" "$esp_dev" "ok" "false" '{"fstype":"vfat","label":"ESP"}' "null"
+    fi
+
+    lamboot_run mkdir -p /boot/efi
+    if ! mountpoint -q /boot/efi 2>/dev/null; then
+        lamboot_run mount "$esp_dev" /boot/efi \
+            || die "failed to mount $esp_dev at /boot/efi"
+        record_action "filesystem.mount" "$esp_dev" "ok" "false" '{"mountpoint":"/boot/efi"}' "null"
+    fi
+
+    success "Phase 5 — ESP at $esp_dev mounted on /boot/efi"
+    printf '%s' "$esp_dev"
+}
+
+to_uefi_phase_6_fstab() {
+    info "Phase 6 — fstab rewrite"
+
+    local esp_dev="$1"
+    local esp_uuid
+    esp_uuid=$(blkid -s UUID -o value "$esp_dev" 2>/dev/null || true)
+    [[ -n "$esp_uuid" ]] || die "could not read UUID for $esp_dev"
+
+    if [[ $LAMBOOT_DRY_RUN -eq 0 ]]; then
+        local new_fstab
+        new_fstab=$(mktemp)
+
+        # Rewrite any /dev/sd* or /dev/nvme* or /dev/hd* references to UUID= form
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^[[:space:]]*/dev/(sd[a-z]|nvme|hd[a-z]) ]]; then
+                local dev
+                dev=$(printf '%s' "$line" | awk '{print $1}')
+                local uuid
+                uuid=$(blkid -s UUID -o value "$dev" 2>/dev/null || true)
+                if [[ -n "$uuid" ]]; then
+                    printf '%s\n' "$line" | sed "s|^${dev}|UUID=${uuid}|"
+                    verbose "rewrote fstab: $dev → UUID=$uuid"
+                else
+                    printf '%s\n' "$line"
+                fi
+            else
+                printf '%s\n' "$line"
+            fi
+        done < /etc/fstab > "$new_fstab"
+
+        # Append ESP entry if not already present
+        if ! grep -q "$esp_uuid" "$new_fstab"; then
+            printf 'UUID=%s /boot/efi vfat umask=0077,shortname=winnt 0 1\n' "$esp_uuid" >> "$new_fstab"
+        fi
+
+        mv "$new_fstab" /etc/fstab
+        chmod 0644 /etc/fstab
+    else
+        printf 'DRY-RUN: would rewrite /etc/fstab with UUID=%s mount at /boot/efi\n' "$esp_uuid" >&2
+    fi
+
+    record_action "fstab.rewrite" "/etc/fstab" "ok" "true" \
+        "{\"esp_uuid\":\"$(json_escape "$esp_uuid")\"}" "$OPT_BACKUP_DIR"
+
+    success "Phase 6 — fstab rewritten with UUID= entries"
+}
+
+to_uefi_phase_7_chroot_prep() {
+    info "Phase 7 — Chroot prep"
+
+    # When running on a live system, these are already mounted; only matters for method B.
+    if [[ -d /proc ]] && mountpoint -q /proc 2>/dev/null; then
+        verbose "/proc already mounted"
+    fi
+    if [[ -d /sys ]] && mountpoint -q /sys 2>/dev/null; then
+        verbose "/sys already mounted"
+    fi
+
+    # efivarfs is BIOS-absent during a live-media chroot; method B should bind-mount.
+    # For method A (in-place), efivarfs won't exist until after reboot into UEFI.
+    if [[ -d /sys/firmware/efi/efivars ]]; then
+        verbose "efivarfs present (method A on post-UEFI host; unusual)"
+    else
+        verbose "efivarfs absent (expected on BIOS boot; will appear after UEFI reboot)"
+    fi
+
+    success "Phase 7 — chroot prep complete"
+}
+
+to_uefi_phase_8_install_bootloader() {
+    info "Phase 8 — Install bootloader ($OPT_BOOTLOADER)"
+
+    case "$OPT_BOOTLOADER" in
+        grub-efi)
+            install_grub_by_distro /boot/efi
+            ;;
+        lamboot)
+            install_grub_by_distro /boot/efi
+            if command -v lamboot-install >/dev/null 2>&1; then
+                lamboot_run lamboot-install --with-drivers --set-default \
+                    || die "lamboot-install failed"
+                record_action "bootloader.lamboot.install" "/boot/efi/EFI/LamBoot" "ok" "false" '{}' "null"
+            else
+                warn "lamboot-install not found; GRUB installed as fallback"
+                warn "install LamBoot later: https://lamboot.dev/install"
+            fi
+            ;;
+        systemd-boot)
+            require_tool bootctl "install systemd-boot via your distro's package manager"
+            lamboot_run bootctl install || die "bootctl install failed"
+            record_action "bootloader.systemd-boot.install" "/boot/efi" "ok" "false" '{}' "null"
+            ;;
+        *)
+            die "unknown bootloader: $OPT_BOOTLOADER (use grub-efi, lamboot, or systemd-boot)"
+            ;;
+    esac
+
+    success "Phase 8 — bootloader installed"
+}
+
+to_uefi_phase_9_uefi_entry() {
+    info "Phase 9 — UEFI boot entry"
+
+    # On a BIOS-booted host, efibootmgr can't write NVRAM (no efivarfs).
+    # Method B (live chroot) or post-reboot-into-UEFI is the actual creation moment.
+    if [[ ! -d /sys/firmware/efi/efivars ]]; then
+        warn "efivarfs not available on BIOS boot — UEFI boot entry will be created on first UEFI boot"
+        record_action "uefi.boot_entry.deferred" "EFI/BOOT/BOOTX64.EFI" "skipped" "false" \
+            '{"reason":"no_efivarfs"}' "null"
+
+        # Populate the fallback path so firmware-removable-boot picks it up
+        populate_fallback_path
+        return 0
+    fi
+
+    local esp_partnum
+    esp_partnum=$(sgdisk -p "$OPT_DISK" 2>/dev/null | awk '$6 == "EF00" {print $1}' | head -1 || true)
+    [[ -n "$esp_partnum" ]] || die "cannot determine ESP partition number for efibootmgr"
+
+    local distro
+    distro=$(detect_distro)
+
+    local loader_path="\\EFI\\${distro}\\grubx64.efi"
+    [[ "$OPT_BOOTLOADER" == "lamboot" ]] && loader_path="\\EFI\\LamBoot\\lambootx64.efi"
+
+    lamboot_run efibootmgr --create --disk "$OPT_DISK" --part "$esp_partnum" \
+        --loader "$loader_path" \
+        --label "LamBoot-migrated $(date +%Y-%m-%d)" \
+        || die "efibootmgr --create failed"
+
+    record_action "uefi.boot_entry.create" "$loader_path" "ok" "true" \
+        "{\"disk\":\"$(json_escape "$OPT_DISK")\",\"part\":${esp_partnum}}" "$OPT_BACKUP_DIR"
+
+    populate_fallback_path
+
+    success "Phase 9 — UEFI boot entry created"
+}
+
+populate_fallback_path() {
+    lamboot_run mkdir -p /boot/efi/EFI/BOOT
+
+    local source_loader=""
+    case "$OPT_BOOTLOADER" in
+        grub-efi)
+            for candidate in /boot/efi/EFI/*/grubx64.efi /boot/efi/EFI/*/shimx64.efi; do
+                [[ -f "$candidate" ]] && { source_loader="$candidate"; break; }
+            done
+            ;;
+        lamboot)
+            source_loader="/boot/efi/EFI/LamBoot/lambootx64.efi"
+            ;;
+        systemd-boot)
+            source_loader="/boot/efi/EFI/systemd/systemd-bootx64.efi"
+            ;;
+    esac
+
+    if [[ -n "$source_loader" ]] && [[ -f "$source_loader" ]]; then
+        lamboot_run cp "$source_loader" /boot/efi/EFI/BOOT/BOOTX64.EFI
+        record_action "uefi.fallback_path.populate" "/boot/efi/EFI/BOOT/BOOTX64.EFI" "ok" "false" \
+            "{\"source\":\"$(json_escape "$source_loader")\"}" "null"
+    else
+        warn "could not find a source loader for fallback path population"
+    fi
+}
+
+to_uefi_phase_10_verify() {
+    info "Phase 10 — Verify"
+
+    if [[ $OPT_SKIP_VERIFY -eq 1 ]]; then
+        verbose "skipping verification (--skip-verify)"
+        return 0
+    fi
+
+    local fail_count=0
+    run_verify_checks || fail_count=$?
+
+    if [[ $fail_count -eq 0 ]]; then
+        backup_success "$OPT_BACKUP_DIR"
+        success "Phase 10 — all 11 verification checks passed"
+    else
+        warn "Phase 10 — $fail_count verification check(s) failed; system in EXIT_PARTIAL state"
+        warn "run 'lamboot-migrate verify' to inspect, or 'lamboot-migrate rollback' to revert"
+        emit_json "$EXIT_PARTIAL"
+        exit "$EXIT_PARTIAL"
+    fi
+}
+
+do_to_uefi() {
+    require_root
+
+    to_uefi_phase_1_preflight
+    to_uefi_phase_2_confirm
+    to_uefi_phase_3_backup
+    to_uefi_phase_4_mbr_to_gpt
+    local esp_dev
+    esp_dev=$(to_uefi_phase_5_create_esp)
+    to_uefi_phase_6_fstab "$esp_dev"
+    to_uefi_phase_7_chroot_prep
+    to_uefi_phase_8_install_bootloader
+    to_uefi_phase_9_uefi_entry
+    to_uefi_phase_10_verify
+
+    cat <<EOF >&2
+
+Migration complete.
+
+Next steps:
+  1. Reboot.
+  2. Enter firmware setup (usually F2/F12/DEL at POST).
+  3. Switch from Legacy/CSM to UEFI mode.
+  4. Boot. Your system will come up via UEFI.
+
+Proxmox VMs:
+  qm shutdown <VMID>
+  qm set <VMID> --bios ovmf --efidisk0 <storage>:1,efitype=4m
+  qm start <VMID>
+
+Backup retained: $OPT_BACKUP_DIR
+Rollback available: sudo lamboot-migrate rollback
+
+EOF
+
+    emit_json "$EXIT_OK"
+}
+
+# ── to-lamboot (SDS-7 §2.2) ──────────────────────────────────────────────
+
+do_to_lamboot() {
+    require_root
+
+    if [[ ! -d /sys/firmware/efi ]]; then
+        emit_finding "migrate.to_lamboot.not_uefi" "firmware" "critical" "fail" \
+            "System is not booted in UEFI mode" \
+            "Run 'lamboot-migrate to-uefi' first to convert BIOS/MBR to UEFI/GPT." \
+            "{}" \
+            '{"summary":"Run to-uefi first","command":"sudo lamboot-migrate to-uefi","doc_url":"https://lamboot.dev/tools/migrate/to-uefi"}'
+        emit_json "$EXIT_NOT_APPLICABLE"
+        exit "$EXIT_NOT_APPLICABLE"
+    fi
+
+    local backup_dir
+    backup_dir=$(backup_dir_new to-lamboot)
+
+    # Snapshot current bootloader state
+    if command -v efibootmgr >/dev/null 2>&1; then
+        efibootmgr -v > "${backup_dir}/efi-vars.txt" 2>/dev/null || true
+    fi
+
+    if ! command -v lamboot-install >/dev/null 2>&1; then
+        die_prerequisite "lamboot-install not found; install the LamBoot bootloader package first"
+    fi
+
+    local install_args=("--signed" "--with-drivers")
+    [[ $OPT_PRESERVE_GRUB -eq 1 ]] && install_args+=("--set-default")
+
+    lamboot_run lamboot-install "${install_args[@]}" \
+        || die "lamboot-install failed"
+
+    record_action "bootloader.lamboot.install" "/boot/efi/EFI/LamBoot" "ok" "false" \
+        "{\"preserve_grub\":$([[ $OPT_PRESERVE_GRUB -eq 1 ]] && printf 'true' || printf 'false')}" \
+        "$backup_dir"
+
+    if [[ $OPT_REMOVE_GRUB -eq 1 ]]; then
+        _remove_grub "$backup_dir"
+    fi
+
+    backup_success "$backup_dir"
+    success "LamBoot installed. Reboot to test."
+    success "If LamBoot fails, use firmware boot menu to select previous bootloader."
+    success "Rollback: sudo lamboot-migrate rollback --backup-dir $backup_dir"
+
+    emit_json "$EXIT_OK"
+}
+
+# ── --remove-grub: uninstall prior bootloader after LamBoot is verified ──
+#
+# Flow:
+#   1. Run the full 11-check verify pass. Refuse to remove if any fail.
+#   2. Confirm with typed-yes (unless --force / --yes / --auto).
+#   3. Snapshot the NVRAM + GRUB package list into $backup_dir for rollback.
+#   4. Distro-aware package uninstall (apt/dnf/pacman/zypper/generic).
+#   5. Remove GRUB files from the ESP (every known installation path).
+#   6. Remove GRUB Boot#### entries from NVRAM via efibootmgr -b <hex> -B.
+#   7. Record a migrate.to_lamboot.grub_removed action for the manifest.
+#
+# Refuses to remove if /boot/efi/EFI/LamBoot isn't present. Rollback is
+# possible via the saved NVRAM snapshot + the distro's package cache.
+
+_distro_grub_packages() {
+    local distro="$1"
+    case "$distro" in
+        debian|ubuntu|pop|linuxmint)
+            printf 'grub-efi-amd64 grub-efi-amd64-bin grub-efi-amd64-signed grub2-common grub-common shim-signed'
+            ;;
+        fedora|rhel|centos|rocky|almalinux)
+            printf 'grub2-efi-x64 grub2-efi-x64-modules grub2-tools grub2-tools-efi grub2-tools-extra grub2-tools-minimal grub2-common shim-x64'
+            ;;
+        arch|endeavouros|manjaro|cachyos)
+            printf 'grub efibootmgr-grub-tools'
+            ;;
+        opensuse*|sles|suse)
+            printf 'grub2 grub2-i386-pc grub2-x86_64-efi grub2-snapper-plugin'
+            ;;
+        *)
+            printf ''  # generic — no package removal
+            ;;
+    esac
+}
+
+_distro_uninstall_cmd() {
+    local distro="$1" pkgs="$2"
+    [[ -z "$pkgs" ]] && { printf ''; return; }
+    case "$distro" in
+        debian|ubuntu|pop|linuxmint)
+            printf 'apt-get purge -y %s' "$pkgs"
+            ;;
+        fedora|rhel|centos|rocky|almalinux)
+            printf 'dnf remove -y %s' "$pkgs"
+            ;;
+        arch|endeavouros|manjaro|cachyos)
+            printf 'pacman -Rns --noconfirm %s' "$pkgs"
+            ;;
+        opensuse*|sles|suse)
+            printf 'zypper remove -y %s' "$pkgs"
+            ;;
+        *)
+            printf ''
+            ;;
+    esac
+}
+
+_remove_grub_nvram_entries() {
+    # Parse efibootmgr for entries containing GRUB/grub/shim; delete each.
+    local efi_output removed_nums removed=0 bootnum label
+    efi_output=$(efibootmgr -v 2>/dev/null) || return 0
+
+    while IFS= read -r line; do
+        # Format: Boot0001* ubuntu	HD(...)/File(\EFI\ubuntu\shimx64.efi)...
+        [[ "$line" =~ ^Boot([0-9A-Fa-f]{4})\*?\ (.*) ]] || continue
+        bootnum="${BASH_REMATCH[1]}"
+        label="${BASH_REMATCH[2]}"
+        # Match common GRUB/shim entry names (case-insensitive, narrow to avoid
+        # false positives like "Windows Boot Manager")
+        if [[ "$line" =~ (grub|GRUB|shim|Shim|SHIM|ubuntu|debian|fedora|opensuse|centos|rocky|almalinux|arch|manjaro|endeavour) ]]; then
+            # Exclude LamBoot explicitly in case a distro label collides
+            [[ "$label" =~ LamBoot ]] && continue
+            lamboot_run efibootmgr --quiet --bootnum "$bootnum" --delete-bootnum \
+                && removed=$((removed + 1)) \
+                && removed_nums="${removed_nums:+$removed_nums }$bootnum" \
+                || warn "failed to remove Boot$bootnum ($label)"
+        fi
+    done <<< "$efi_output"
+
+    printf '%d' "$removed"
+}
+
+_remove_grub_esp_files() {
+    local esp="$1" removed=0
+    # Known GRUB/shim paths across distros.
+    local paths=(
+        "$esp/EFI/GRUB"
+        "$esp/EFI/grub"
+        "$esp/EFI/debian"
+        "$esp/EFI/ubuntu"
+        "$esp/EFI/fedora"
+        "$esp/EFI/centos"
+        "$esp/EFI/redhat"
+        "$esp/EFI/opensuse"
+        "$esp/EFI/arch"
+        "$esp/EFI/Manjaro"
+        "$esp/EFI/endeavouros"
+        "$esp/EFI/almalinux"
+        "$esp/EFI/rocky"
+        "$esp/grub"
+        "$esp/grub2"
+    )
+    for p in "${paths[@]}"; do
+        if [[ -e "$p" ]]; then
+            lamboot_run rm -rf "$p" && removed=$((removed + 1)) \
+                || warn "failed to remove: $p"
+        fi
+    done
+    printf '%d' "$removed"
+}
+
+_remove_grub() {
+    local backup_dir="$1"
+
+    info "Running post-install verify before GRUB removal..."
+    local verify_fail=0
+    run_verify_checks || verify_fail=$?
+
+    if [[ $verify_fail -gt 0 ]]; then
+        die "verify failed with $verify_fail check(s); refusing to remove GRUB. Boot LamBoot successfully first, then re-run with --remove-grub."
+    fi
+
+    # Defense-in-depth: confirm LamBoot files are actually on the ESP.
+    local esp
+    esp=$(detect_esp) || die "cannot locate ESP for GRUB removal"
+    if [[ ! -d "$esp/EFI/LamBoot" ]]; then
+        die "refusing to remove GRUB: $esp/EFI/LamBoot not found — LamBoot may not be installed"
+    fi
+
+    if ! confirm "REMOVE GRUB PACKAGES + ESP FILES + NVRAM ENTRIES (irreversible without rollback)" "remove-grub"; then
+        warn "--remove-grub aborted; LamBoot installed, GRUB retained"
+        return 0
+    fi
+
+    # Snapshot NVRAM for rollback context
+    efibootmgr -v > "${backup_dir}/efi-vars.pre-grub-removal.txt" 2>/dev/null || true
+
+    local distro pkgs uninst
+    distro=$(detect_distro)
+    pkgs=$(_distro_grub_packages "$distro")
+    uninst=$(_distro_uninstall_cmd "$distro" "$pkgs")
+
+    local pkg_removed=0
+    if [[ -n "$uninst" ]]; then
+        info "Uninstalling distro GRUB packages: $pkgs"
+        # Record pre-removal package list so rollback can reinstall
+        case "$distro" in
+            debian|ubuntu|pop|linuxmint)
+                dpkg -l 2>/dev/null | awk '/^ii/ && $2 ~ /^(grub|shim)/ {print $2}' \
+                    > "${backup_dir}/grub-packages.txt" 2>/dev/null || true
+                ;;
+            fedora|rhel|centos|rocky|almalinux)
+                rpm -qa --qf '%{NAME}\n' 2>/dev/null | grep -E '^(grub2|shim)' \
+                    > "${backup_dir}/grub-packages.txt" 2>/dev/null || true
+                ;;
+            arch|endeavouros|manjaro|cachyos)
+                pacman -Qq grub 2>/dev/null > "${backup_dir}/grub-packages.txt" || true
+                ;;
+            opensuse*|sles|suse)
+                rpm -qa --qf '%{NAME}\n' 2>/dev/null | grep -E '^grub2' \
+                    > "${backup_dir}/grub-packages.txt" 2>/dev/null || true
+                ;;
+        esac
+
+        if lamboot_run sh -c "$uninst"; then
+            pkg_removed=1
+        else
+            warn "package uninstall reported failure; continuing with ESP + NVRAM cleanup (packages may be partially removed)"
+        fi
+    else
+        info "No package removal recipe for distro '$distro'; skipping package step (ESP + NVRAM cleanup will still run)"
+    fi
+
+    info "Removing GRUB files from ESP at $esp"
+    local esp_removed
+    esp_removed=$(_remove_grub_esp_files "$esp")
+    info "Removed $esp_removed ESP directory(ies)"
+
+    info "Removing GRUB/shim Boot#### entries from NVRAM"
+    local nvram_removed
+    nvram_removed=$(_remove_grub_nvram_entries)
+    info "Removed $nvram_removed NVRAM entry(ies)"
+
+    record_action "migrate.to_lamboot.grub_removed" "$esp" "ok" "true" \
+        "{\"distro\":\"$distro\",\"pkg_removed\":$pkg_removed,\"esp_dirs_removed\":$esp_removed,\"nvram_entries_removed\":$nvram_removed,\"packages_list\":\"${backup_dir}/grub-packages.txt\"}" \
+        "$backup_dir"
+
+    success "GRUB removed. To restore, use: sudo lamboot-migrate rollback --backup-dir $backup_dir"
+}
+
+# ── verify (SDS-7 §2.3, 11 checks) ───────────────────────────────────────
+
+verify_check_1_boot_mode_uefi() {
+    if [[ -d /sys/firmware/efi ]]; then
+        emit_finding "migrate.verify.boot_mode" "verify" "info" "pass" \
+            "Check 1: Boot mode is UEFI" "/sys/firmware/efi exists." "{}" '{}'
+        return 0
+    fi
+    emit_finding "migrate.verify.boot_mode" "verify" "critical" "fail" \
+        "Check 1: Boot mode is NOT UEFI" "/sys/firmware/efi not present." "{}" \
+        '{"summary":"Switch firmware from Legacy/CSM to UEFI","doc_url":"https://lamboot.dev/tools/migrate/firmware-setup"}'
+    return 1
+}
+
+verify_check_2_disk_is_gpt() {
+    local disk
+    disk=$(detect_target_disk) || disk="/dev/sda"
+    local pttype
+    pttype=$(blkid -o value -s PTTYPE "$disk" 2>/dev/null || true)
+    if [[ "$pttype" == "gpt" ]]; then
+        emit_finding "migrate.verify.gpt" "verify" "info" "pass" \
+            "Check 2: Disk is GPT" "Partition table on $disk is GPT." \
+            "{\"disk\":\"$(json_escape "$disk")\"}" '{}'
+        return 0
+    fi
+    emit_finding "migrate.verify.gpt" "verify" "error" "fail" \
+        "Check 2: Disk is NOT GPT" "Partition table on $disk is '$pttype' (expected gpt)." \
+        "{\"disk\":\"$(json_escape "$disk")\",\"pttype\":\"$pttype\"}" \
+        '{"summary":"Run lamboot-migrate to-uefi","command":"sudo lamboot-migrate to-uefi","doc_url":"https://lamboot.dev/tools/migrate/to-uefi"}'
+    return 1
+}
+
+verify_check_3_esp_exists_ef00() {
+    local disk
+    disk=$(detect_target_disk) || disk="/dev/sda"
+    local esp
+    esp=$(sgdisk -p "$disk" 2>/dev/null | awk '$6 == "EF00" {print $1}' | head -1 || true)
+    if [[ -n "$esp" ]]; then
+        emit_finding "migrate.verify.esp_partition" "verify" "info" "pass" \
+            "Check 3: ESP partition present (type EF00)" \
+            "ESP is partition $esp on $disk." \
+            "{\"disk\":\"$(json_escape "$disk")\",\"partition\":$esp}" '{}'
+        return 0
+    fi
+    emit_finding "migrate.verify.esp_partition" "verify" "critical" "fail" \
+        "Check 3: No ESP partition found" \
+        "No partition on $disk has type EF00." \
+        "{\"disk\":\"$(json_escape "$disk")\"}" \
+        '{"summary":"Create ESP via lamboot-migrate to-uefi","command":"sudo lamboot-migrate to-uefi","doc_url":"https://lamboot.dev/tools/migrate/esp"}'
+    return 1
+}
+
+verify_check_4_esp_mounted() {
+    for mp in /boot/efi /efi; do
+        if mountpoint -q "$mp" 2>/dev/null; then
+            local fstype
+            fstype=$(findmnt -n -o FSTYPE "$mp" 2>/dev/null || true)
+            if [[ "$fstype" == "vfat" ]]; then
+                emit_finding "migrate.verify.esp_mounted" "verify" "info" "pass" \
+                    "Check 4: ESP mounted" "$mp mounted as vfat." \
+                    "{\"mountpoint\":\"$mp\"}" '{}'
+                return 0
+            fi
+        fi
+    done
+    emit_finding "migrate.verify.esp_mounted" "verify" "error" "fail" \
+        "Check 4: ESP not mounted" \
+        "Neither /boot/efi nor /efi is a vfat mountpoint." "{}" \
+        '{"summary":"Mount the ESP","command":"sudo mount /boot/efi","doc_url":"https://lamboot.dev/tools/migrate/esp"}'
+    return 1
+}
+
+verify_check_5_efibootmgr_entries() {
+    if ! command -v efibootmgr >/dev/null 2>&1; then
+        emit_finding "migrate.verify.efibootmgr" "verify" "warning" "skip" \
+            "Check 5: efibootmgr not available" "Install efibootmgr." "{}" \
+            '{"summary":"Install efibootmgr","command":"sudo apt install efibootmgr || sudo dnf install efibootmgr","doc_url":""}'
+        return 1
+    fi
+    local entries
+    entries=$(efibootmgr 2>/dev/null | grep -cE '^Boot[0-9A-Fa-f]{4}' || true)
+    entries="${entries:-0}"
+    if [[ "$entries" -gt 0 ]]; then
+        emit_finding "migrate.verify.efibootmgr" "verify" "info" "pass" \
+            "Check 5: UEFI boot entries present" \
+            "$entries entry/entries in NVRAM." \
+            "{\"count\":${entries}}" '{}'
+        return 0
+    fi
+    emit_finding "migrate.verify.efibootmgr" "verify" "error" "fail" \
+        "Check 5: No UEFI boot entries" "efibootmgr shows 0 entries." "{}" \
+        '{"summary":"Create boot entry via bootloader reinstall","doc_url":"https://lamboot.dev/tools/migrate/uefi-entries"}'
+    return 1
+}
+
+verify_check_6_fallback_path() {
+    if [[ -f /boot/efi/EFI/BOOT/BOOTX64.EFI ]]; then
+        emit_finding "migrate.verify.fallback_path" "verify" "info" "pass" \
+            "Check 6: Fallback path present" \
+            "/boot/efi/EFI/BOOT/BOOTX64.EFI exists." "{}" '{}'
+        return 0
+    fi
+    emit_finding "migrate.verify.fallback_path" "verify" "warning" "fail" \
+        "Check 6: Fallback path missing" \
+        "/boot/efi/EFI/BOOT/BOOTX64.EFI not present (removable/portable boot will not work)." "{}" \
+        '{"summary":"Run to-uefi which populates the fallback path","command":"sudo lamboot-migrate to-uefi","doc_url":"https://lamboot.dev/tools/migrate/fallback"}'
+    return 1
+}
+
+verify_check_7_bootloader_pe32() {
+    local found=""
+    for candidate in /boot/efi/EFI/*/grubx64.efi /boot/efi/EFI/LamBoot/lambootx64.efi /boot/efi/EFI/systemd/systemd-bootx64.efi; do
+        [[ -f "$candidate" ]] && { found="$candidate"; break; }
+    done
+
+    if [[ -z "$found" ]]; then
+        emit_finding "migrate.verify.pe32_bootloader" "verify" "error" "fail" \
+            "Check 7: No bootloader binary found" \
+            "No grubx64.efi, lambootx64.efi, or systemd-bootx64.efi on ESP." "{}" \
+            '{"summary":"Reinstall the bootloader","doc_url":"https://lamboot.dev/tools/migrate/bootloader"}'
+        return 1
+    fi
+
+    local info
+    info=$(file "$found" 2>/dev/null || true)
+    if printf '%s' "$info" | grep -q 'PE32+'; then
+        emit_finding "migrate.verify.pe32_bootloader" "verify" "info" "pass" \
+            "Check 7: Bootloader is PE32+ (EFI application)" \
+            "$found is a valid UEFI binary." \
+            "{\"path\":\"$(json_escape "$found")\"}" '{}'
+        return 0
+    fi
+
+    emit_finding "migrate.verify.pe32_bootloader" "verify" "critical" "fail" \
+        "Check 7: Bootloader is NOT PE32+" \
+        "$found is not a UEFI binary (may be BIOS GRUB instead)." \
+        "{\"path\":\"$(json_escape "$found")\",\"type\":\"$(json_escape "$info")\"}" \
+        '{"summary":"Reinstall with --target=x86_64-efi","doc_url":"https://lamboot.dev/tools/migrate/bootloader"}'
+    return 1
+}
+
+verify_check_8_fstab_uses_uuids() {
+    local dev_entries
+    dev_entries=$(grep -cE '^\s*/dev/sd[a-z]|^\s*/dev/nvme|^\s*/dev/hd[a-z]' /etc/fstab 2>/dev/null || true)
+    dev_entries="${dev_entries:-0}"
+    if [[ "$dev_entries" -eq 0 ]]; then
+        emit_finding "migrate.verify.fstab_uuid" "verify" "info" "pass" \
+            "Check 8: fstab uses UUID= form" \
+            "No /dev/ references in /etc/fstab." "{}" '{}'
+        return 0
+    fi
+    emit_finding "migrate.verify.fstab_uuid" "verify" "warning" "fail" \
+        "Check 8: fstab still has /dev/ paths" \
+        "${dev_entries} fstab entries use /dev/ paths." \
+        "{\"count\":${dev_entries}}" \
+        '{"summary":"Rewrite fstab to UUID form","doc_url":"https://lamboot.dev/tools/migrate/fstab"}'
+    return 1
+}
+
+verify_check_9_boot_has_kernels() {
+    local kernel_count
+    kernel_count=$(find /boot -maxdepth 1 -name 'vmlinuz-*' 2>/dev/null | wc -l)
+    if [[ "$kernel_count" -gt 0 ]]; then
+        emit_finding "migrate.verify.kernels_present" "verify" "info" "pass" \
+            "Check 9: Kernel(s) present in /boot" \
+            "$kernel_count kernel image(s) found." \
+            "{\"count\":${kernel_count}}" '{}'
+        return 0
+    fi
+    emit_finding "migrate.verify.kernels_present" "verify" "error" "fail" \
+        "Check 9: No kernels in /boot" \
+        "/boot has no vmlinuz-* files." "{}" \
+        '{"summary":"Reinstall kernel package","doc_url":"https://lamboot.dev/tools/migrate/kernels"}'
+    return 1
+}
+
+verify_check_10_backup_manifest_valid() {
+    local backup_path="${OPT_VERIFY_PATH:-}"
+    if [[ -z "$backup_path" ]]; then
+        backup_path=$(backup_latest migrate)
+    fi
+    if [[ -z "$backup_path" ]] || [[ ! -d "$backup_path" ]]; then
+        emit_finding "migrate.verify.backup_manifest" "verify" "warning" "skip" \
+            "Check 10: No backup directory to verify" \
+            "No prior to-uefi backup found; check inapplicable." "{}" '{}'
+        return 0
+    fi
+    if [[ -f "$backup_path/MANIFEST.json" ]]; then
+        if command -v jq >/dev/null 2>&1; then
+            if jq -e . "$backup_path/MANIFEST.json" >/dev/null 2>&1; then
+                emit_finding "migrate.verify.backup_manifest" "verify" "info" "pass" \
+                    "Check 10: Backup manifest valid JSON" \
+                    "$backup_path/MANIFEST.json parses cleanly." "{}" '{}'
+                return 0
+            fi
+        else
+            emit_finding "migrate.verify.backup_manifest" "verify" "info" "pass" \
+                "Check 10: Backup manifest present" \
+                "$backup_path/MANIFEST.json exists (jq not installed — content not validated)." "{}" '{}'
+            return 0
+        fi
+    fi
+    emit_finding "migrate.verify.backup_manifest" "verify" "warning" "fail" \
+        "Check 10: Backup manifest missing or invalid" \
+        "$backup_path/MANIFEST.json not valid JSON or absent." \
+        "{\"backup_dir\":\"$(json_escape "$backup_path")\"}" '{}'
+    return 1
+}
+
+verify_check_11_rollback_dry_run() {
+    local backup_path="${OPT_VERIFY_PATH:-}"
+    if [[ -z "$backup_path" ]]; then
+        backup_path=$(backup_latest migrate)
+    fi
+    if [[ -z "$backup_path" ]] || [[ ! -d "$backup_path" ]]; then
+        emit_finding "migrate.verify.rollback_ready" "verify" "info" "skip" \
+            "Check 11: No backup to dry-run rollback against" \
+            "Skipped (no backup dir)." "{}" '{}'
+        return 0
+    fi
+    local missing=()
+    for f in mbr-raw.bin partition-table.gpt fstab.pre-rewrite; do
+        [[ -f "$backup_path/$f" ]] || missing+=("$f")
+    done
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        emit_finding "migrate.verify.rollback_ready" "verify" "info" "pass" \
+            "Check 11: Rollback backup files complete" \
+            "All required rollback files present in $backup_path." "{}" '{}'
+        return 0
+    fi
+    emit_finding "migrate.verify.rollback_ready" "verify" "warning" "fail" \
+        "Check 11: Rollback backup incomplete" \
+        "Missing: ${missing[*]}" \
+        "{\"missing\":[\"$(printf '%s' "${missing[*]}" | sed 's/ /","/g')\"]}" '{}'
+    return 1
+}
+
+run_verify_checks() {
+    local fail=0
+    verify_check_1_boot_mode_uefi       || fail=$((fail + 1))
+    verify_check_2_disk_is_gpt          || fail=$((fail + 1))
+    verify_check_3_esp_exists_ef00      || fail=$((fail + 1))
+    verify_check_4_esp_mounted          || fail=$((fail + 1))
+    verify_check_5_efibootmgr_entries   || fail=$((fail + 1))
+    verify_check_6_fallback_path        || fail=$((fail + 1))
+    verify_check_7_bootloader_pe32      || fail=$((fail + 1))
+    verify_check_8_fstab_uses_uuids     || fail=$((fail + 1))
+    verify_check_9_boot_has_kernels     || fail=$((fail + 1))
+    verify_check_10_backup_manifest_valid || fail=$((fail + 1))
+    verify_check_11_rollback_dry_run    || fail=$((fail + 1))
+    return $fail
+}
+
+do_verify() {
+    info "Running post-conversion verification (11 checks)"
+    local fail=0
+    run_verify_checks || fail=$?
+
+    if [[ $fail -eq 0 ]]; then
+        success "All 11 verification checks passed"
+        emit_json "$EXIT_OK"
+        exit "$EXIT_OK"
+    fi
+
+    warn "$fail check(s) failed — see findings above"
+    emit_json "$EXIT_PARTIAL"
+    exit "$EXIT_PARTIAL"
+}
+
+# ── rollback (SDS-7 §7.2) ────────────────────────────────────────────────
+
+do_rollback() {
+    require_root
+
+    local backup_dir="${OPT_BACKUP_DIR:-}"
+    if [[ -z "$backup_dir" ]]; then
+        backup_dir=$(backup_latest migrate)
+    fi
+
+    if [[ -z "$backup_dir" ]] || [[ ! -d "$backup_dir" ]]; then
+        emit_finding "migrate.rollback.no_backup" "rollback" "critical" "fail" \
+            "No backup directory found" \
+            "No previous to-uefi run to roll back from." "{}" '{}'
+        emit_json "$EXIT_NOT_APPLICABLE"
+        exit "$EXIT_NOT_APPLICABLE"
+    fi
+
+    if [[ ! -f "$backup_dir/MANIFEST.json" ]]; then
+        die "backup dir missing MANIFEST.json: $backup_dir"
+    fi
+
+    local disk
+    disk=$(grep -oE '"[^"]*":\s*"/dev/[^"]*"' "$backup_dir/MANIFEST.json" | head -1 | grep -oE '/dev/[^"]*' || true)
+    if [[ -z "$disk" ]]; then
+        warn "could not extract disk from MANIFEST.json; using auto-detected"
+        disk=$(detect_target_disk) || die "cannot determine target disk for rollback"
+    fi
+
+    cat <<EOF >&2
+
+Rollback plan:
+  Backup dir:    $backup_dir
+  Target disk:   $disk
+  Will restore:  MBR, partition table, fstab, default-grub (if present)
+  Will remove:   UEFI boot entries created by to-uefi
+
+After rollback, switch firmware back to Legacy/CSM to boot via MBR.
+
+EOF
+
+    if ! confirm "ROLLBACK" "yes"; then
+        record_action "migrate.rollback_aborted" "$backup_dir" "abort" "false" '{}' "null"
+        emit_json "$EXIT_ABORT"
+        exit "$EXIT_ABORT"
+    fi
+
+    # Restore fstab
+    if [[ -f "$backup_dir/fstab.pre-rewrite" ]]; then
+        lamboot_run cp "$backup_dir/fstab.pre-rewrite" /etc/fstab
+        record_action "fstab.restore" "/etc/fstab" "ok" "false" \
+            "{\"from\":\"$(json_escape "$backup_dir/fstab.pre-rewrite")\"}" "null"
+    fi
+
+    # Restore /etc/default/grub
+    if [[ -f "$backup_dir/default-grub" ]]; then
+        lamboot_run cp "$backup_dir/default-grub" /etc/default/grub
+        record_action "grub.default_restore" "/etc/default/grub" "ok" "false" '{}' "null"
+    fi
+
+    # Remove UEFI boot entries we created
+    if [[ -d /sys/firmware/efi/efivars ]] && command -v efibootmgr >/dev/null 2>&1; then
+        local entries
+        entries=$(efibootmgr 2>/dev/null | grep -oE '^Boot[0-9A-Fa-f]{4}\*?\s+LamBoot-migrated' | grep -oE '[0-9A-Fa-f]{4}' || true)
+        while IFS= read -r entry; do
+            [[ -z "$entry" ]] && continue
+            lamboot_run efibootmgr --bootnum "$entry" --delete-bootnum
+            record_action "uefi.boot_entry.remove" "Boot$entry" "ok" "false" '{}' "null"
+        done <<< "$entries"
+    fi
+
+    # Zap GPT and restore MBR
+    lamboot_run sgdisk --zap-all "$disk" \
+        || warn "sgdisk --zap-all failed (may be expected if disk already in post-zap state)"
+
+    lamboot_run dd "if=$backup_dir/mbr-raw.bin" "of=$disk" bs=1M count=1 status=none \
+        || die "MBR restore failed"
+
+    record_action "partition.mbr_restore" "$disk" "ok" "false" \
+        "{\"from\":\"$(json_escape "$backup_dir/mbr-raw.bin")\"}" "null"
+
+    if [[ -f "$backup_dir/partition-table.gpt" ]]; then
+        verbose "sfdisk-format backup available but skipping restore (MBR takes precedence)"
+    fi
+
+    # Append to ROLLBACK.log
+    if [[ $LAMBOOT_DRY_RUN -eq 0 ]]; then
+        cat >> "$backup_dir/ROLLBACK.log" <<EOF
+$(date -u +%Y-%m-%dT%H:%M:%SZ) rollback executed on $(hostname)
+  disk=$disk
+  run_id=$LAMBOOT_RUN_ID
+EOF
+    fi
+
+    success "Rollback complete"
+    success "Switch firmware back to Legacy/CSM and reboot"
+    emit_json "$EXIT_OK"
+}
+
+# ── status (kept from v0.1.0, formalized) ────────────────────────────────
+
+do_status() {
+    local boot_mode
+    boot_mode=$(detect_boot_mode)
+    emit_finding "migrate.status.boot_mode" "status" "info" "pass" \
+        "Boot mode: $boot_mode" "System is in $boot_mode mode." \
+        "{\"mode\":\"$boot_mode\"}" '{}'
+
+    local disk
+    disk=$(detect_target_disk) || disk=""
+
+    if [[ -n "$disk" ]]; then
+        local pttype
+        pttype=$(blkid -o value -s PTTYPE "$disk" 2>/dev/null || true)
+        emit_finding "migrate.status.partition_table" "status" "info" "pass" \
+            "Partition table: $pttype" "Disk $disk uses $pttype." \
+            "{\"disk\":\"$(json_escape "$disk")\",\"pttype\":\"$pttype\"}" '{}'
+    fi
+
+    local bootloaders
+    bootloaders=$(list_bootloaders 2>/dev/null | paste -sd, - || true)
+    emit_finding "migrate.status.bootloaders" "status" "info" "pass" \
+        "Installed bootloaders: ${bootloaders:-none}" \
+        "" \
+        "{\"bootloaders\":\"$(json_escape "${bootloaders:-none}")\"}" '{}'
+
+    local distro distro_ver
+    distro=$(detect_distro)
+    distro_ver=$(detect_distro_version)
+    emit_finding "migrate.status.distro" "status" "info" "pass" \
+        "Distribution: $distro $distro_ver" "" \
+        "{\"id\":\"$distro\",\"version\":\"$distro_ver\"}" '{}'
+
+    # Migration readiness summary
+    if [[ "$boot_mode" == "bios" ]] && [[ -n "$disk" ]]; then
+        local pttype
+        pttype=$(blkid -o value -s PTTYPE "$disk" 2>/dev/null || true)
+        if [[ "$pttype" == "dos" ]]; then
+            emit_finding "migrate.status.readiness" "status" "warning" "warn" \
+                "Ready for BIOS→UEFI migration" \
+                "System is BIOS+MBR. Run 'sudo lamboot-migrate to-uefi --disk $disk' to convert." \
+                "{\"action\":\"to-uefi\"}" \
+                "{\"summary\":\"Run to-uefi conversion\",\"command\":\"sudo lamboot-migrate to-uefi --disk $disk\",\"doc_url\":\"https://lamboot.dev/tools/migrate/to-uefi\"}"
+        fi
+    fi
+
+    if [[ $LAMBOOT_JSON -eq 1 ]]; then
+        emit_json "$EXIT_OK"
+    fi
+}
+
+# ── CLI ──────────────────────────────────────────────────────────────────
+
+show_version() {
+    printf 'lamboot-migrate %s (lamboot-tools %s)\n' \
+        "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"
+}
+
+show_help() {
+    print_after_help
+}
+
+parse_args() {
+    [[ $# -eq 0 ]] && { die "no subcommand (try: lamboot-migrate help)"; }
+
+    # The first positional that is a known subcommand name captures the
+    # subcommand; subsequent positionals are arguments to it. This prevents
+    # `help to-uefi` from overwriting OPT_SUBCOMMAND=help with to-uefi.
+    local positional=()
+    while [[ $# -gt 0 ]]; do
+        if [[ -z "$OPT_SUBCOMMAND" ]]; then
+            case "$1" in
+                to-uefi|to-lamboot|verify|rollback|status|help)
+                    OPT_SUBCOMMAND="$1"
+                    shift
+                    continue
+                    ;;
+            esac
+        fi
+        positional+=("$1")
+        shift
+    done
+
+    if [[ "$OPT_SUBCOMMAND" == "help" ]]; then
+        _register_subcommands
+        if [[ ${#positional[@]} -eq 0 ]]; then
+            dispatch_help
+            exit 0
+        fi
+        dispatch_help "${positional[0]}"
+        exit $?
+    fi
+
+    set -- "${positional[@]+${positional[@]}}"
+
+    # Second pass: parse flags
+    while [[ $# -gt 0 ]]; do
+        parse_common_flag "$1"
+        local rc=$?
+        case $rc in
+            1) shift; continue ;;
+            2) _register_subcommands
+               if [[ -n "$OPT_SUBCOMMAND" ]]; then
+                   dispatch_help "$OPT_SUBCOMMAND"
+               else
+                   dispatch_help
+               fi
+               exit 0 ;;
+            3) show_version; exit 0 ;;
+            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            5) shift; OPT_DISK="$1"; shift; continue ;;
+            0) ;;
+        esac
+
+        case "$1" in
+            --disk)         OPT_DISK="${2:-}"; shift 2 ;;
+            --esp-size)     OPT_ESP_SIZE_MB="${2:-550}"; shift 2 ;;
+            --bootloader)   OPT_BOOTLOADER="${2:-grub-efi}"; shift 2 ;;
+            --cmdline)      OPT_CMDLINE="${2:-}"; shift 2 ;;
+            --backup-dir)   OPT_BACKUP_DIR="${2:-}"; shift 2 ;;
+            --method)       OPT_METHOD="${2:-auto}"; shift 2 ;;
+            --skip-verify)  OPT_SKIP_VERIFY=1; shift ;;
+            --keep-legacy-mbr) OPT_KEEP_LEGACY_MBR=1; shift ;;
+            --preserve-grub) OPT_PRESERVE_GRUB=1; OPT_REMOVE_GRUB=0; shift ;;
+            --remove-grub)   OPT_REMOVE_GRUB=1; OPT_PRESERVE_GRUB=0; shift ;;
+            --all)          OPT_VERIFY_ALL=1; shift ;;
+            --path)         OPT_VERIFY_PATH="${2:-}"; shift 2 ;;
+            *)              die "unknown option: $1" ;;
+        esac
+    done
+}
+
+main() {
+    parse_args "$@"
+
+    case "$OPT_SUBCOMMAND" in
+        to-uefi)    do_to_uefi ;;
+        to-lamboot) do_to_lamboot ;;
+        verify)     do_verify ;;
+        rollback)   do_rollback ;;
+        status)     do_status ;;
+        "")         die "no subcommand specified (try: lamboot-migrate help)" ;;
+        *)          die "unknown subcommand: $OPT_SUBCOMMAND" ;;
+    esac
+}
+
+main "$@"

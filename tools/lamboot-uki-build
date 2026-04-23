@@ -1,0 +1,590 @@
+#!/bin/bash
+# lamboot-uki-build — host-side Unified Kernel Image builder
+#
+# Wraps ukify/dracut/objcopy + sbsign/sbverify in a consistent CLI with
+# unified JSON output. Produces UKIs per UAPI.5 that work with any
+# UKI-aware bootloader (systemd-boot, LamBoot, firmware-direct).
+#
+# Governed by docs/SPEC-LAMBOOT-UKI-BUILD.md.
+# Part of the lamboot-tools suite (SPEC-LAMBOOT-TOOLKIT-V1.md §3.1).
+
+# shellcheck source=../lib/lamboot-toolkit-lib.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
+# shellcheck source=../lib/lamboot-toolkit-help.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
+
+LAMBOOT_TOOL_NAME="lamboot-uki-build"
+LAMBOOT_TOOL_VERSION="0.2.0"
+
+readonly DOC_BASE="https://lamboot.dev/tools/findings"
+
+OPT_SUBCOMMAND=""
+OPT_KERNEL=""
+OPT_INITRDS=()
+OPT_CMDLINE=""
+OPT_OSREL=""
+OPT_UNAME=""
+OPT_SPLASH=""
+OPT_DTB=""
+OPT_STUB=""
+OPT_PROFILES=()
+OPT_BACKEND="auto"
+OPT_KEY=""
+OPT_CERT=""
+OPT_OUTPUT=""
+OPT_INPUT=""
+
+# ── Help registry ────────────────────────────────────────────────────────
+
+_register_subcommands() {
+    register_subcommand \
+        --name "build" \
+        --category "UKI" \
+        --summary "Compose a Unified Kernel Image from a kernel + initrd + cmdline" \
+        --syntax "lamboot-uki-build build OUTPUT.efi --kernel PATH [--initrd PATH]... [--cmdline STR] [--osrel PATH] [--splash PATH] [--backend ukify|objcopy]" \
+        --arg "OUTPUT.efi:Output UKI path" \
+        --arg "--kernel PATH:Source kernel vmlinuz (required)" \
+        --arg "--initrd PATH:Source initrd (repeatable for multi-initrd concat)" \
+        --arg "--cmdline STR:Kernel cmdline to embed (default: empty)" \
+        --arg "--osrel PATH:os-release file (default: /etc/os-release)" \
+        --arg "--uname STR:Kernel version for .uname" \
+        --arg "--splash PATH:BMP splash image (optional)" \
+        --arg "--dtb PATH:Device tree blob (optional)" \
+        --arg "--stub PATH:EFI stub binary (default: auto-detect systemd-stub)" \
+        --arg "--backend ukify|objcopy:Build backend (default: auto — ukify if available)" \
+        --example "sudo lamboot-uki-build build /boot/efi/EFI/Linux/custom.efi --kernel /boot/vmlinuz-6.12 --initrd /boot/initramfs-6.12.img --cmdline 'root=UUID=abc ro quiet'" \
+        --example "lamboot-uki-build build /tmp/test.efi --kernel /boot/vmlinuz-\$(uname -r) --initrd /boot/initrd.img-\$(uname -r)" \
+        --notes "Wraps ukify (preferred) or objcopy (fallback). Produces UKIs per UAPI.5 spec that work with any UKI-aware bootloader." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "inspect, sign, verify, lamboot-signing-keys" \
+        --doc-url "https://lamboot.dev/tools/uki-build/build" \
+        --maturity "beta"
+
+    register_subcommand \
+        --name "inspect" \
+        --category "UKI" \
+        --summary "Parse an existing UKI and display its PE sections" \
+        --syntax "lamboot-uki-build inspect UKI.efi [--json]" \
+        --arg "UKI.efi:Input UKI file" \
+        --example "lamboot-uki-build inspect /boot/efi/EFI/Linux/linux.efi" \
+        --example "lamboot-uki-build inspect uki.efi --json | jq .findings" \
+        --notes "Read-only. Parses PE headers without external dependency. Extracts text content of .osrel, .cmdline, .uname sections." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "build, sign, verify" \
+        --doc-url "https://lamboot.dev/tools/uki-build/inspect" \
+        --maturity "beta"
+
+    register_subcommand \
+        --name "sign" \
+        --category "UKI" \
+        --summary "Sign a UKI with sbsign" \
+        --syntax "lamboot-uki-build sign UKI.efi --key KEY --cert CERT [--output OUT]" \
+        --arg "UKI.efi:UKI file to sign" \
+        --arg "--key PATH:Private key" \
+        --arg "--cert PATH:Signing certificate" \
+        --arg "--output PATH:Output file (default: overwrite input)" \
+        --example "sudo lamboot-uki-build sign linux.efi --key /etc/keys/db.key --cert /etc/keys/db.crt" \
+        --notes "Wraps sbsign. Signed UKIs verify against the cert via sbverify or any Secure Boot chain that trusts the cert." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "build, verify, lamboot-signing-keys" \
+        --doc-url "https://lamboot.dev/tools/uki-build/sign" \
+        --maturity "beta"
+
+    register_subcommand \
+        --name "verify" \
+        --category "UKI" \
+        --summary "Verify a UKI's signature against a cert" \
+        --syntax "lamboot-uki-build verify UKI.efi --cert CERT" \
+        --arg "UKI.efi:UKI file to verify" \
+        --arg "--cert PATH:Certificate to verify against" \
+        --example "lamboot-uki-build verify linux.efi --cert /etc/keys/db.crt" \
+        --notes "Wraps sbverify. Exit 0 on valid signature, non-zero on failure." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "build, sign" \
+        --doc-url "https://lamboot.dev/tools/uki-build/verify" \
+        --maturity "beta"
+}
+
+# ── Remediation ──────────────────────────────────────────────────────────
+
+_remediation_json() {
+    local id="$1" summary="$2" cmd="${3:-}"
+    local doc="${DOC_BASE}/${id//.//}"
+    local cmd_field="\"\""
+    [[ -n "$cmd" ]] && cmd_field="\"$(json_escape "$cmd")\""
+    printf '{"summary":"%s","command":%s,"doc_url":"%s"}' \
+        "$(json_escape "$summary")" "$cmd_field" "$doc"
+}
+
+# ── Backend selection ────────────────────────────────────────────────────
+
+detect_backend() {
+    case "$OPT_BACKEND" in
+        ukify)
+            command -v ukify >/dev/null 2>&1 || die_prerequisite "ukify not installed (install systemd-ukify or systemd-boot package)"
+            printf 'ukify'
+            ;;
+        objcopy)
+            command -v objcopy >/dev/null 2>&1 || die_prerequisite "objcopy not installed (install binutils)"
+            printf 'objcopy'
+            ;;
+        auto)
+            if command -v ukify >/dev/null 2>&1; then
+                printf 'ukify'
+            elif command -v objcopy >/dev/null 2>&1; then
+                printf 'objcopy'
+            else
+                die_prerequisite "neither ukify nor objcopy available; install systemd-ukify or binutils"
+            fi
+            ;;
+        *)
+            die "unknown --backend: $OPT_BACKEND (use ukify, objcopy, or auto)"
+            ;;
+    esac
+}
+
+# ── Auto-detect systemd-stub ─────────────────────────────────────────────
+
+detect_stub() {
+    [[ -n "$OPT_STUB" ]] && { printf '%s' "$OPT_STUB"; return 0; }
+
+    for candidate in \
+        /usr/lib/systemd/boot/efi/linuxx64.efi.stub \
+        /usr/lib/systemd/boot/linuxx64.efi.stub \
+        /usr/lib/gummiboot/linuxx64.efi.stub; do
+        if [[ -f "$candidate" ]]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# ── Subcommand: build ────────────────────────────────────────────────────
+
+do_build() {
+    [[ -n "$OPT_OUTPUT" ]] || die "build requires OUTPUT path as first positional argument"
+    [[ -n "$OPT_KERNEL" ]] || die "build requires --kernel PATH"
+    [[ -f "$OPT_KERNEL" ]] || die "kernel not found: $OPT_KERNEL"
+
+    if [[ ${#OPT_INITRDS[@]} -eq 0 ]]; then
+        warn "no --initrd provided; UKI will lack an initrd section"
+    fi
+
+    local backend
+    backend=$(detect_backend)
+    verbose "backend: $backend"
+
+    local osrel="${OPT_OSREL:-/etc/os-release}"
+    [[ -f "$osrel" ]] || die "os-release not found: $osrel (use --osrel)"
+
+    if [[ $LAMBOOT_DRY_RUN -eq 1 ]]; then
+        info "DRY-RUN: would build $OPT_OUTPUT via $backend"
+        info "  kernel: $OPT_KERNEL"
+        info "  initrd(s): ${OPT_INITRDS[*]:-(none)}"
+        info "  cmdline: ${OPT_CMDLINE:-(empty)}"
+        info "  osrel: $osrel"
+        record_action "uki.build.dry_run" "$OPT_OUTPUT" "ok" "false" \
+            "{\"backend\":\"$backend\"}" "null"
+        emit_finding "ukibuild.build.dry_run" "uki" "info" "pass" \
+            "DRY-RUN: UKI build planned" "" \
+            "{\"output\":\"$(json_escape "$OPT_OUTPUT")\"}" '{}'
+        emit_json "$EXIT_OK"
+        exit "$EXIT_OK"
+    fi
+
+    case "$backend" in
+        ukify)
+            build_with_ukify "$osrel"
+            ;;
+        objcopy)
+            build_with_objcopy "$osrel"
+            ;;
+    esac
+
+    if [[ ! -f "$OPT_OUTPUT" ]]; then
+        die "build completed but output not found: $OPT_OUTPUT"
+    fi
+
+    local size_kb
+    size_kb=$(( $(stat -c %s "$OPT_OUTPUT" 2>/dev/null || printf '0') / 1024 ))
+
+    emit_finding "ukibuild.build.complete" "uki" "info" "pass" \
+        "UKI built: $OPT_OUTPUT (${size_kb} KiB)" \
+        "Backend: $backend." \
+        "{\"output\":\"$(json_escape "$OPT_OUTPUT")\",\"backend\":\"$backend\",\"size_kb\":${size_kb}}" \
+        '{}'
+    record_action "uki.build.compose" "$OPT_OUTPUT" "ok" "false" \
+        "{\"backend\":\"$backend\",\"kernel\":\"$(json_escape "$OPT_KERNEL")\"}" "null"
+
+    success "Built UKI → $OPT_OUTPUT (${size_kb} KiB)"
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+build_with_ukify() {
+    local osrel="$1"
+    local args=(build "--linux=$OPT_KERNEL" "--os-release=@$osrel" "--output=$OPT_OUTPUT")
+
+    local initrd
+    for initrd in "${OPT_INITRDS[@]+${OPT_INITRDS[@]}}"; do
+        args+=("--initrd=$initrd")
+    done
+
+    [[ -n "$OPT_CMDLINE" ]] && args+=("--cmdline=$OPT_CMDLINE")
+    [[ -n "$OPT_UNAME" ]] && args+=("--uname=$OPT_UNAME")
+    [[ -n "$OPT_SPLASH" ]] && [[ -f "$OPT_SPLASH" ]] && args+=("--splash=$OPT_SPLASH")
+    [[ -n "$OPT_DTB" ]] && [[ -f "$OPT_DTB" ]] && args+=("--devicetree=$OPT_DTB")
+    [[ -n "$OPT_STUB" ]] && [[ -f "$OPT_STUB" ]] && args+=("--stub=$OPT_STUB")
+
+    lamboot_run ukify "${args[@]}" || die "ukify build failed"
+}
+
+build_with_objcopy() {
+    local osrel="$1"
+
+    local stub
+    stub=$(detect_stub) || die "systemd-stub not found; specify with --stub"
+
+    # Concat initrds if more than one
+    local initrd_file=""
+    if [[ ${#OPT_INITRDS[@]} -gt 0 ]]; then
+        initrd_file=$(mktemp -t lamboot-uki-initrd.XXXXXX)
+        for i in "${OPT_INITRDS[@]}"; do
+            cat "$i" >> "$initrd_file" || die "failed to concat initrd: $i"
+        done
+    fi
+
+    # cmdline to a file
+    local cmdline_file
+    cmdline_file=$(mktemp -t lamboot-uki-cmdline.XXXXXX)
+    printf '%s\x00' "${OPT_CMDLINE:-}" > "$cmdline_file"
+
+    # Build the section arguments for objcopy
+    local obj_args=("--add-section" ".osrel=$osrel" \
+                    "--change-section-vma" ".osrel=0x20000" \
+                    "--add-section" ".cmdline=$cmdline_file" \
+                    "--change-section-vma" ".cmdline=0x30000" \
+                    "--add-section" ".linux=$OPT_KERNEL" \
+                    "--change-section-vma" ".linux=0x2000000")
+
+    if [[ -n "$initrd_file" ]]; then
+        obj_args+=("--add-section" ".initrd=$initrd_file" \
+                   "--change-section-vma" ".initrd=0x3000000")
+    fi
+
+    if [[ -n "$OPT_SPLASH" ]] && [[ -f "$OPT_SPLASH" ]]; then
+        obj_args+=("--add-section" ".splash=$OPT_SPLASH" \
+                   "--change-section-vma" ".splash=0x40000")
+    fi
+
+    if [[ -n "$OPT_DTB" ]] && [[ -f "$OPT_DTB" ]]; then
+        obj_args+=("--add-section" ".dtb=$OPT_DTB" \
+                   "--change-section-vma" ".dtb=0x40000")
+    fi
+
+    lamboot_run objcopy "${obj_args[@]}" "$stub" "$OPT_OUTPUT" || {
+        rm -f "$cmdline_file" "$initrd_file" 2>/dev/null
+        die "objcopy failed"
+    }
+
+    rm -f "$cmdline_file" "$initrd_file" 2>/dev/null
+}
+
+# ── Subcommand: inspect ──────────────────────────────────────────────────
+
+# Read a u16 LE from a binary file at offset
+_read_u16le() {
+    local file="$1" offset="$2"
+    od -An -tu2 -N2 -j"$offset" --endian=little "$file" 2>/dev/null | tr -d ' '
+}
+
+# Read a u32 LE from a binary file at offset
+_read_u32le() {
+    local file="$1" offset="$2"
+    od -An -tu4 -N4 -j"$offset" --endian=little "$file" 2>/dev/null | tr -d ' '
+}
+
+# Read a raw bytes range from a file
+_read_bytes() {
+    local file="$1" offset="$2" length="$3"
+    dd if="$file" bs=1 count="$length" skip="$offset" 2>/dev/null
+}
+
+parse_uki_sections() {
+    local file="$1"
+
+    [[ -f "$file" ]] || die "file not found: $file"
+
+    local filesize
+    filesize=$(stat -c %s "$file" 2>/dev/null || printf '0')
+    [[ "$filesize" -lt 64 ]] && die "file too small to be a UKI: $file"
+
+    # Check DOS magic "MZ"
+    local magic
+    magic=$(_read_bytes "$file" 0 2 | od -An -tx1 | tr -d ' \n')
+    if [[ "$magic" != "4d5a" ]]; then
+        die "not a PE binary (no MZ magic): $file"
+    fi
+
+    # Read e_lfanew (PE offset) at 0x3C
+    local pe_offset
+    pe_offset=$(_read_u32le "$file" 60)
+    [[ -z "$pe_offset" ]] && die "failed to read PE offset"
+    [[ "$pe_offset" -ge "$filesize" ]] && die "PE offset out of range"
+
+    # Check PE signature at pe_offset
+    local pe_magic
+    pe_magic=$(_read_bytes "$file" "$pe_offset" 4 | od -An -tx1 | tr -d ' \n')
+    if [[ "$pe_magic" != "50450000" ]]; then
+        die "not a PE binary (no PE signature)"
+    fi
+
+    # Read COFF header
+    local coff_off=$((pe_offset + 4))
+    local machine
+    machine=$(_read_u16le "$file" "$coff_off")
+    local num_sections
+    num_sections=$(_read_u16le "$file" $((coff_off + 2)))
+    local opt_hdr_size
+    opt_hdr_size=$(_read_u16le "$file" $((coff_off + 16)))
+
+    local arch_name="unknown"
+    case "$machine" in
+        34404) arch_name="x86_64" ;;  # 0x8664
+        43620) arch_name="aarch64" ;;  # 0xAA64
+    esac
+
+    emit_finding "ukibuild.inspect.header" "uki" "info" "pass" \
+        "PE header: ${arch_name}, ${num_sections} sections" "" \
+        "{\"machine\":${machine},\"architecture\":\"$arch_name\",\"sections\":${num_sections}}" '{}'
+
+    # Section table starts at coff_off + 20 + opt_hdr_size
+    local sec_table=$((coff_off + 20 + opt_hdr_size))
+    local sec_size=40
+
+    local i
+    local found_sections=0
+    for ((i = 0; i < num_sections; i++)); do
+        local sec_off=$((sec_table + i * sec_size))
+
+        # Section name is 8 bytes, null-padded ASCII
+        local name_raw
+        name_raw=$(_read_bytes "$file" "$sec_off" 8)
+        local name
+        name=$(printf '%s' "$name_raw" | tr -d '\0' | head -c 20)
+
+        # SizeOfRawData at +16, PointerToRawData at +20
+        local raw_size
+        raw_size=$(_read_u32le "$file" $((sec_off + 16)))
+        local raw_offset
+        raw_offset=$(_read_u32le "$file" $((sec_off + 20)))
+
+        # Only surface UKI-relevant sections
+        case "$name" in
+            .osrel|.cmdline|.uname|.linux|.initrd|.splash|.dtb|.profile|.sbat|.hwids|.pcrsig)
+                found_sections=$((found_sections + 1))
+                _emit_section_finding "$file" "$name" "$raw_offset" "$raw_size"
+                ;;
+        esac
+    done
+
+    if [[ $found_sections -eq 0 ]]; then
+        emit_finding "ukibuild.inspect.no_uki_sections" "uki" "warning" "warn" \
+            "No UKI-specific sections found" \
+            "File is a valid PE binary but contains no .osrel, .cmdline, or other UKI sections." \
+            "{\"file\":\"$(json_escape "$file")\"}" \
+            "$(_remediation_json "ukibuild.inspect.no_uki_sections" \
+                "Rebuild as a UKI" \
+                "lamboot-uki-build build <output> --kernel <vmlinuz> --initrd <initrd>")"
+    fi
+}
+
+_emit_section_finding() {
+    local file="$1" name="$2" offset="$3" size="$4"
+
+    local size_kb=$((size / 1024))
+    local ctx
+    ctx="{\"name\":\"$(json_escape "$name")\",\"offset\":${offset},\"size\":${size},\"size_kb\":${size_kb}}"
+    local title="Section ${name}: ${size} bytes"
+
+    # For text sections, extract the content
+    case "$name" in
+        .osrel|.cmdline|.uname)
+            if [[ "$size" -lt 8192 ]] && [[ "$size" -gt 0 ]]; then
+                local content
+                content=$(_read_bytes "$file" "$offset" "$size" | tr -d '\0')
+                local esc
+                esc=$(json_escape "$(printf '%s' "$content" | head -c 512)")
+                ctx="{\"name\":\"$(json_escape "$name")\",\"offset\":${offset},\"size\":${size},\"content_preview\":\"$esc\"}"
+
+                if [[ "$name" == ".cmdline" ]]; then
+                    title="Kernel cmdline: $(printf '%s' "$content" | head -c 80)$([[ ${#content} -gt 80 ]] && printf '...' || true)"
+                elif [[ "$name" == ".uname" ]]; then
+                    title="Kernel version: $(printf '%s' "$content" | head -c 80)"
+                fi
+            fi
+            ;;
+    esac
+
+    emit_finding "ukibuild.inspect.section${name}" "uki" "info" "pass" \
+        "$title" "" "$ctx" '{}'
+}
+
+do_inspect() {
+    [[ -n "$OPT_INPUT" ]] || die "inspect requires input UKI path as first positional argument"
+    parse_uki_sections "$OPT_INPUT"
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── Subcommand: sign ─────────────────────────────────────────────────────
+
+do_sign() {
+    [[ -n "$OPT_INPUT" ]] || die "sign requires input UKI path as first positional argument"
+    [[ -f "$OPT_INPUT" ]] || die "input not found: $OPT_INPUT"
+    [[ -n "$OPT_KEY" ]] || die "sign requires --key PATH"
+    [[ -n "$OPT_CERT" ]] || die "sign requires --cert PATH"
+    [[ -f "$OPT_KEY" ]] || die "key file not found: $OPT_KEY"
+    [[ -f "$OPT_CERT" ]] || die "cert file not found: $OPT_CERT"
+
+    require_tool sbsign "install sbsigntool (Debian/Ubuntu) or sbsigntools (Fedora)"
+
+    local output="${OPT_OUTPUT:-$OPT_INPUT}"
+
+    if [[ $LAMBOOT_DRY_RUN -eq 1 ]]; then
+        info "DRY-RUN: would sign $OPT_INPUT → $output"
+        record_action "uki.sign.dry_run" "$output" "ok" "false" '{}' "null"
+        emit_json "$EXIT_OK"
+        exit "$EXIT_OK"
+    fi
+
+    lamboot_run sbsign --key "$OPT_KEY" --cert "$OPT_CERT" --output "$output" "$OPT_INPUT" \
+        || die "sbsign failed"
+
+    emit_finding "ukibuild.sign.complete" "uki" "info" "pass" \
+        "UKI signed → $output" \
+        "Using key: $OPT_KEY, cert: $OPT_CERT." \
+        "{\"output\":\"$(json_escape "$output")\",\"cert\":\"$(json_escape "$OPT_CERT")\"}" \
+        '{}'
+    record_action "uki.sign.signed" "$output" "ok" "false" \
+        "{\"cert\":\"$(json_escape "$OPT_CERT")\"}" "null"
+
+    success "Signed → $output"
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── Subcommand: verify ───────────────────────────────────────────────────
+
+do_verify() {
+    [[ -n "$OPT_INPUT" ]] || die "verify requires input UKI path as first positional argument"
+    [[ -f "$OPT_INPUT" ]] || die "input not found: $OPT_INPUT"
+    [[ -n "$OPT_CERT" ]] || die "verify requires --cert PATH"
+    [[ -f "$OPT_CERT" ]] || die "cert file not found: $OPT_CERT"
+
+    require_tool sbverify "install sbsigntool (Debian/Ubuntu) or sbsigntools (Fedora)"
+
+    if sbverify --cert "$OPT_CERT" "$OPT_INPUT" >/dev/null 2>&1; then
+        emit_finding "ukibuild.verify.pass" "uki" "info" "pass" \
+            "Signature verified against cert" "" \
+            "{\"file\":\"$(json_escape "$OPT_INPUT")\",\"cert\":\"$(json_escape "$OPT_CERT")\"}" \
+            '{}'
+        success "Signature valid"
+        emit_json "$EXIT_OK"
+        exit "$EXIT_OK"
+    fi
+
+    emit_finding "ukibuild.verify.fail" "uki" "error" "fail" \
+        "Signature verification FAILED" \
+        "The UKI is not signed by this cert, or signature is corrupt." \
+        "{\"file\":\"$(json_escape "$OPT_INPUT")\",\"cert\":\"$(json_escape "$OPT_CERT")\"}" \
+        "$(_remediation_json "ukibuild.verify.fail" \
+            "Re-sign with the correct key" \
+            "sudo lamboot-uki-build sign <file> --key <key> --cert $OPT_CERT")"
+    emit_json "$EXIT_ERROR"
+    exit "$EXIT_ERROR"
+}
+
+# ── CLI ──────────────────────────────────────────────────────────────────
+
+parse_args() {
+    local positional=()
+    while [[ $# -gt 0 ]]; do
+        parse_common_flag "$1"
+        local rc=$?
+        case $rc in
+            1) shift; continue ;;
+            2) _register_subcommands; dispatch_help; exit 0 ;;
+            3) printf 'lamboot-uki-build %s (lamboot-tools %s)\n' \
+                "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
+            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            5) shift; shift; continue ;;  # --offline accepted but not used
+            0) ;;
+        esac
+
+        case "$1" in
+            --kernel)    OPT_KERNEL="${2:-}"; shift 2 ;;
+            --initrd)    OPT_INITRDS+=("${2:-}"); shift 2 ;;
+            --cmdline)   OPT_CMDLINE="${2:-}"; shift 2 ;;
+            --osrel)     OPT_OSREL="${2:-}"; shift 2 ;;
+            --uname)     OPT_UNAME="${2:-}"; shift 2 ;;
+            --splash)    OPT_SPLASH="${2:-}"; shift 2 ;;
+            --dtb)       OPT_DTB="${2:-}"; shift 2 ;;
+            --stub)      OPT_STUB="${2:-}"; shift 2 ;;
+            --profile)   OPT_PROFILES+=("${2:-}"); shift 2 ;;
+            --backend)   OPT_BACKEND="${2:-auto}"; shift 2 ;;
+            --key)       OPT_KEY="${2:-}"; shift 2 ;;
+            --cert)      OPT_CERT="${2:-}"; shift 2 ;;
+            --output)    OPT_OUTPUT="${2:-}"; shift 2 ;;
+            build|inspect|sign|verify|help)
+                if [[ -z "$OPT_SUBCOMMAND" ]]; then
+                    OPT_SUBCOMMAND="$1"
+                else
+                    positional+=("$1")
+                fi
+                shift ;;
+            -*)          die "unknown option: $1" ;;
+            *)           positional+=("$1"); shift ;;
+        esac
+    done
+
+    if [[ "$OPT_SUBCOMMAND" == "help" ]]; then
+        _register_subcommands
+        if [[ ${#positional[@]} -gt 0 ]]; then
+            dispatch_help "${positional[0]}"
+        else
+            dispatch_help
+        fi
+        exit 0
+    fi
+
+    # First positional is the file argument for each subcommand
+    if [[ ${#positional[@]} -gt 0 ]]; then
+        case "$OPT_SUBCOMMAND" in
+            build)    OPT_OUTPUT="${positional[0]}" ;;
+            inspect|sign|verify) OPT_INPUT="${positional[0]}" ;;
+        esac
+    fi
+}
+
+main() {
+    parse_args "$@"
+
+    [[ -z "$OPT_SUBCOMMAND" ]] && die "no subcommand (try: lamboot-uki-build help)"
+
+    case "$OPT_SUBCOMMAND" in
+        build)   do_build ;;
+        inspect) do_inspect ;;
+        sign)    do_sign ;;
+        verify)  do_verify ;;
+        *)       die "unknown subcommand: $OPT_SUBCOMMAND" ;;
+    esac
+}
+
+main "$@"

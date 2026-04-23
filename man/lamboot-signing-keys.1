@@ -1,0 +1,772 @@
+.\" lamboot-signing-keys(1) — auto-generated from help registry
+.\" Source: tools/lamboot-signing-keys
+.\" Generated: 2026-04-23T13:57:40Z
+.\" DO NOT EDIT — regenerate via `make man` or `scripts/registry-to-man`.
+.TH "LAMBOOT-SIGNING-KEYS" "1" "2026-04-23" "lamboot-signing-keys 0.2.0" "lamboot-tools"
+.SH NAME
+lamboot-signing-keys \- part of the lamboot-tools suite
+.SH SYNOPSIS
+.B lamboot-signing-keys
+[\fIGLOBAL FLAGS\fR] [\fISUBCOMMAND\fR] [\fIARGS\fR]
+.SH DESCRIPTION
+lamboot-signing-keys is part of
+.BR lamboot-tools (7),
+"The Linux UEFI boot toolkit." See that page for suite-level conventions
+and cross-tool composition.
+.PP
+This page documents every subcommand registered in lamboot-signing-keys's help
+registry. Every subcommand is also accessible via
+.BI "lamboot-signing-keys help " SUBCOMMAND
+at runtime.
+.SH SUBCOMMANDS
+.SS generate
+.PP
+.I Generate a signing keypair + cert
+.PP
+.B Category:
+Keys
+.br
+.B Maturity:
+experimental
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-signing\-keys generate [\-\-type db|kek|pk] [\-\-size N] [\-\-cn NAME] [\-\-days N] [\-\-output PREFIX]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B \-\-type db
+\-\-type db
+.TP
+.B kek
+kek
+.TP
+.B pk
+Key role (default: db)
+.TP
+.B \-\-size N
+RSA key size (default: 2048 for db, 4096 for pk/kek)
+.TP
+.B \-\-cn NAME
+Subject CommonName
+.TP
+.B \-\-days N
+Validity (default: 1095 for db, 3650 for pk/kek)
+.TP
+.B \-\-output PREFIX
+Output prefix; produces PREFIX.key + PREFIX.crt + PREFIX.der (default: ./<type>)
+.TP
+.B \-\-force\-4096
+Override RSA\-2048 constraint for db (dangerous; shim freezes per Debian #1013320)
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+lamboot\-signing\-keys generate \-\-type db \-\-cn \'My db Key 2026\'
+lamboot\-signing\-keys generate \-\-type pk \-\-output /tmp/mypk
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+RSA\-2048 is enforced for db keys because Debian bug #1013320 causes shim to freeze verifying RSA\-4096 MOK certs. RSA\-4096 is safe for PK/KEK. Private key is 0600; cert is 0644.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+inspect, mok\-enroll, status
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/signing-keys/generate
+.UE
+.RE
+.PP
+.SS rotate
+.PP
+.I Rotate a db/kek/pk keypair, cross\-signing with the parent key
+.PP
+.B Category:
+Keys
+.br
+.B Maturity:
+experimental
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-signing\-keys rotate TYPE \-\-old\-key K \-\-old\-cert C [\-\-new\-cn NAME] [\-\-parent\-key K \-\-parent\-cert C] [\-\-output\-dir DIR]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B TYPE
+db 
+.TP
+.B  kek 
+ kek 
+.TP
+.B  pk
+ pk
+.TP
+.B \-\-old\-key PATH
+Existing private key being rotated
+.TP
+.B \-\-old\-cert PATH
+Existing cert being rotated
+.TP
+.B \-\-new\-cn NAME
+CN for the new cert (default: inherits old CN with \'\-rotated\-YYYYMMDD\' suffix)
+.TP
+.B \-\-parent\-key PATH
+Parent private key for cross\-sign (KEK for db rotation, PK for KEK rotation). Optional; if absent, rotation produces a self\-signed new cert and emits a warning.
+.TP
+.B \-\-parent\-cert PATH
+Parent cert for cross\-sign (must match \-\-parent\-key)
+.TP
+.B \-\-output\-dir DIR
+Rotation artifacts directory (default: ./rotation\-TYPE\-YYYYMMDD\-HHMMSS)
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-signing\-keys rotate db \-\-old\-key keys/db.key \-\-old\-cert keys/db.crt \-\-parent\-key keys/kek.key \-\-parent\-cert keys/kek.crt
+sudo lamboot\-signing\-keys rotate kek \-\-old\-key keys/kek.key \-\-old\-cert keys/kek.crt \-\-parent\-key keys/pk.key \-\-parent\-cert keys/pk.crt
+sudo lamboot\-signing\-keys rotate pk \-\-old\-key keys/pk.key \-\-old\-cert keys/pk.crt
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Generates a new keypair with the same RSA size + validity defaults as generate, then cross\-signs the new cert with the parent key (db←KEK, KEK←PK, PK←self). Produces a timestamped rotation directory containing old + new keypairs, a transition manifest, and re\-enrollment instructions. Both old and new keys remain valid during the transition window; stragglers can be re\-signed with either old or new db until distribution completes. See KEY\-GENERATION.md §6.1.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+generate, generate\-hierarchy, mok\-enroll
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/signing-keys/rotate
+.UE
+.RE
+.PP
+.SS inspect
+.PP
+.I Display cert subject, algorithm, key size, validity
+.PP
+.B Category:
+Keys
+.br
+.B Maturity:
+experimental
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-signing\-keys inspect KEYFILE_OR_CERT [\-\-json]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B KEYFILE_OR_CERT
+Path to .key, .crt, .der, or .pem
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+lamboot\-signing\-keys inspect /etc/keys/db.crt
+lamboot\-signing\-keys inspect myKey.der \-\-json
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Parses via openssl. Warns on RSA\-4096 leaf certs, expiring certs (<90 days), or inconsistent CA flags.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+generate
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/signing-keys/inspect
+.UE
+.RE
+.PP
+.SS status
+.PP
+.I Show current Secure Boot state + enrolled certs
+.PP
+.B Category:
+Keys
+.br
+.B Maturity:
+experimental
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-signing\-keys status [\-\-json]
+.fi
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+lamboot\-signing\-keys status
+sudo lamboot\-signing\-keys status
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Reads /sys/firmware/efi/efivars/{SecureBoot,SetupMode,AuditMode}\-*. Runs mokutil \-\-list\-enrolled if available.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+mok\-list, mok\-enroll
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/signing-keys/status
+.UE
+.RE
+.PP
+.SS mok\-enroll
+.PP
+.I Stage a cert for MOK enrollment (user\-mode)
+.PP
+.B Category:
+User MOK
+.br
+.B Maturity:
+experimental
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-signing\-keys mok\-enroll CERT
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B CERT
+Path to cert to enroll (.der or .crt)
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-signing\-keys mok\-enroll /etc/keys/db.der
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Wraps mokutil \-\-import. Prompts for one\-time enrollment password. Reboot required to complete via MokManager.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Requires root (sudo)
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+mok\-list, mok\-delete, generate
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/signing-keys/mok-enroll
+.UE
+.RE
+.PP
+.SS mok\-list
+.PP
+.I List MOK\-enrolled certs
+.PP
+.B Category:
+User MOK
+.br
+.B Maturity:
+experimental
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-signing\-keys mok\-list [\-\-json]
+.fi
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+lamboot\-signing\-keys mok\-list
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Wraps mokutil \-\-list\-enrolled.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+mok\-enroll
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/signing-keys/mok-list
+.UE
+.RE
+.PP
+.SS mok\-delete
+.PP
+.I Stage MOK deletion (reverses mok\-enroll)
+.PP
+.B Category:
+User MOK
+.br
+.B Maturity:
+experimental
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-signing\-keys mok\-delete CERT
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B CERT
+Path to cert to remove from MOK
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-signing\-keys mok\-delete /etc/keys/db.der
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Wraps mokutil \-\-delete. Reboot required.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Requires root (sudo)
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+mok\-enroll
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/signing-keys/mok-delete
+.UE
+.RE
+.PP
+.SS ovmf\-vars
+.PP
+.I Build OVMF_VARS.fd with cert pre\-enrolled in db
+.PP
+.B Category:
+OVMF
+.br
+.B Maturity:
+experimental
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-signing\-keys ovmf\-vars OUTPUT.fd \-\-cert CERT
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B OUTPUT.fd
+Output OVMF vars file
+.TP
+.B \-\-cert PATH
+Certificate to embed in db
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-signing\-keys ovmf\-vars OVMF_VARS_custom.fd \-\-cert /etc/keys/db.crt
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Wraps virt\-fw\-vars. Consumes stock OVMF_VARS_4M.ms.fd template. Used for Proxmox Config 4 per OVMF\-VARS\-PROXMOX.md.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+generate, lamboot\-pve\-ovmf\-vars
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/signing-keys/ovmf-vars
+.UE
+.RE
+.PP
+.SS generate\-hierarchy
+.PP
+.I Generate full PK + KEK + db hierarchy (Scope 1)
+.PP
+.B Category:
+Release Eng
+.br
+.B Maturity:
+experimental
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-signing\-keys generate\-hierarchy [\-\-output\-dir DIR] [\-\-cn\-prefix NAME]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B \-\-output\-dir DIR
+Output directory (default: ./keys\-gen/)
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+lamboot\-signing\-keys generate\-hierarchy \-\-output\-dir ./keys\-gen/
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Produces PK (RSA 4096, CA:TRUE, 10y), KEK (RSA 4096, CA:TRUE, 10y), db (RSA 2048, CA:FALSE, codeSigning, 3y) per ~/lamboot\-dev/docs/KEY\-GENERATION.md §3. Prompts for three passphrases.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+generate, sign\-binary
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/signing-keys/generate-hierarchy
+.UE
+.RE
+.PP
+.SS sign\-binary
+.PP
+.I Sign a binary (Scope 1)
+.PP
+.B Category:
+Release Eng
+.br
+.B Maturity:
+experimental
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-signing\-keys sign\-binary BINARY \-\-key KEY \-\-cert CERT [\-\-output OUT] [\-\-sbat CSV|\-\-sbat\-file PATH|\-\-no\-sbat]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B BINARY
+File to sign
+.TP
+.B \-\-key PATH
+Private key
+.TP
+.B \-\-cert PATH
+Cert
+.TP
+.B \-\-sbat CSV
+Inline SBAT CSV line (e.g. "lamboot,1,LamCo,lamboot,0.8.4,https://lamboot.dev/sbat")
+.TP
+.B \-\-sbat\-file PATH
+Path to SBAT CSV file (header row + one entry per component); overrides \-\-sbat
+.TP
+.B \-\-no\-sbat
+Skip SBAT section injection (NOT recommended — shim may refuse to chain unsigned SBAT binaries)
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+lamboot\-signing\-keys sign\-binary dist/lambootx64.efi \-\-key keys/db.key \-\-cert keys/db.crt
+lamboot\-signing\-keys sign\-binary dist/lambootx64.efi \-\-key keys/db.key \-\-cert keys/db.crt \-\-sbat\-file /etc/lamboot/sbat.csv
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Injects a .sbat PE section before sbsign if not present. Resolution order: \-\-sbat\-file > \-\-sbat > /etc/lamboot/sbat.csv > built\-in default. Uses objcopy \-\-add\-section .sbat=PATH with appropriate flags. SBAT format per https://github.com/rhboot/shim/blob/main/SBAT.md. Pass \-\-no\-sbat to skip injection entirely (e.g. when binary already has .sbat).
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+generate\-hierarchy, lamboot\-uki\-build
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/signing-keys/sign-binary
+.UE
+.RE
+.PP
+.SH GLOBAL FLAGS
+Every subcommand accepts these universal flags (documented in
+.BR lamboot-tools (7)):
+.TP
+.BR \-\-help ", " \-h
+Show inline help
+.TP
+.B \-\-version
+Print tool and toolkit version
+.TP
+.B \-\-json
+Emit unified JSON output (schema v1)
+.TP
+.B \-\-json-schema
+Print the JSON schema this tool emits
+.TP
+.BR \-\-verbose ", " \-v
+Informational output beyond the default
+.TP
+.BR \-\-quiet ", " \-q
+Only warnings and errors
+.TP
+.B \-\-no-color
+Disable ANSI color (auto on non-TTY)
+.TP
+.B \-\-dry-run
+Print planned actions without executing
+.TP
+.BR \-\-yes ", " \-y
+Answer yes to interactive prompts
+.TP
+.B \-\-force
+Skip safety checks (per-subcommand semantics)
+.TP
+.B \-\-auto
+Non-interactive full automation (implies \fB\-\-yes\fR)
+.TP
+.BI \-\-offline " DISK"
+Operate on an unmounted disk or image
+.TP
+.B \-\-suggest-next-command
+Print the recommended follow-up command
+.SH EXIT STATUS
+.TP
+.B 0
+Success
+.TP
+.B 1
+Fatal error
+.TP
+.B 2
+Partial \- some operations succeeded, some failed
+.TP
+.B 3
+Nothing to do (already in requested state)
+.TP
+.B 4
+Refused due to a safety check
+.TP
+.B 5
+User declined interactive confirmation
+.TP
+.B 6
+Operation does not apply to this system
+.TP
+.B 7
+Required tool or capability is missing
+.SH FILES
+.TP
+.I /usr/lib/lamboot-tools/lamboot-toolkit-lib.sh
+Shared library sourced by every tool
+.TP
+.I /usr/lib/lamboot-tools/lamboot-toolkit-help.sh
+Help registry driver
+.TP
+.I /var/backups/lamboot-*-<timestamp>/
+Per-run backup directory (when a tool mutates state)
+.SH ENVIRONMENT
+.TP
+.B LAMBOOT_LIB_DIR
+Override shared library directory (default:
+.IR /usr/lib/lamboot-tools ).
+.TP
+.B NO_COLOR
+When set (to any value), disables ANSI color (freedesktop convention).
+.SH SEE ALSO
+.BR lamboot-tools (7),
+.BR lamboot-toolkit (1),
+.BR lamboot-diagnose (1),
+.BR lamboot-esp (1),
+.BR lamboot-backup (1),
+.BR lamboot-repair (1),
+.BR lamboot-migrate (1),
+.BR lamboot-doctor (1),
+.BR lamboot-uki-build (1),
+.BR lamboot-signing-keys (1)
+.PP
+Full documentation at
+.UR https://lamboot.dev/tools/
+.UE
+.SH AUTHORS
+The lamboot-tools suite is developed by
+.B Lamco Development
+(https://lamco.io). Source:
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.SH LICENSE
+MIT OR Apache-2.0

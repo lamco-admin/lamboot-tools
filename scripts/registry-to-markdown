@@ -1,0 +1,214 @@
+#!/bin/bash
+# registry-to-markdown — generate per-tool Markdown pages from help registry
+#
+# Parallels scripts/registry-to-man but targets Markdown for the website.
+# Same extraction mechanism: source the tool with main() stripped, dump the
+# populated LAMBOOT_HELP_REGISTRY.
+#
+# Usage: scripts/registry-to-markdown <tool-path> [<output-dir>]
+
+set -uo pipefail
+
+TOOL="${1:-}"
+OUTPUT_DIR="${2:-website/tools}"
+
+[[ -n "$TOOL" ]] || { echo "usage: $0 <tool-path> [<output-dir>]" >&2; exit 1; }
+[[ -f "$TOOL" ]] || { echo "tool not found: $TOOL" >&2; exit 1; }
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TOOL_NAME="$(basename "$TOOL")"
+OUTPUT_FILE="${OUTPUT_DIR}/${TOOL_NAME}.md"
+
+mkdir -p "$OUTPUT_DIR"
+
+# Extract registry (same subshell trick as registry-to-man)
+dump=$(
+    export LAMBOOT_LIB_DIR="$REPO_ROOT/lib"
+    sed -e 's/^main "\$@"$/# main "$@" stripped/' \
+        -e 's/^main "$@"$/# main "$@" stripped/' \
+        "$TOOL" > /tmp/registry-md-tool.$$.sh
+
+    # shellcheck disable=SC1090,SC1091  # dynamic; generated per-tool at runtime
+    source /tmp/registry-md-tool.$$.sh 2>/dev/null || {
+        rm -f /tmp/registry-md-tool.$$.sh
+        exit 1
+    }
+    rm -f /tmp/registry-md-tool.$$.sh
+
+    _register_subcommands 2>/dev/null
+
+    printf 'TOOL_NAME=%s\n' "$LAMBOOT_TOOL_NAME"
+    printf 'TOOL_VERSION=%s\n' "$LAMBOOT_TOOL_VERSION"
+    printf 'TOOLKIT_VERSION=%s\n' "$LAMBOOT_TOOLKIT_VERSION"
+    printf -- '---REGISTRY-BEGIN---\n'
+    # The dispatcher (lamboot-toolkit) sources only the lib, not the help
+    # module, so LAMBOOT_HELP_REGISTRY may be unset. Default to empty.
+    printf '%s\n' "${LAMBOOT_HELP_REGISTRY:-}"
+    printf -- '---REGISTRY-END---\n'
+)
+
+[[ -z "$dump" ]] && { echo "failed to extract registry from $TOOL" >&2; exit 1; }
+
+tool_name=$(printf '%s' "$dump" | grep '^TOOL_NAME=' | head -1 | cut -d= -f2-)
+tool_version=$(printf '%s' "$dump" | grep '^TOOL_VERSION=' | head -1 | cut -d= -f2-)
+toolkit_version=$(printf '%s' "$dump" | grep '^TOOLKIT_VERSION=' | head -1 | cut -d= -f2-)
+
+[[ -z "$tool_name" ]] && { echo "failed to read tool metadata" >&2; exit 1; }
+
+registry=$(printf '%s' "$dump" | sed -n '/^---REGISTRY-BEGIN---$/,/^---REGISTRY-END---$/p' | sed '1d;$d')
+
+# ── Emit Markdown ───────────────────────────────────────────────────────
+
+exec > "$OUTPUT_FILE"
+
+cat <<EOF
+# ${tool_name}
+
+<!-- This page is auto-generated from ${tool_name}'s help registry.
+     Regenerate via \`make website\` or \`scripts/registry-to-markdown\`.
+     Hand-authored introduction lives in the section below; everything
+     from "## Subcommands" onward is regenerated from the registry. -->
+
+!!! info "Version"
+    ${tool_name} **${tool_version}** (part of lamboot-tools **${toolkit_version}**)
+
+See the [man page](https://manpages.debian.org/${tool_name}) for the formal reference.
+
+## Subcommands
+
+EOF
+
+# Parse records and emit sections
+while IFS= read -r record; do
+    [[ -z "$record" ]] && continue
+
+    # Split on ASCII 0x1F
+    IFS=$'\x1f' read -r name aliases category summary syntax args \
+                       examples notes offline root see_also doc_url maturity \
+                       <<< "$record"
+
+    [[ -z "$name" ]] && continue
+
+    # Maturity badge
+    local_badge=""
+    case "$maturity" in
+        stable)        local_badge="![stable](https://img.shields.io/badge/-stable-green)" ;;
+        beta)          local_badge="![beta](https://img.shields.io/badge/-beta-yellow)" ;;
+        experimental)  local_badge="![experimental](https://img.shields.io/badge/-experimental-orange)" ;;
+    esac
+
+    cat <<EOF
+
+### \`${name}\` ${local_badge}
+
+*${summary}*
+
+EOF
+
+    [[ -n "$aliases" ]] && cat <<EOF
+**Aliases:** \`${aliases//,/\`, \`}\`
+
+EOF
+
+    cat <<EOF
+**Category:** ${category}
+&nbsp;&nbsp; **Maturity:** ${maturity}
+&nbsp;&nbsp; **Offline:** $([[ "$offline" == "true" ]] && printf 'Yes' || printf 'No')
+&nbsp;&nbsp; **Root:** $([[ "$root" == "true" ]] && printf 'Required' || printf 'Not required')
+
+#### Syntax
+
+\`\`\`
+${syntax}
+\`\`\`
+
+EOF
+
+    # Arguments
+    if [[ -n "$args" ]]; then
+        cat <<'EOF'
+#### Arguments
+
+| Argument | Description |
+|---|---|
+EOF
+        IFS='|' read -ra arg_arr <<< "$args"
+        for a in "${arg_arr[@]}"; do
+            local_name="${a%%:*}"
+            local_desc="${a#*:}"
+            # Escape markdown-special chars in arg descriptions
+            local_desc="${local_desc//|/\\|}"
+            printf '| `%s` | %s |\n' "$local_name" "$local_desc"
+        done
+        printf '\n'
+    fi
+
+    # Examples
+    if [[ -n "$examples" ]]; then
+        cat <<'EOF'
+#### Examples
+
+```console
+EOF
+        IFS='||' read -ra ex_arr <<< "$examples"
+        for ex in "${ex_arr[@]}"; do
+            [[ -z "$ex" ]] && continue
+            printf '$ %s\n' "$ex"
+        done
+        cat <<'EOF'
+```
+
+EOF
+    fi
+
+    # Notes
+    if [[ -n "$notes" ]]; then
+        cat <<EOF
+#### Notes
+
+${notes}
+
+EOF
+    fi
+
+    # See also
+    if [[ -n "$see_also" ]]; then
+        cat <<EOF
+**See also:** ${see_also//,/,  }
+
+EOF
+    fi
+
+    # Doc URL
+    if [[ -n "$doc_url" ]]; then
+        cat <<EOF
+[Deep-dive documentation →](${doc_url}){ .md-button }
+
+EOF
+    fi
+
+done <<< "$registry"
+
+# ── Emit standard footer ────────────────────────────────────────────────
+
+cat <<EOF
+## Universal flags
+
+All tools accept the universal flags listed in [CLI contracts](../reference/cli-contracts.md). Key flags:
+
+- \`--json\` — emit [schema v1](../reference/json-schema.md) output
+- \`--dry-run\` — preview without executing
+- \`--suggest-next-command\` — print the recommended follow-up command
+
+## Exit codes
+
+See [exit codes reference](../reference/exit-codes.md).
+
+## See also
+
+- \`${tool_name}(1)\` — man page
+- [Overview](../index.md)
+- [Tool inventory](index.md)
+EOF
+
+exit 0

@@ -1,0 +1,25 @@
+# Fixture checksums for lamboot-tools integration tests.
+# Format: <sha256>  <filename>
+# Updated by: tests/fixtures/regen/<fixture>.sh (commit this file after regen).
+#
+# These hashes were generated on 2026-04-22 by running regen-all.sh on
+# pve.a.lamco.io (sgdisk + sfdisk + mkfs.fat + mkfs.ext4 + cryptsetup +
+# losetup + python3). Each image is a synthetic disk designed to trip a
+# specific check in lamboot-diagnose / lamboot-esp / lamboot-migrate.
+#
+# The .raw files themselves are NOT committed (sizes 100MB-500MB,
+# ~3GB total). Hosting decision: upload to fixtures.lamboot.dev OR a
+# lamco-admin/lamboot-fixtures GitHub release-assets repo.
+# download-fixtures.sh verifies sha256 on fetch.
+
+7cfbcbba4250370b41b0b98337372fb1e3653c0fe6bd29e6eecc6238028eebe8  clean-bios-mbr.raw
+f97af77d7feead0e9395da2704d39a6cc7d623d61cc18d6dda5e8f98d6f728c2  clean-uefi-gpt.raw
+083ee0e578cfd23eb0ddaf9425434aa1208bf7b442fe8336d17a8893a2278119  hybrid-mbr.raw
+a489180399a0bf545c01749e7b2ac133151324b69083aebfc192ec8cf8f63dff  encrypted-root.raw
+3db98e32242b06616b101b78c31106c14c806b39246c5c669caaff7a93780fcd  windows-mbr.raw
+70e621520d78b1c1589b94a8af1c084b7d0c88d0674b2c199894467f9b841cad  no-esp.raw
+6eb971a239abe16de18f2e11163d77818f4f3fdc45925dbef4049c165c7a9486  full-esp.raw
+b7f42b3b68799b1e8772c88a28f6ebd6813c4d8c8f4dc5460efa15869af0ea8f  corrupted-esp-fat.raw
+6ad4657720a01e896a9d2fa6b51c15850f65b456a2a6ff68547d31ecc5fa4493  lamboot-installed.raw
+9489fc70dfde9250ee7ddfc4a213cec9ee6f3f7abee51ddf29753705c9155ab8  grub-installed.raw
+c83348dcb4711ff477df11215b8bcaaa27000b78a7ea8e13625497bb366f8a6a  sdboot-installed.raw

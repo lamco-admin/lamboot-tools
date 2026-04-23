@@ -1,0 +1,984 @@
+#!/bin/bash
+# lamboot-diagnose — generic UEFI boot diagnostic scanner
+#
+# Flagship tool of the lamboot-tools suite. Read-only scan of the boot chain
+# across 11 categories; emits findings with remediation commands.
+#
+# Governed by docs/SPEC-LAMBOOT-DIAGNOSE.md.
+# Part of the lamboot-tools suite (SPEC-LAMBOOT-TOOLKIT-V1.md §3.1).
+
+# shellcheck source=../lib/lamboot-toolkit-lib.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
+# shellcheck source=../lib/lamboot-toolkit-help.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
+
+LAMBOOT_TOOL_NAME="lamboot-diagnose"
+LAMBOOT_TOOL_VERSION="0.2.0"
+
+# ── ESP partition type GUID constant ─────────────────────────────────────
+readonly ESP_PARTTYPE_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+readonly DOC_BASE="https://lamboot.dev/tools/findings"
+
+# ── Tool-specific flags ──────────────────────────────────────────────────
+OPT_ESP_OVERRIDE=""
+OPT_CATEGORIES=()
+OPT_SKIP_CATEGORIES=()
+OPT_FILTER_ID=""
+OPT_WITH_REMEDIATION=0
+
+# Resolved ESP mount (set by check_esp)
+DIAG_ESP_MOUNT=""
+
+# ── Help registry ────────────────────────────────────────────────────────
+
+_register_subcommands() {
+    register_subcommand \
+        --name "scan" \
+        --category "Diagnostics" \
+        --summary "Run the full UEFI boot-chain scan (default action)" \
+        --syntax "lamboot-diagnose [--esp PATH] [--offline DISK] [--category CAT] [--skip CAT] [--id ID] [--json]" \
+        --arg "--esp PATH:Override ESP mount point detection" \
+        --arg "--offline DISK:Operate on an unmounted disk or image" \
+        --arg "--category CAT:Only run checks in this category (repeatable)" \
+        --arg "--skip CAT:Skip checks in this category (repeatable)" \
+        --arg "--id ID:Run only the check with this dotted finding ID" \
+        --arg "--with-remediation:Always print remediation sections" \
+        --example "sudo lamboot-diagnose" \
+        --example "lamboot-diagnose --json | jq .summary" \
+        --example "sudo lamboot-diagnose --offline /dev/pve/vm-201-disk-1 --json" \
+        --example "lamboot-diagnose --category esp --category partition_table" \
+        --example "lamboot-diagnose --id esp.free_space" \
+        --notes "Read-only. Runs unprivileged where possible; some checks require root (noted per finding). Every finding at severity warning or above includes a remediation command and documentation URL pointing at lamboot.dev/tools/findings/." \
+        --offline-capable "true" \
+        --requires-root "false" \
+        --see-also "lamboot-esp, lamboot-repair, lamboot-migrate" \
+        --doc-url "https://lamboot.dev/tools/diagnose" \
+        --maturity "stable"
+}
+
+# ── Remediation helpers ──────────────────────────────────────────────────
+
+_remediation_json() {
+    local id="$1"
+    local summary="$2"
+    local command="${3:-}"
+    local doc="${DOC_BASE}/${id//.//}"
+
+    local cmd_field="\"\""
+    [[ -n "$command" ]] && cmd_field="\"$(json_escape "$command")\""
+
+    printf '{"summary":"%s","command":%s,"doc_url":"%s"}' \
+        "$(json_escape "$summary")" "$cmd_field" "$doc"
+}
+
+# ── Category filter ──────────────────────────────────────────────────────
+
+_category_active() {
+    local cat="$1"
+
+    for skip in "${OPT_SKIP_CATEGORIES[@]}"; do
+        [[ "$cat" == "$skip" ]] && return 1
+    done
+
+    if [[ ${#OPT_CATEGORIES[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    for allowed in "${OPT_CATEGORIES[@]}"; do
+        [[ "$cat" == "$allowed" ]] && return 0
+    done
+
+    return 1
+}
+
+_id_active() {
+    local id="$1"
+    [[ -z "$OPT_FILTER_ID" ]] && return 0
+    [[ "$id" == "$OPT_FILTER_ID" ]]
+}
+
+# ── Root disk helper ─────────────────────────────────────────────────────
+
+resolve_root_disk() {
+    if [[ $LAMBOOT_OFFLINE_ACTIVE -eq 1 ]] && [[ -n "$LAMBOOT_OFFLINE_LOOP_DEV" ]]; then
+        printf '%s' "$LAMBOOT_OFFLINE_LOOP_DEV"
+        return 0
+    fi
+
+    local src
+    src=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/\[.*\]//' || true)
+    [[ -z "$src" ]] && return 1
+
+    local parent
+    parent=$(lsblk -nro PKNAME "$src" 2>/dev/null | head -1 || true)
+    if [[ -n "$parent" ]]; then
+        printf '/dev/%s' "$parent"
+        return 0
+    fi
+
+    printf '%s' "$src"
+}
+
+# ── Category 1: boot_mode ────────────────────────────────────────────────
+
+check_category_boot_mode() {
+    _category_active "boot_mode" || return 0
+
+    local mode
+    mode=$(detect_boot_mode)
+
+    if [[ "$mode" == "uefi" ]]; then
+        _id_active "boot_mode.uefi" && emit_finding "boot_mode.uefi" "boot_mode" "info" "pass" \
+            "Booted in UEFI mode" \
+            "Firmware is UEFI; /sys/firmware/efi is present." \
+            "{\"mode\":\"uefi\"}" '{}'
+    else
+        _id_active "boot_mode.uefi" && emit_finding "boot_mode.uefi" "boot_mode" "warning" "warn" \
+            "System is booted in BIOS/Legacy mode" \
+            "Consider BIOS→UEFI migration for modern boot support." \
+            "{\"mode\":\"bios\"}" \
+            "$(_remediation_json "boot_mode.uefi" \
+                "Convert to UEFI with lamboot-migrate" \
+                "sudo lamboot-migrate to-uefi")"
+    fi
+}
+
+# ── Category 2: partition_table ──────────────────────────────────────────
+
+check_category_partition_table() {
+    _category_active "partition_table" || return 0
+
+    local disk
+    disk=$(resolve_root_disk) || {
+        _id_active "partition_table.type" && emit_finding "partition_table.type" "partition_table" "error" "fail" \
+            "Cannot determine root disk" \
+            "findmnt + lsblk could not resolve the root filesystem's parent disk." \
+            "{}" \
+            "$(_remediation_json "partition_table.type" \
+                "Inspect root mount manually" \
+                "findmnt -n -o SOURCE / && lsblk")"
+        return
+    }
+
+    local pttype
+    pttype=$(blkid -o value -s PTTYPE "$disk" 2>/dev/null || true)
+
+    _id_active "partition_table.type" || return 0
+    case "$pttype" in
+        gpt)
+            emit_finding "partition_table.type" "partition_table" "info" "pass" \
+                "Partition table is GPT" \
+                "Disk $disk uses GPT." \
+                "{\"disk\":\"$(json_escape "$disk")\",\"pttype\":\"gpt\"}" '{}'
+            ;;
+        dos)
+            emit_finding "partition_table.type" "partition_table" "warning" "warn" \
+                "Partition table is MBR" \
+                "Disk $disk uses MBR. UEFI boot requires GPT for full compatibility." \
+                "{\"disk\":\"$(json_escape "$disk")\",\"pttype\":\"dos\"}" \
+                "$(_remediation_json "partition_table.type" \
+                    "Convert to GPT+UEFI" \
+                    "sudo lamboot-migrate to-uefi --disk $disk")"
+            ;;
+        "")
+            emit_finding "partition_table.type" "partition_table" "error" "fail" \
+                "Partition table type unknown" \
+                "blkid returned no PTTYPE for $disk." \
+                "{\"disk\":\"$(json_escape "$disk")\"}" \
+                "$(_remediation_json "partition_table.type" \
+                    "Inspect partition table" \
+                    "sudo fdisk -l $disk")"
+            ;;
+        *)
+            emit_finding "partition_table.type" "partition_table" "warning" "warn" \
+                "Unusual partition table type: $pttype" \
+                "Disk $disk uses '$pttype'." \
+                "{\"disk\":\"$(json_escape "$disk")\",\"pttype\":\"$pttype\"}" '{}'
+            ;;
+    esac
+}
+
+# ── Category 3: esp ──────────────────────────────────────────────────────
+
+check_category_esp() {
+    _category_active "esp" || return 0
+
+    local esp=""
+    if [[ -n "$OPT_ESP_OVERRIDE" ]]; then
+        esp="$OPT_ESP_OVERRIDE"
+    else
+        esp=$(detect_esp 2>/dev/null || true)
+    fi
+
+    if [[ -z "$esp" ]]; then
+        _id_active "esp.mounted" && emit_finding "esp.mounted" "esp" "critical" "fail" \
+            "No EFI System Partition found mounted" \
+            "Neither /boot/efi nor /efi is a vfat mountpoint." "{}" \
+            "$(_remediation_json "esp.mounted" \
+                "Create or mount an ESP" \
+                "sudo lamboot-migrate to-uefi")"
+        return
+    fi
+
+    DIAG_ESP_MOUNT="$esp"
+    _id_active "esp.mounted" && emit_finding "esp.mounted" "esp" "info" "pass" \
+        "ESP mounted at $esp" \
+        "EFI System Partition is mounted and accessible." \
+        "{\"mountpoint\":\"$esp\"}" '{}'
+
+    local esp_dev
+    esp_dev=$(findmnt -n -o SOURCE "$esp" 2>/dev/null || true)
+
+    # Partition type GUID check
+    if _id_active "esp.partition_type_guid"; then
+        local parttype=""
+        [[ -n "$esp_dev" ]] && parttype=$(lsblk -nro PARTTYPE "$esp_dev" 2>/dev/null | head -1 || true)
+        if [[ -n "$parttype" ]] && printf '%s' "$parttype" | grep -qi "$ESP_PARTTYPE_GUID"; then
+            emit_finding "esp.partition_type_guid" "esp" "info" "pass" \
+                "ESP partition type GUID is correct" \
+                "Partition type is EF00 (UEFI ESP)." \
+                "{\"guid\":\"$(json_escape "$parttype")\"}" '{}'
+        elif [[ -n "$parttype" ]]; then
+            emit_finding "esp.partition_type_guid" "esp" "warning" "warn" \
+                "ESP partition type GUID is not standard" \
+                "Expected $ESP_PARTTYPE_GUID; found $parttype." \
+                "{\"guid\":\"$(json_escape "$parttype")\"}" \
+                "$(_remediation_json "esp.partition_type_guid" \
+                    "Set partition type to EF00" \
+                    "sudo sgdisk --typecode=<N>:EF00 <disk>")"
+        fi
+    fi
+
+    # Filesystem type
+    if _id_active "esp.filesystem"; then
+        local fstype
+        fstype=$(findmnt -n -o FSTYPE "$esp" 2>/dev/null || true)
+        if [[ "$fstype" == "vfat" ]]; then
+            emit_finding "esp.filesystem" "esp" "info" "pass" \
+                "ESP filesystem is vfat" \
+                "Correct filesystem for UEFI." \
+                "{\"fstype\":\"vfat\"}" '{}'
+        else
+            emit_finding "esp.filesystem" "esp" "critical" "fail" \
+                "ESP filesystem is not vfat" \
+                "Found $fstype; UEFI requires FAT32." \
+                "{\"fstype\":\"$(json_escape "$fstype")\"}" \
+                "$(_remediation_json "esp.filesystem" \
+                    "Reformat ESP as FAT32 (destructive)" \
+                    "sudo lamboot-esp recreate")"
+        fi
+    fi
+
+    # Free space
+    if _id_active "esp.free_space"; then
+        local avail_kb total_kb
+        avail_kb=$(df -k --output=avail "$esp" 2>/dev/null | tail -1 | tr -d ' ' || true)
+        total_kb=$(df -k --output=size "$esp" 2>/dev/null | tail -1 | tr -d ' ' || true)
+        if [[ -n "$avail_kb" ]] && [[ -n "$total_kb" ]] && [[ "$total_kb" -gt 0 ]]; then
+            local avail_mb=$((avail_kb / 1024))
+            local total_mb=$((total_kb / 1024))
+            local used_pct=$(( (total_kb - avail_kb) * 100 / total_kb ))
+            local free_pct=$((100 - used_pct))
+
+            local sev="info" stat="pass"
+            if [[ $free_pct -lt 5 ]]; then
+                sev="error"; stat="fail"
+            elif [[ $free_pct -lt 10 ]]; then
+                sev="warning"; stat="warn"
+            fi
+
+            local ctx="{\"free_mb\":${avail_mb},\"total_mb\":${total_mb},\"percent_free\":${free_pct}}"
+            if [[ "$sev" == "info" ]]; then
+                emit_finding "esp.free_space" "esp" "info" "pass" \
+                    "ESP has ${free_pct}% free" \
+                    "${avail_mb} MB free of ${total_mb} MB." "$ctx" '{}'
+            else
+                emit_finding "esp.free_space" "esp" "$sev" "$stat" \
+                    "ESP is ${used_pct}% full" \
+                    "Only ${avail_mb} MB free of ${total_mb} MB (${free_pct}% free)." \
+                    "$ctx" \
+                    "$(_remediation_json "esp.free_space" \
+                        "Remove stale kernel images and orphaned files" \
+                        "sudo lamboot-esp clean --dry-run")"
+            fi
+        fi
+    fi
+
+    # Integrity (non-destructive fsck)
+    if _id_active "esp.integrity" && [[ -n "$esp_dev" ]] && command -v fsck.fat >/dev/null 2>&1; then
+        if fsck.fat -n "$esp_dev" >/dev/null 2>&1; then
+            emit_finding "esp.integrity" "esp" "info" "pass" \
+                "ESP filesystem is clean" \
+                "fsck.fat -n reports no issues." \
+                "{\"device\":\"$(json_escape "$esp_dev")\"}" '{}'
+        else
+            emit_finding "esp.integrity" "esp" "warning" "warn" \
+                "ESP filesystem has issues" \
+                "fsck.fat -n reported problems; run fsck.fat -a $esp_dev (unmount first)." \
+                "{\"device\":\"$(json_escape "$esp_dev")\"}" \
+                "$(_remediation_json "esp.integrity" \
+                    "Repair ESP filesystem" \
+                    "sudo lamboot-esp repair")"
+        fi
+    fi
+
+    # Fallback path
+    if _id_active "esp.fallback_path"; then
+        if [[ -f "${esp}/EFI/BOOT/BOOTX64.EFI" ]] || [[ -f "${esp}/EFI/BOOT/bootx64.efi" ]]; then
+            emit_finding "esp.fallback_path" "esp" "info" "pass" \
+                "Fallback loader present" \
+                "EFI/BOOT/BOOTX64.EFI exists for removable-media boot." \
+                "{}" '{}'
+        else
+            emit_finding "esp.fallback_path" "esp" "warning" "warn" \
+                "Fallback loader missing" \
+                "EFI/BOOT/BOOTX64.EFI not present; firmware default-loader boot will not work." "{}" \
+                "$(_remediation_json "esp.fallback_path" \
+                    "Populate fallback path via bootloader reinstall" \
+                    "sudo lamboot-repair")"
+        fi
+    fi
+}
+
+# ── Category 4: boot_entries ─────────────────────────────────────────────
+
+check_category_boot_entries() {
+    _category_active "boot_entries" || return 0
+
+    if [[ ! -d /sys/firmware/efi ]]; then
+        _id_active "boot_entries.count" && emit_finding "boot_entries.count" "boot_entries" "info" "skip" \
+            "UEFI boot entries — skipped (BIOS boot)" \
+            "Not booted via UEFI; no boot entries to enumerate." "{}" '{}'
+        return
+    fi
+
+    if ! command -v efibootmgr >/dev/null 2>&1; then
+        _id_active "boot_entries.count" && emit_finding "boot_entries.count" "boot_entries" "warning" "skip" \
+            "efibootmgr not installed" \
+            "Cannot enumerate UEFI boot entries." "{}" \
+            "$(_remediation_json "boot_entries.count" \
+                "Install efibootmgr" \
+                "sudo apt install efibootmgr || sudo dnf install efibootmgr")"
+        return
+    fi
+
+    local entries
+    entries=$(efibootmgr 2>/dev/null | grep -cE '^Boot[0-9A-Fa-f]{4}' || true)
+    entries="${entries:-0}"
+
+    if _id_active "boot_entries.count"; then
+        if [[ "$entries" -eq 0 ]]; then
+            emit_finding "boot_entries.count" "boot_entries" "error" "fail" \
+                "No UEFI boot entries in NVRAM" \
+                "efibootmgr shows 0 entries." "{}" \
+                "$(_remediation_json "boot_entries.count" \
+                    "Reinstall the bootloader to create a boot entry" \
+                    "sudo lamboot-repair")"
+        else
+            emit_finding "boot_entries.count" "boot_entries" "info" "pass" \
+                "$entries UEFI boot entries in NVRAM" "" \
+                "{\"count\":${entries}}" '{}'
+        fi
+    fi
+
+    if _id_active "boot_entries.bootorder"; then
+        local bootorder
+        bootorder=$(efibootmgr 2>/dev/null | grep '^BootOrder:' | cut -d: -f2 | tr -d ' ' || true)
+        if [[ -n "$bootorder" ]]; then
+            local first="${bootorder%%,*}"
+            emit_finding "boot_entries.bootorder" "boot_entries" "info" "pass" \
+                "BootOrder set" \
+                "First entry: Boot$first" \
+                "{\"bootorder\":\"$(json_escape "$bootorder")\",\"first\":\"$first\"}" '{}'
+        else
+            emit_finding "boot_entries.bootorder" "boot_entries" "warning" "warn" \
+                "BootOrder not set" \
+                "Firmware will fall back to removable-media boot or its default." "{}" '{}'
+        fi
+    fi
+
+    if _id_active "boot_entries.lamboot_present"; then
+        if efibootmgr 2>/dev/null | grep -qi 'lamboot'; then
+            emit_finding "boot_entries.lamboot_present" "boot_entries" "info" "pass" \
+                "LamBoot boot entry present" "" "{}" '{}'
+        else
+            verbose "no LamBoot boot entry (informational)"
+        fi
+    fi
+}
+
+# ── Category 5: bootloader ───────────────────────────────────────────────
+
+check_category_bootloader() {
+    _category_active "bootloader" || return 0
+
+    [[ -z "$DIAG_ESP_MOUNT" ]] && return 0
+
+    local found=0
+
+    _try_bootloader() {
+        if _check_bootloader_binary "$1" "$2"; then
+            found=$((found + 1))
+            return 0
+        fi
+        return 1
+    }
+
+    _try_bootloader "lamboot" "${DIAG_ESP_MOUNT}/EFI/LamBoot/lambootx64.efi" || true
+
+    # GRUB lives under one of several distro directories; stop on first hit
+    for grub_dir in fedora debian ubuntu arch rocky centos opensuse manjaro endeavouros; do
+        if _try_bootloader "grub" "${DIAG_ESP_MOUNT}/EFI/${grub_dir}/grubx64.efi"; then
+            break
+        fi
+    done
+
+    _try_bootloader "systemd-boot" "${DIAG_ESP_MOUNT}/EFI/systemd/systemd-bootx64.efi" || true
+    _try_bootloader "refind"       "${DIAG_ESP_MOUNT}/EFI/refind/refind_x64.efi"       || true
+    _try_bootloader "limine"       "${DIAG_ESP_MOUNT}/EFI/limine/limine.cfg"           || true
+    _try_bootloader "windows"      "${DIAG_ESP_MOUNT}/EFI/Microsoft/Boot/bootmgfw.efi" || true
+
+    if _id_active "bootloader.count"; then
+        if [[ $found -eq 0 ]]; then
+            emit_finding "bootloader.count" "bootloader" "critical" "fail" \
+                "No bootloader binaries found on ESP" \
+                "ESP contains no recognized bootloader; system may not boot." \
+                "{\"esp\":\"$DIAG_ESP_MOUNT\"}" \
+                "$(_remediation_json "bootloader.count" \
+                    "Install a bootloader" \
+                    "sudo lamboot-repair")"
+        else
+            emit_finding "bootloader.count" "bootloader" "info" "pass" \
+                "$found bootloader(s) detected on ESP" "" \
+                "{\"count\":${found}}" '{}'
+        fi
+    fi
+}
+
+_check_bootloader_binary() {
+    local name="$1"
+    local path="$2"
+
+    [[ -f "$path" ]] || return 1
+
+    local id="bootloader.${name}.present"
+    _id_active "$id" || { return 0; }
+
+    local size_kb
+    size_kb=$(( $(stat -c %s "$path" 2>/dev/null || printf '0') / 1024 ))
+
+    emit_finding "$id" "bootloader" "info" "pass" \
+        "${name} present on ESP" \
+        "$path (${size_kb} KiB)" \
+        "{\"path\":\"$(json_escape "$path")\",\"size_kb\":${size_kb}}" '{}'
+
+    # PE format check for UEFI binaries (not for config-only like limine)
+    if [[ "$name" != "limine" ]] && command -v file >/dev/null 2>&1; then
+        local pe_id="bootloader.${name}.pe_format"
+        _id_active "$pe_id" || return 0
+        local filetype
+        filetype=$(file -b "$path" 2>/dev/null || true)
+        if printf '%s' "$filetype" | grep -q 'PE32+'; then
+            emit_finding "$pe_id" "bootloader" "info" "pass" \
+                "${name} is valid PE32+ UEFI binary" "" \
+                "{\"path\":\"$(json_escape "$path")\"}" '{}'
+        else
+            emit_finding "$pe_id" "bootloader" "critical" "fail" \
+                "${name} binary is not PE32+" \
+                "$path is $filetype; UEFI requires PE32+." \
+                "{\"path\":\"$(json_escape "$path")\",\"type\":\"$(json_escape "$filetype")\"}" \
+                "$(_remediation_json "bootloader.${name}.pe_format" \
+                    "Reinstall ${name} with correct UEFI target" \
+                    "sudo lamboot-repair")"
+        fi
+    fi
+
+    return 0
+}
+
+# ── Category 6: kernel ───────────────────────────────────────────────────
+
+check_category_kernel() {
+    _category_active "kernel" || return 0
+
+    local boot_dir="/boot"
+    [[ $LAMBOOT_OFFLINE_ACTIVE -eq 1 ]] && [[ -n "$LAMBOOT_OFFLINE_ROOT" ]] && boot_dir="$LAMBOOT_OFFLINE_ROOT/boot"
+
+    local kernel_count=0
+    local missing_initrd=0
+    local kernels=()
+    for kpath in "$boot_dir"/vmlinuz-*; do
+        [[ -f "$kpath" ]] || continue
+        kernel_count=$((kernel_count + 1))
+        local ver="${kpath##*/vmlinuz-}"
+        kernels+=("$ver")
+
+        local initrd_found=0
+        for pattern in "$boot_dir/initramfs-${ver}.img" "$boot_dir/initrd.img-${ver}" "$boot_dir/initrd-${ver}"; do
+            [[ -f "$pattern" ]] && { initrd_found=1; break; }
+        done
+
+        local id="kernel.${ver}.initrd"
+        _id_active "$id" || continue
+        if [[ $initrd_found -eq 1 ]]; then
+            emit_finding "$id" "kernel" "info" "pass" \
+                "Kernel $ver has initrd" "" \
+                "{\"version\":\"$(json_escape "$ver")\"}" '{}'
+        else
+            missing_initrd=$((missing_initrd + 1))
+            emit_finding "$id" "kernel" "warning" "warn" \
+                "Kernel $ver missing initrd" \
+                "No initramfs found for kernel $ver in $boot_dir." \
+                "{\"version\":\"$(json_escape "$ver")\"}" \
+                "$(_remediation_json "kernel.missing_initrd" \
+                    "Rebuild initrd" \
+                    "sudo dracut --force /boot/initramfs-${ver}.img ${ver} || sudo update-initramfs -c -k ${ver}")"
+        fi
+    done
+
+    # UKIs in ESP
+    local uki_count=0
+    if [[ -n "$DIAG_ESP_MOUNT" ]] && [[ -d "$DIAG_ESP_MOUNT/EFI/Linux" ]]; then
+        for uki in "$DIAG_ESP_MOUNT"/EFI/Linux/*.efi; do
+            [[ -f "$uki" ]] || continue
+            uki_count=$((uki_count + 1))
+        done
+    fi
+
+    if _id_active "kernel.count"; then
+        local total=$((kernel_count + uki_count))
+        if [[ $total -eq 0 ]]; then
+            emit_finding "kernel.count" "kernel" "critical" "fail" \
+                "No kernels found" \
+                "Neither /boot/vmlinuz-* nor EFI/Linux/*.efi has any kernels." "{}" \
+                "$(_remediation_json "kernel.count" \
+                    "Reinstall kernel package" \
+                    "sudo dnf reinstall kernel || sudo apt install --reinstall linux-image-generic")"
+        else
+            emit_finding "kernel.count" "kernel" "info" "pass" \
+                "$total kernel(s) found ($kernel_count legacy + $uki_count UKI)" \
+                "Legacy kernels: ${kernels[*]:-none}" \
+                "{\"total\":${total},\"legacy\":${kernel_count},\"uki\":${uki_count}}" '{}'
+        fi
+    fi
+
+    if _id_active "kernel.uki.count" && [[ $uki_count -gt 0 ]]; then
+        emit_finding "kernel.uki.count" "kernel" "info" "pass" \
+            "$uki_count UKI(s) in ESP" "" \
+            "{\"count\":${uki_count}}" '{}'
+    fi
+}
+
+# ── Category 7: bls ──────────────────────────────────────────────────────
+
+check_category_bls() {
+    _category_active "bls" || return 0
+
+    local roots=(/boot/loader/entries /boot/efi/loader/entries /efi/loader/entries)
+    [[ $LAMBOOT_OFFLINE_ACTIVE -eq 1 ]] && [[ -n "$LAMBOOT_OFFLINE_ROOT" ]] && \
+        roots=("$LAMBOOT_OFFLINE_ROOT/boot/loader/entries" "$LAMBOOT_OFFLINE_ROOT/boot/efi/loader/entries")
+
+    local bls_count=0
+    local bls_broken=0
+    for dir in "${roots[@]}"; do
+        [[ -d "$dir" ]] || continue
+        for conf in "$dir"/*.conf; do
+            [[ -f "$conf" ]] || continue
+            bls_count=$((bls_count + 1))
+
+            local has_linux has_efi
+            has_linux=$(grep -c '^linux ' "$conf" 2>/dev/null || printf '0')
+            has_efi=$(grep -c '^efi ' "$conf" 2>/dev/null || printf '0')
+            if [[ "$has_linux" -eq 0 ]] && [[ "$has_efi" -eq 0 ]]; then
+                bls_broken=$((bls_broken + 1))
+                local id
+                id="bls.$(basename "$conf" .conf).valid"
+                _id_active "$id" && emit_finding "$id" "bls" "warning" "fail" \
+                    "BLS entry $(basename "$conf") missing linux or efi field" \
+                    "$conf has neither 'linux' nor 'efi' line." \
+                    "{\"file\":\"$(json_escape "$conf")\"}" '{}'
+            fi
+        done
+    done
+
+    if _id_active "bls.count"; then
+        if [[ $bls_count -eq 0 ]]; then
+            emit_finding "bls.count" "bls" "info" "skip" \
+                "No BLS entries found" \
+                "System may use GRUB config or UKIs for boot discovery." "{}" '{}'
+        elif [[ $bls_broken -gt 0 ]]; then
+            emit_finding "bls.count" "bls" "warning" "warn" \
+                "$bls_count BLS entries, $bls_broken invalid" "" \
+                "{\"total\":${bls_count},\"broken\":${bls_broken}}" '{}'
+        else
+            emit_finding "bls.count" "bls" "info" "pass" \
+                "$bls_count BLS entries, all valid" "" \
+                "{\"total\":${bls_count}}" '{}'
+        fi
+    fi
+}
+
+# ── Category 8: secure_boot ──────────────────────────────────────────────
+
+check_category_secure_boot() {
+    _category_active "secure_boot" || return 0
+
+    if [[ ! -d /sys/firmware/efi ]]; then
+        _id_active "secure_boot.enabled" && emit_finding "secure_boot.enabled" "secure_boot" "info" "skip" \
+            "Secure Boot check skipped (BIOS boot)" "" "{}" '{}'
+        return
+    fi
+
+    local sb_var="/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+    if [[ ! -r "$sb_var" ]]; then
+        _id_active "secure_boot.enabled" && emit_finding "secure_boot.enabled" "secure_boot" "info" "skip" \
+            "Secure Boot state not readable" \
+            "efivarfs not accessible (requires root for some systems)." "{}" '{}'
+        return
+    fi
+
+    if _id_active "secure_boot.enabled"; then
+        local val
+        val=$(od -An -t u1 -j4 -N1 "$sb_var" 2>/dev/null | tr -d ' ' || printf '0')
+        if [[ "$val" == "1" ]]; then
+            emit_finding "secure_boot.enabled" "secure_boot" "info" "pass" \
+                "Secure Boot is enabled" "" \
+                "{\"enabled\":true}" '{}'
+        else
+            emit_finding "secure_boot.enabled" "secure_boot" "info" "pass" \
+                "Secure Boot is disabled" \
+                "Not an error; reported for visibility." \
+                "{\"enabled\":false}" '{}'
+        fi
+    fi
+
+    if _id_active "secure_boot.mok_enrolled" && command -v mokutil >/dev/null 2>&1; then
+        local mok_count
+        mok_count=$(mokutil --list-enrolled 2>/dev/null | grep -c 'SHA1 Fingerprint' || printf '0')
+        mok_count="${mok_count:-0}"
+        emit_finding "secure_boot.mok_enrolled" "secure_boot" "info" "pass" \
+            "$mok_count cert(s) enrolled in MOK" "" \
+            "{\"count\":${mok_count}}" '{}'
+    fi
+}
+
+# ── Category 9: fstab ────────────────────────────────────────────────────
+
+check_category_fstab() {
+    _category_active "fstab" || return 0
+
+    local fstab=/etc/fstab
+    [[ $LAMBOOT_OFFLINE_ACTIVE -eq 1 ]] && [[ -n "$LAMBOOT_OFFLINE_ROOT" ]] && fstab="$LAMBOOT_OFFLINE_ROOT/etc/fstab"
+
+    if [[ ! -f "$fstab" ]]; then
+        _id_active "fstab.esp_entry" && emit_finding "fstab.esp_entry" "fstab" "warning" "skip" \
+            "fstab not found at $fstab" "" "{}" '{}'
+        return
+    fi
+
+    # ESP entry
+    if _id_active "fstab.esp_entry" && [[ -n "$DIAG_ESP_MOUNT" ]]; then
+        if grep -q "$DIAG_ESP_MOUNT" "$fstab" 2>/dev/null; then
+            local esp_line
+            esp_line=$(grep "$DIAG_ESP_MOUNT" "$fstab" | head -1)
+            if printf '%s' "$esp_line" | grep -q 'UUID='; then
+                emit_finding "fstab.esp_entry" "fstab" "info" "pass" \
+                    "ESP in fstab with UUID" "" "{}" '{}'
+            elif printf '%s' "$esp_line" | grep -q '^/dev/'; then
+                emit_finding "fstab.esp_uuid_form" "fstab" "warning" "warn" \
+                    "ESP fstab entry uses device path" \
+                    "Device paths may change after partition reshape; use UUID= instead." "{}" \
+                    "$(_remediation_json "fstab.esp_uuid_form" \
+                        "Rewrite ESP entry to UUID form" \
+                        "sudo lamboot-repair --fix-fstab")"
+            fi
+        else
+            emit_finding "fstab.esp_entry" "fstab" "warning" "fail" \
+                "ESP not in fstab" \
+                "$DIAG_ESP_MOUNT will not mount automatically on boot." "{}" \
+                "$(_remediation_json "fstab.esp_entry" \
+                    "Add ESP entry to fstab" \
+                    "sudo lamboot-repair --fix-fstab")"
+        fi
+    fi
+
+    # Root entry UUID form
+    if _id_active "fstab.root_uuid_form"; then
+        local root_line
+        root_line=$(grep -E '^\S+\s+/\s' "$fstab" 2>/dev/null | head -1 || true)
+        if [[ -n "$root_line" ]]; then
+            if printf '%s' "$root_line" | grep -qE 'UUID=|PARTUUID=|LABEL='; then
+                emit_finding "fstab.root_uuid_form" "fstab" "info" "pass" \
+                    "Root filesystem uses UUID/LABEL/PARTUUID" "" "{}" '{}'
+            elif printf '%s' "$root_line" | grep -q '^/dev/'; then
+                emit_finding "fstab.root_uuid_form" "fstab" "warning" "warn" \
+                    "Root uses device path" \
+                    "Dangerous when partitions change; convert to UUID=." "{}" \
+                    "$(_remediation_json "fstab.root_uuid_form" \
+                        "Convert root entry to UUID" \
+                        "sudo lamboot-repair --fix-fstab")"
+            fi
+        fi
+    fi
+
+    # Count /dev/ entries
+    if _id_active "fstab.dev_paths"; then
+        local dev_count
+        # grep -c always prints a count; || branch only used if grep errors out
+        # entirely (e.g., file missing), and must also produce a clean integer.
+        dev_count=$(grep -cE '^\s*/dev/sd[a-z]|^\s*/dev/nvme|^\s*/dev/hd[a-z]' "$fstab" 2>/dev/null)
+        [[ -z "$dev_count" ]] && dev_count=0
+        # Take only the first line in case something exotic added noise
+        dev_count=$(printf '%s' "$dev_count" | head -1 | tr -d ' ')
+        [[ "$dev_count" =~ ^[0-9]+$ ]] || dev_count=0
+        if [[ "$dev_count" -gt 0 ]]; then
+            emit_finding "fstab.dev_paths" "fstab" "warning" "warn" \
+                "$dev_count fstab entries use /dev/ paths" \
+                "Convert to UUID= for stability across partition changes." \
+                "{\"count\":${dev_count}}" \
+                "$(_remediation_json "fstab.dev_paths" \
+                    "Rewrite /dev/ references to UUID= form" \
+                    "sudo lamboot-repair --fix-fstab")"
+        fi
+    fi
+}
+
+# ── Category 10: vm ──────────────────────────────────────────────────────
+
+check_category_vm() {
+    _category_active "vm" || return 0
+
+    local virt
+    virt=$(command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt 2>/dev/null || printf 'none')
+
+    if _id_active "vm.type"; then
+        emit_finding "vm.type" "vm" "info" "pass" \
+            "Virtualization: $virt" "" \
+            "{\"type\":\"$(json_escape "$virt")\"}" '{}'
+    fi
+
+    # LamBoot NVRAM health (only if KVM/QEMU + LamBoot)
+    if [[ "$virt" =~ ^(kvm|qemu)$ ]] && [[ -d /sys/firmware/efi/efivars ]]; then
+        local state_var="/sys/firmware/efi/efivars/LamBootState-4c414d42-4f4f-5400-0000-000000000001"
+        if [[ -r "$state_var" ]]; then
+            local state counter
+            state=$(od -An -t u1 -j4 -N1 "$state_var" 2>/dev/null | tr -d ' ' || printf '0')
+            local counter_var="/sys/firmware/efi/efivars/LamBootCrashCount-4c414d42-4f4f-5400-0000-000000000001"
+            counter=0
+            [[ -r "$counter_var" ]] && counter=$(od -An -t u1 -j4 -N1 "$counter_var" 2>/dev/null | tr -d ' ' || printf '0')
+
+            local state_name
+            case "$state" in
+                0) state_name="Fresh" ;;
+                1) state_name="Booting" ;;
+                2) state_name="BootedOK" ;;
+                3) state_name="CrashLoop" ;;
+                *) state_name="Unknown" ;;
+            esac
+
+            if _id_active "vm.lamboot_state"; then
+                if [[ "$state" == "3" ]]; then
+                    emit_finding "vm.lamboot_state" "vm" "critical" "fail" \
+                        "LamBoot is in crash loop" \
+                        "NVRAM state: $state_name (counter=$counter)." \
+                        "{\"state\":\"$state_name\",\"counter\":$counter}" \
+                        "$(_remediation_json "vm.lamboot_state" \
+                            "Use lamboot-repair --offline to recover" \
+                            "sudo lamboot-repair --offline <disk>")"
+                elif [[ "$state" == "1" ]]; then
+                    emit_finding "vm.lamboot_state" "vm" "warning" "warn" \
+                        "LamBoot stuck in Booting state" \
+                        "Previous boot may not have completed (counter=$counter)." \
+                        "{\"state\":\"$state_name\",\"counter\":$counter}" '{}'
+                else
+                    emit_finding "vm.lamboot_state" "vm" "info" "pass" \
+                        "LamBoot health: $state_name" "" \
+                        "{\"state\":\"$state_name\",\"counter\":$counter}" '{}'
+                fi
+            fi
+
+            if _id_active "vm.lamboot_crash_counter" && [[ "$counter" -ge 2 ]]; then
+                emit_finding "vm.lamboot_crash_counter" "vm" "error" "fail" \
+                    "LamBoot crash counter is high" \
+                    "Counter value $counter indicates repeated boot failures." \
+                    "{\"counter\":$counter}" \
+                    "$(_remediation_json "vm.lamboot_crash_counter" \
+                        "Investigate and reset crash counter" \
+                        "sudo lamboot-repair --reset-counter")"
+            fi
+        fi
+    fi
+}
+
+# ── Category 11: lamboot ─────────────────────────────────────────────────
+
+check_category_lamboot() {
+    _category_active "lamboot" || return 0
+
+    # Only surface findings if LamBoot is detected
+    if [[ -z "$DIAG_ESP_MOUNT" ]] || [[ ! -f "${DIAG_ESP_MOUNT}/EFI/LamBoot/lambootx64.efi" ]]; then
+        verbose "LamBoot not installed; skipping LamBoot-specific checks"
+        return 0
+    fi
+
+    if _id_active "lamboot.mark_success"; then
+        if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled lamboot-mark-success.service >/dev/null 2>&1; then
+            emit_finding "lamboot.mark_success" "lamboot" "info" "pass" \
+                "lamboot-mark-success.service is enabled" "" "{}" '{}'
+        elif [[ -f /usr/lib/systemd/system/lamboot-mark-success.service ]]; then
+            emit_finding "lamboot.mark_success" "lamboot" "warning" "warn" \
+                "lamboot-mark-success.service installed but not enabled" \
+                "Enable to ensure crash-loop recovery works." "{}" \
+                "$(_remediation_json "lamboot.mark_success" \
+                    "Enable the mark-success service" \
+                    "sudo systemctl enable lamboot-mark-success.service")"
+        fi
+    fi
+
+    if _id_active "lamboot.kernel_install_plugin"; then
+        if [[ -f /usr/lib/kernel/install.d/90-lamboot.install ]]; then
+            emit_finding "lamboot.kernel_install_plugin" "lamboot" "info" "pass" \
+                "kernel-install plugin installed" "" "{}" '{}'
+        fi
+    fi
+
+    if _id_active "lamboot.boot_report"; then
+        local report="${DIAG_ESP_MOUNT}/EFI/LamBoot/reports/boot.json"
+        if [[ -f "$report" ]]; then
+            emit_finding "lamboot.boot_report" "lamboot" "info" "pass" \
+                "Boot report present" \
+                "Latest report at $report." \
+                "{\"path\":\"$(json_escape "$report")\"}" '{}'
+        fi
+    fi
+
+    if _id_active "lamboot.install_manifest"; then
+        local manifest="${DIAG_ESP_MOUNT}/EFI/LamBoot/.install-manifest"
+        if [[ -f "$manifest" ]]; then
+            emit_finding "lamboot.install_manifest" "lamboot" "info" "pass" \
+                "LamBoot install manifest present" "" "{}" '{}'
+        fi
+    fi
+
+    if _id_active "lamboot.inspect_available" && command -v lamboot-inspect >/dev/null 2>&1; then
+        emit_finding "lamboot.inspect_available" "lamboot" "info" "pass" \
+            "Run lamboot-inspect for LamBoot-specific deep diagnostic" "" "{}" \
+            "$(_remediation_json "lamboot.inspect_available" \
+                "LamBoot-specific deep inspection" \
+                "sudo lamboot-inspect")"
+    fi
+}
+
+# ── Main scan orchestration ──────────────────────────────────────────────
+
+run_scan() {
+    check_category_boot_mode
+    check_category_partition_table
+    check_category_esp
+    check_category_boot_entries
+    check_category_bootloader
+    check_category_kernel
+    check_category_bls
+    check_category_secure_boot
+    check_category_fstab
+    check_category_vm
+    check_category_lamboot
+}
+
+_human_print_findings() {
+    [[ $LAMBOOT_JSON -eq 1 ]] && return 0
+    [[ -z "$LAMBOOT_JSON_FINDINGS" ]] && return 0
+
+    local current_cat=""
+    while IFS= read -r finding; do
+        [[ -z "$finding" ]] && continue
+
+        local cat sev title msg
+        cat=$(printf '%s' "$finding" | grep -oE '"category":"[^"]*"' | head -1 | cut -d'"' -f4)
+        sev=$(printf '%s' "$finding" | grep -oE '"severity":"[^"]*"' | head -1 | cut -d'"' -f4)
+        title=$(printf '%s' "$finding" | grep -oE '"title":"[^"]*"' | head -1 | cut -d'"' -f4)
+        msg=$(printf '%s' "$finding" | grep -oE '"message":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+        # --quiet mode: suppress info findings
+        if [[ $LAMBOOT_QUIET -eq 1 ]] && [[ "$sev" == "info" ]]; then
+            continue
+        fi
+
+        if [[ "$cat" != "$current_cat" ]]; then
+            printf '\n%s%s%s\n' "$LAMBOOT_COLOR_INFO" "$cat:" "$LAMBOOT_COLOR_RESET"
+            current_cat="$cat"
+        fi
+
+        local marker="" color=""
+        case "$sev" in
+            critical|error) marker="✗"; color="$LAMBOOT_COLOR_ERROR" ;;
+            warning)        marker="⚠"; color="$LAMBOOT_COLOR_WARN" ;;
+            info)           marker="✓"; color="$LAMBOOT_COLOR_OK" ;;
+        esac
+        printf '  %s%s%s %s' "$color" "$marker" "$LAMBOOT_COLOR_RESET" "$title"
+        [[ -n "$msg" ]] && printf ' — %s' "$msg"
+        printf '\n'
+    done < <(printf '%s' "$LAMBOOT_JSON_FINDINGS" | sed 's/},{/}\n{/g')
+}
+
+# ── CLI ──────────────────────────────────────────────────────────────────
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        parse_common_flag "$1"
+        local rc=$?
+        case $rc in
+            1) shift; continue ;;
+            2) _register_subcommands; dispatch_help; exit 0 ;;
+            3) printf 'lamboot-diagnose %s (lamboot-tools %s)\n' \
+                "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
+            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            5) shift; OPT_DISK="$1"; shift; continue ;;
+            0) ;;
+        esac
+
+        case "$1" in
+            --esp)        OPT_ESP_OVERRIDE="${2:-}"; shift 2 ;;
+            --offline)    local disk="${2:-}"; shift 2
+                          [[ -z "$disk" ]] && die "--offline requires a disk path"
+                          offline_setup "$disk" ;;
+            --category)   OPT_CATEGORIES+=("${2:-}"); shift 2 ;;
+            --skip)       OPT_SKIP_CATEGORIES+=("${2:-}"); shift 2 ;;
+            --id)         OPT_FILTER_ID="${2:-}"; shift 2 ;;
+            --with-remediation) OPT_WITH_REMEDIATION=1; shift ;;
+            help)         _register_subcommands
+                          if [[ -n "${2:-}" ]]; then
+                              dispatch_help "$2"
+                          else
+                              dispatch_help
+                          fi
+                          exit 0 ;;
+            scan)         shift ;;
+            *)            die "unknown option: $1" ;;
+        esac
+    done
+}
+
+main() {
+    parse_args "$@"
+
+    [[ $LAMBOOT_JSON -eq 0 ]] && [[ $LAMBOOT_QUIET -eq 0 ]] && \
+        printf '%slamboot-diagnose%s %s\n\n' \
+            "$LAMBOOT_COLOR_INFO" "$LAMBOOT_COLOR_RESET" "$LAMBOOT_TOOL_VERSION" >&2
+
+    run_scan
+
+    # Determine exit code from findings
+    local exit_code=0
+    if [[ "$LAMBOOT_JSON_FINDINGS" == *'"severity":"critical"'* ]] || \
+       [[ "$LAMBOOT_JSON_FINDINGS" == *'"severity":"error"'* ]]; then
+        exit_code=2
+    fi
+
+    _human_print_findings
+    emit_json "$exit_code"
+
+    exit "$exit_code"
+}
+
+main "$@"

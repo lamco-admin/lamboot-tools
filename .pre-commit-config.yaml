@@ -1,0 +1,44 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: \.md$
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+        exclude: ^tests/fixtures/
+      - id: check-merge-conflict
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+
+  - repo: https://github.com/koalaman/shellcheck-precommit
+    rev: v0.10.0
+    hooks:
+      - id: shellcheck
+        args: ['--severity=warning', '--external-sources',
+               '--exclude=SC1091,SC2034,SC2317']
+
+  - repo: local
+    hooks:
+      - id: bash-syntax-check
+        name: bash -n syntax check
+        entry: bash -n
+        language: system
+        types: [shell]
+
+      - id: forbid-ai-attribution
+        name: forbid AI attribution in commits and code
+        entry: '(Co-Authored-By: Claude|Co-authored-by: Claude|Anthropic|Generated with .*Claude|🤖 Generated)'
+        language: pygrep
+        types: [text]
+        exclude: ^docs/.*\.md$
+
+      - id: forbid-placeholders
+        name: scan for placeholder markers
+        # XX dropped: collides with legitimate mktemp XXXXXX templates.
+        entry: '\b(YYYY|PLACEHOLDER|FIXME_BEFORE_RELEASE)\b'
+        language: pygrep
+        types: [text]
+        exclude: ^(docs/|CLAUDE\.md|\.pre-commit-config\.yaml|\.githooks/|scripts/verify-claims\.sh|scripts/release-rehearsal\.sh)

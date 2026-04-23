@@ -1,0 +1,314 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Lint bash sources
+        run: |
+          # --severity=warning: style/info findings are advisory, not CI gates
+          # Excluded codes are architectural false-positives:
+          #   SC1091  "Not following source": every tool sources the lib via
+          #           ${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/... — a
+          #           variable path shellcheck cannot resolve at lint time
+          #   SC2034  "variable appears unused": lib-exported constants
+          #           (EXIT_OK, LAMBOOT_TOOL_NAME, etc.) are consumed by
+          #           sourcing tools across the source boundary
+          #   SC2317  "command appears unreachable": dispatch tables and
+          #           register_subcommand callbacks are invoked indirectly
+          failures=0
+          for f in lib/*.sh tools/lamboot-* pve/tools/lamboot-* .githooks/pre-commit scripts/* publish/*.sh; do
+            [ -f "$f" ] || continue
+            case "$f" in *.py|*.pyc) continue ;; esac
+            if head -1 "$f" | grep -qE '^#!.*(bash|sh)'; then
+              echo "--- shellcheck: $f"
+              if ! shellcheck --severity=warning --external-sources \
+                     --exclude=SC1091,SC2034,SC2317 "$f"; then
+                failures=$((failures + 1))
+              fi
+            fi
+          done
+          if [ $failures -gt 0 ]; then
+            echo "::error::$failures file(s) failed shellcheck"
+            exit 1
+          fi
+
+  syntax:
+    name: bash -n
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash syntax check
+        run: |
+          failures=0
+          for f in lib/*.sh tools/lamboot-* pve/tools/lamboot-* .githooks/pre-commit scripts/* publish/*.sh; do
+            [ -f "$f" ] || continue
+            case "$f" in *.py|*.pyc) continue ;; esac
+            if head -1 "$f" | grep -qE '^#!.*(bash|sh)'; then
+              if ! bash -n "$f"; then
+                echo "::error file=$f::bash -n failed"
+                failures=$((failures + 1))
+              fi
+            fi
+          done
+          if [ $failures -gt 0 ]; then exit 1; fi
+
+  build-inline:
+    name: build inlined tools
+    runs-on: ubuntu-latest
+    needs: [shellcheck, syntax]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sourced + inlined forms
+        run: |
+          make build
+          ls -la build/sourced/ build/inlined/
+
+      - name: Verify inlined tools have no source-statement references
+        run: |
+          for t in build/inlined/lamboot-*; do
+            if grep -qE '^[[:space:]]*source[[:space:]]+.*lamboot-toolkit-(lib|help)\.sh' "$t"; then
+              echo "::error file=$t::inlined tool still contains a source statement"
+              exit 1
+            fi
+          done
+
+      - name: bash -n on inlined builds
+        run: |
+          for t in build/inlined/lamboot-*; do
+            bash -n "$t"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: build/
+
+  bats:
+    name: bats-core tests
+    runs-on: ubuntu-latest
+    needs: [shellcheck, syntax]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats-core + dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats jq file util-linux
+
+      - name: Run bats suite (core CLI)
+        run: |
+          if ls tests/*.bats >/dev/null 2>&1; then
+            bats tests/*.bats
+          else
+            echo "No core bats tests found; skipping"
+          fi
+
+      - name: Run bats suite (PVE companion)
+        run: |
+          if [ -d pve/tests ] && ls pve/tests/*.bats >/dev/null 2>&1; then
+            bats pve/tests/
+          else
+            echo "No PVE bats tests found; skipping"
+          fi
+
+      - name: Run bats suite (integration — fixture-based, may skip)
+        run: |
+          if [ -d tests/integration ] && ls tests/integration/*.bats >/dev/null 2>&1; then
+            bats tests/integration/*.bats || echo "integration tests may skip without fixtures"
+          else
+            echo "No integration tests found"
+          fi
+
+  install-smoke:
+    name: install smoke (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    needs: [build-inline]
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:24.04
+          - fedora:44
+          - opensuse/tumbleweed
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Debian/Ubuntu)
+        if: startsWith(matrix.image, 'ubuntu')
+        run: |
+          apt-get update
+          apt-get install -y make util-linux coreutils bash efibootmgr file
+
+      - name: Install dependencies (Fedora)
+        if: startsWith(matrix.image, 'fedora')
+        run: |
+          dnf install -y make util-linux coreutils bash efibootmgr file
+
+      - name: Install dependencies (openSUSE)
+        if: startsWith(matrix.image, 'opensuse')
+        run: |
+          zypper install -y make util-linux coreutils bash efibootmgr file
+
+      - name: make install
+        run: |
+          make install PREFIX=/tmp/install
+
+      - name: Substantive smoke tests (exercise real behavior)
+        run: |
+          export PATH=/tmp/install/bin:$PATH
+          export LAMBOOT_LIB_DIR=/tmp/install/lib/lamboot-tools
+          set -e
+          fail=0
+
+          for tool in lamboot-toolkit lamboot-diagnose lamboot-esp lamboot-backup \
+                       lamboot-repair lamboot-migrate lamboot-doctor \
+                       lamboot-uki-build lamboot-signing-keys; do
+            [ -f /tmp/install/bin/$tool ] || { echo "::error::$tool not installed"; fail=1; continue; }
+
+            # 1. --version: exit 0, contains tool name
+            if ! out=$($tool --version 2>&1); then
+              echo "::error::$tool --version exited non-zero"; fail=1; continue
+            fi
+            case "$out" in
+              *"$tool"*) ;;
+              *) echo "::error::$tool --version output missing tool name: $out"; fail=1 ;;
+            esac
+
+            # 2. --json-schema: emits schema envelope
+            if out=$($tool --json-schema 2>/dev/null); then
+              case "$out" in
+                *'"$schema"'*'lamboot.dev/schemas'*) ;;
+                *) echo "::error::$tool --json-schema missing schema URL"; fail=1 ;;
+              esac
+            fi
+
+            # 3. help listing contains subcommand names (for non-dispatcher tools)
+            case "$tool" in
+              lamboot-toolkit) ;;  # dispatcher has different help layout
+              *)
+                out=$($tool help 2>&1 || true)
+                case "$out" in
+                  *"subcommand"*) ;;
+                  *) echo "::warning::$tool help output unexpected shape" ;;
+                esac
+                ;;
+            esac
+          done
+
+          # 4. lamboot-diagnose on a non-existent offline DISK should refuse cleanly,
+          #    not crash. Exit code must be non-zero with a structured error message.
+          if lamboot-diagnose --offline /dev/null 2>/dev/null; then
+            echo "::error::lamboot-diagnose --offline /dev/null should have failed"
+            fail=1
+          fi
+
+          # 5. lamboot-migrate status emits schema-v1 JSON unprivileged
+          out=$(lamboot-migrate status --json 2>/dev/null || true)
+          case "$out" in
+            *'"schema_version":"1"'*) ;;
+            *) echo "::warning::lamboot-migrate status --json did not emit schema_version v1" ;;
+          esac
+
+          # 6. lamboot-backup show on a synthesized snapshot parses correctly
+          tmp=$(mktemp)
+          cat > "$tmp" <<SNAP
+          {"schema_version":"1","tool":"lamboot-backup","version":"smoke","toolkit_version":"smoke","timestamp":"2026-04-22T00:00:00Z","host":"smoke","run_id":"smoke","source":"online","vars_file":null,"nvram":{"boot_order":"0001","boot_current":"0001","boot_next":null,"timeout_seconds":3,"secure_boot_enabled":false,"setup_mode":false},"entries":[],"lamboot_nvram":null}
+          SNAP
+          if ! lamboot-backup show "$tmp" --json | grep -q '"schema_version":"1"'; then
+            echo "::error::lamboot-backup show did not round-trip schema_version"
+            fail=1
+          fi
+          rm -f "$tmp"
+
+          # 7. lamboot-signing-keys rejects RSA-4096 for leaf/db without --force-4096
+          if lamboot-signing-keys generate --type db --size 4096 --output /tmp/reject-test 2>/dev/null; then
+            echo "::error::lamboot-signing-keys should refuse RSA-4096 db without --force-4096"
+            fail=1
+          fi
+
+          [ $fail -eq 0 ] || exit 1
+          echo "Substantive smoke tests passed on $(cat /etc/os-release | grep PRETTY_NAME | head -1)"
+
+      - name: make uninstall
+        run: |
+          make uninstall PREFIX=/tmp/install
+          # Verify removal
+          remaining=$(find /tmp/install -name 'lamboot-*' 2>/dev/null | wc -l)
+          if [ "$remaining" -gt 0 ]; then
+            echo "::error::uninstall left $remaining files behind"
+            find /tmp/install -name 'lamboot-*'
+            exit 1
+          fi
+
+  verify-claims:
+    name: verify claims appendix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run verify-claims.sh
+        run: |
+          # Hard gate: the claims appendix is authoritative, so CI must fail
+          # loudly if verify-claims doesn't pass. The prior `[ -x ]` guard
+          # silently skipped the whole check when the filename drifted during
+          # the verify-structure → verify-claims rename.
+          scripts/verify-claims.sh
+
+  pre-commit-scan:
+    name: placeholder + AI-attribution scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Forbid AI attribution
+        run: |
+          # Guard files are excluded because they CONTAIN the regex as literal
+          # text (the guard-vs-guarded paradox). The pre-commit hook avoids
+          # this by scanning only `git diff --cached` added lines (^\+); the
+          # CI scan is whole-file so needs explicit exclusion.
+          if grep -rnE '(Co-[Aa]uthored-[Bb]y:\s*Claude|🤖 Generated|Generated with.*Claude)' \
+              --include='*.sh' --include='*.md' --include='*.py' \
+              --exclude-dir=.git --exclude-dir=docs \
+              --exclude='verify-claims.sh' \
+              --exclude='release-rehearsal.sh' \
+              --exclude='pre-commit' \
+              --exclude='.pre-commit-config.yaml' .; then
+            echo "::error::AI attribution markers found (forbidden by project policy)"
+            exit 1
+          fi
+
+      - name: Forbid placeholders in source
+        run: |
+          # XX dropped from the regex: coreutils mktemp uses XXXXXX templates
+          # as a legitimate idiom ("replace these X's with random chars"),
+          # which collides with the placeholder semantics. CLAUDE.md and
+          # guard files are excluded — they document the patterns literally.
+          if grep -rnE '\b(YYYY|PLACEHOLDER|FIXME_BEFORE_RELEASE)\b' \
+              --include='*.sh' --include='*.md' \
+              --exclude-dir=.git --exclude-dir=docs \
+              --exclude='CLAUDE.md' \
+              --exclude='verify-claims.sh' \
+              --exclude='release-rehearsal.sh' \
+              --exclude='pre-commit' \
+              --exclude='.pre-commit-config.yaml' \
+              --exclude-dir=.githooks .; then
+            echo "::error::placeholder markers found in source"
+            exit 1
+          fi

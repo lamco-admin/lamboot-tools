@@ -1,0 +1,79 @@
+#!/bin/bash
+# Pre-commit gate for lamboot-tools.
+#
+# Enforces the v0.2 ship gates locally before commit:
+#   1. shellcheck clean (severity >= style)
+#   2. bash -n syntax check on all changed .sh files
+#   3. No AI attribution markers in staged changes
+#   4. No placeholder markers (XX, YYYY, PLACEHOLDER) in staged source
+#
+# To activate: git config core.hooksPath .githooks
+
+set -uo pipefail
+
+readonly RED=$'\033[0;31m'
+readonly YELLOW=$'\033[0;33m'
+readonly GREEN=$'\033[0;32m'
+readonly RESET=$'\033[0m'
+
+fail() {
+    printf '%s[pre-commit fail]%s %s\n' "$RED" "$RESET" "$1" >&2
+}
+
+warn() {
+    printf '%s[pre-commit warn]%s %s\n' "$YELLOW" "$RESET" "$1" >&2
+}
+
+info() {
+    printf '%s[pre-commit ok]%s %s\n' "$GREEN" "$RESET" "$1" >&2
+}
+
+exit_code=0
+
+staged_sh=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(sh|bats)$|^(lib|tools)/[^/]+$' || true)
+
+if [[ -n "$staged_sh" ]]; then
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        [[ ! -f "$file" ]] && continue
+
+        if ! bash -n "$file" 2>&1; then
+            fail "bash -n failed: $file"
+            exit_code=1
+        fi
+
+        if command -v shellcheck >/dev/null 2>&1; then
+            # Mirrors .github/workflows/ci.yml shellcheck job:
+            # warnings+ only, excluding architectural false-positives
+            # (SC1091 variable source paths, SC2034 lib-exported constants,
+            # SC2317 indirect-invoke dispatch callbacks).
+            if ! shellcheck --severity=warning --external-sources \
+                   --exclude=SC1091,SC2034,SC2317 "$file"; then
+                fail "shellcheck failed: $file"
+                exit_code=1
+            fi
+        else
+            warn "shellcheck not installed; skipping lint on $file"
+        fi
+    done <<< "$staged_sh"
+fi
+
+staged_diff=$(git diff --cached)
+if echo "$staged_diff" | grep -qE 'Co-[Aa]uthored-[Bb]y:\s*Claude|🤖 Generated|Generated with.*Claude|Anthropic'; then
+    fail "AI attribution markers found in staged changes (forbidden by project policy)"
+    exit_code=1
+fi
+
+staged_non_docs=$(git diff --cached --name-only --diff-filter=ACM | grep -vE '^(docs/|\.githooks/|\.pre-commit)' || true)
+if [[ -n "$staged_non_docs" ]]; then
+    if git diff --cached -- $staged_non_docs | grep -qE '^\+.*\b(XX{1,}|YYYY|PLACEHOLDER|FIXME_BEFORE_RELEASE)\b'; then
+        fail "placeholder markers found in staged source (XX/YYYY/PLACEHOLDER)"
+        exit_code=1
+    fi
+fi
+
+if [[ $exit_code -eq 0 ]]; then
+    info "all pre-commit checks passed"
+fi
+
+exit $exit_code

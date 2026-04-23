@@ -1,0 +1,787 @@
+#!/bin/bash
+# lamboot-esp — EFI System Partition health + management
+#
+# Three subcommands: check, inventory, clean. Goes deep on the ESP layer;
+# complements lamboot-diagnose which covers the full boot chain.
+#
+# Governed by docs/SPEC-LAMBOOT-ESP.md.
+# Part of the lamboot-tools suite (SPEC-LAMBOOT-TOOLKIT-V1.md §3.1).
+
+# shellcheck source=../lib/lamboot-toolkit-lib.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
+# shellcheck source=../lib/lamboot-toolkit-help.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
+
+LAMBOOT_TOOL_NAME="lamboot-esp"
+LAMBOOT_TOOL_VERSION="0.2.0"
+
+readonly ESP_PARTTYPE_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+readonly DOC_BASE="https://lamboot.dev/tools/findings"
+
+OPT_SUBCOMMAND=""
+OPT_ESP_OVERRIDE=""
+OPT_APPLY=0
+OPT_KEEP_BACKUPS=0
+
+ESP_MOUNT=""
+ESP_DEV=""
+
+# ── Help registry ────────────────────────────────────────────────────────
+
+_register_subcommands() {
+    register_subcommand \
+        --name "check" \
+        --category "Diagnostics" \
+        --summary "Run ESP health checks" \
+        --syntax "lamboot-esp check [--esp PATH] [--offline DISK] [--json]" \
+        --example "sudo lamboot-esp check" \
+        --example "lamboot-esp check --json | jq .summary" \
+        --example "sudo lamboot-esp check --offline /dev/pve/vm-201-disk-1" \
+        --notes "Runs read-only health checks. Every finding at warning severity or above includes a remediation command pointing at a sibling toolkit tool." \
+        --offline-capable "true" \
+        --requires-root "false" \
+        --see-also "inventory, clean, lamboot-diagnose" \
+        --doc-url "https://lamboot.dev/tools/esp/check" \
+        --maturity "stable"
+
+    register_subcommand \
+        --name "inventory" \
+        --category "Diagnostics" \
+        --summary "Show structured ESP contents inventory" \
+        --syntax "lamboot-esp inventory [--esp PATH] [--offline DISK] [--json]" \
+        --example "lamboot-esp inventory" \
+        --example "lamboot-esp inventory --json | jq .findings" \
+        --notes "Enumerates bootloaders, UKIs, BLS entries, and directory sizes. Read-only." \
+        --offline-capable "true" \
+        --requires-root "false" \
+        --see-also "check, clean" \
+        --doc-url "https://lamboot.dev/tools/esp/inventory" \
+        --maturity "stable"
+
+    register_subcommand \
+        --name "clean" \
+        --category "Maintenance" \
+        --summary "Remove stale/orphaned files from the ESP (dry-run by default)" \
+        --syntax "lamboot-esp clean [--apply] [--keep-backups] [--esp PATH] [--offline DISK] [--json]" \
+        --arg "--apply:Actually remove files (default: preview only)" \
+        --arg "--keep-backups:Don't remove .bak files even if stale" \
+        --example "sudo lamboot-esp clean" \
+        --example "sudo lamboot-esp clean --apply" \
+        --example "sudo lamboot-esp clean --keep-backups --apply" \
+        --notes "Targets: macOS remnants (mach_kernel, System/), LamBoot backup files (*.lamboot-backup), interrupted-install temp files (*.lamboot-tmp.*). NEVER removes bootloader binaries, BLS entries, or UKIs." \
+        --offline-capable "true" \
+        --requires-root "true" \
+        --see-also "check, inventory" \
+        --doc-url "https://lamboot.dev/tools/esp/clean" \
+        --maturity "stable"
+}
+
+# ── Remediation helper ───────────────────────────────────────────────────
+
+_remediation_json() {
+    local id="$1" summary="$2" cmd="${3:-}"
+    local doc="${DOC_BASE}/${id//.//}"
+    local cmd_field="\"\""
+    [[ -n "$cmd" ]] && cmd_field="\"$(json_escape "$cmd")\""
+    printf '{"summary":"%s","command":%s,"doc_url":"%s"}' \
+        "$(json_escape "$summary")" "$cmd_field" "$doc"
+}
+
+# ── ESP detection ────────────────────────────────────────────────────────
+
+detect_esp_for_tool() {
+    if [[ -n "$OPT_ESP_OVERRIDE" ]]; then
+        ESP_MOUNT="$OPT_ESP_OVERRIDE"
+    else
+        ESP_MOUNT=$(detect_esp 2>/dev/null || true)
+    fi
+
+    if [[ -z "$ESP_MOUNT" ]]; then
+        emit_finding "esp.not_found" "esp" "critical" "fail" \
+            "No ESP detected" \
+            "Neither /boot/efi nor /efi is a vfat mountpoint; use --esp PATH to override or --offline DISK to operate on an unmounted disk." \
+            "{}" \
+            "$(_remediation_json "esp.not_found" \
+                "Create or mount an ESP" \
+                "sudo lamboot-migrate to-uefi")"
+        emit_json "$EXIT_PREREQUISITE"
+        exit "$EXIT_PREREQUISITE"
+    fi
+
+    ESP_DEV=$(findmnt -n -o SOURCE "$ESP_MOUNT" 2>/dev/null || true)
+    verbose "ESP mount: $ESP_MOUNT, device: $ESP_DEV"
+}
+
+# ── Subcommand: check ────────────────────────────────────────────────────
+
+check_partition_type_guid() {
+    [[ -z "$ESP_DEV" ]] && return 0
+    local parttype
+    parttype=$(lsblk -nro PARTTYPE "$ESP_DEV" 2>/dev/null | head -1 || true)
+    if [[ -n "$parttype" ]] && printf '%s' "$parttype" | grep -qi "$ESP_PARTTYPE_GUID"; then
+        emit_finding "esp.partition.type_guid" "esp_partition" "info" "pass" \
+            "Partition type GUID is correct (EF00)" "" \
+            "{\"guid\":\"$(json_escape "$parttype")\"}" '{}'
+    elif [[ -n "$parttype" ]]; then
+        emit_finding "esp.partition.type_guid" "esp_partition" "warning" "warn" \
+            "Partition type GUID is not standard ESP" \
+            "Expected $ESP_PARTTYPE_GUID; found $parttype." \
+            "{\"guid\":\"$(json_escape "$parttype")\"}" \
+            "$(_remediation_json "esp.partition.type_guid" \
+                "Set partition type to EF00 via sgdisk" \
+                "sudo sgdisk --typecode=<partnum>:EF00 <disk>")"
+    fi
+}
+
+check_partition_size() {
+    [[ -z "$ESP_DEV" ]] && return 0
+    local partsize
+    partsize=$(lsblk -nrbo SIZE "$ESP_DEV" 2>/dev/null | head -1 || true)
+    [[ -z "$partsize" ]] && return 0
+    local size_mb=$((partsize / 1024 / 1024))
+    local sev="info" stat="pass" msg="${size_mb} MB partition size"
+    if [[ "$size_mb" -lt 100 ]]; then
+        sev="warning"; stat="warn"
+        msg="ESP is only ${size_mb} MB (recommended: 256 MB+)"
+    fi
+    if [[ "$sev" == "info" ]]; then
+        emit_finding "esp.partition.size" "esp_partition" "info" "pass" \
+            "$msg" "" "{\"size_mb\":${size_mb}}" '{}'
+    else
+        emit_finding "esp.partition.size" "esp_partition" "$sev" "$stat" \
+            "$msg" \
+            "Small ESPs run out of space when multiple kernels or distro bootloaders coexist." \
+            "{\"size_mb\":${size_mb}}" \
+            "$(_remediation_json "esp.partition.size" \
+                "Resize ESP (destructive; back up first)" \
+                "sudo lamboot-migrate to-uefi --esp-size 512")"
+    fi
+}
+
+check_filesystem_type() {
+    local fstype
+    fstype=$(findmnt -n -o FSTYPE "$ESP_MOUNT" 2>/dev/null || true)
+    if [[ "$fstype" == "vfat" ]]; then
+        emit_finding "esp.filesystem.type" "esp_filesystem" "info" "pass" \
+            "Filesystem is vfat" "" "{\"fstype\":\"vfat\"}" '{}'
+    else
+        emit_finding "esp.filesystem.type" "esp_filesystem" "critical" "fail" \
+            "Filesystem is not vfat" \
+            "Found '$fstype'; UEFI requires FAT32." \
+            "{\"fstype\":\"$(json_escape "$fstype")\"}" \
+            "$(_remediation_json "esp.filesystem.type" \
+                "Reformat ESP as FAT32 (destructive — data loss)" \
+                "sudo lamboot-migrate to-uefi")"
+    fi
+}
+
+check_filesystem_integrity() {
+    command -v fsck.fat >/dev/null 2>&1 || {
+        verbose "fsck.fat not installed; skipping integrity check"
+        return 0
+    }
+    [[ -z "$ESP_DEV" ]] && return 0
+
+    if fsck.fat -n "$ESP_DEV" >/dev/null 2>&1; then
+        emit_finding "esp.filesystem.integrity" "esp_filesystem" "info" "pass" \
+            "Filesystem integrity is clean" \
+            "fsck.fat -n reported no issues." "{}" '{}'
+    else
+        emit_finding "esp.filesystem.integrity" "esp_filesystem" "warning" "warn" \
+            "Filesystem has issues" \
+            "fsck.fat -n found problems; unmount and run fsck.fat -a $ESP_DEV." \
+            "{\"device\":\"$(json_escape "$ESP_DEV")\"}" \
+            "$(_remediation_json "esp.filesystem.integrity" \
+                "Repair filesystem (unmount first)" \
+                "sudo umount $ESP_MOUNT && sudo fsck.fat -a $ESP_DEV")"
+    fi
+}
+
+check_filesystem_space() {
+    local avail_kb total_kb
+    avail_kb=$(df -k --output=avail "$ESP_MOUNT" 2>/dev/null | tail -1 | tr -d ' ' || true)
+    total_kb=$(df -k --output=size "$ESP_MOUNT" 2>/dev/null | tail -1 | tr -d ' ' || true)
+    [[ -z "$avail_kb" ]] && return 0
+    [[ -z "$total_kb" ]] && return 0
+    [[ "$total_kb" -le 0 ]] && return 0
+
+    local avail_mb=$((avail_kb / 1024))
+    local total_mb=$((total_kb / 1024))
+    local used_pct=$(( (total_kb - avail_kb) * 100 / total_kb ))
+    local free_pct=$((100 - used_pct))
+
+    local ctx="{\"free_mb\":${avail_mb},\"total_mb\":${total_mb},\"percent_free\":${free_pct}}"
+
+    if [[ "$free_pct" -lt 5 ]]; then
+        emit_finding "esp.filesystem.space" "esp_filesystem" "error" "fail" \
+            "ESP critically low on space" \
+            "Only ${avail_mb} MB free of ${total_mb} MB (${free_pct}% free)." \
+            "$ctx" \
+            "$(_remediation_json "esp.filesystem.space" \
+                "Remove stale files" \
+                "sudo lamboot-esp clean --apply")"
+    elif [[ "$free_pct" -lt 10 ]]; then
+        emit_finding "esp.filesystem.space" "esp_filesystem" "warning" "warn" \
+            "ESP low on space" \
+            "${avail_mb} MB free of ${total_mb} MB (${free_pct}% free)." \
+            "$ctx" \
+            "$(_remediation_json "esp.filesystem.space" \
+                "Preview stale files to remove" \
+                "sudo lamboot-esp clean")"
+    else
+        emit_finding "esp.filesystem.space" "esp_filesystem" "info" "pass" \
+            "ESP has ${free_pct}% free (${avail_mb}/${total_mb} MB)" "" \
+            "$ctx" '{}'
+    fi
+}
+
+check_mount_rw() {
+    local opts
+    opts=$(findmnt -n -o OPTIONS "$ESP_MOUNT" 2>/dev/null || true)
+    if printf '%s' "$opts" | grep -q '\brw\b'; then
+        emit_finding "esp.filesystem.mount_rw" "esp_filesystem" "info" "pass" \
+            "ESP mounted read-write" "" "{\"options\":\"$(json_escape "$opts")\"}" '{}'
+    else
+        emit_finding "esp.filesystem.mount_rw" "esp_filesystem" "warning" "warn" \
+            "ESP mounted read-only" \
+            "Cannot update bootloader or install new kernels until remounted rw." \
+            "{\"options\":\"$(json_escape "$opts")\"}" \
+            "$(_remediation_json "esp.filesystem.mount_rw" \
+                "Remount read-write" \
+                "sudo mount -o remount,rw $ESP_MOUNT")"
+    fi
+}
+
+check_fallback() {
+    local x64="${ESP_MOUNT}/EFI/BOOT/BOOTX64.EFI"
+    local x64_lower="${ESP_MOUNT}/EFI/BOOT/bootx64.efi"
+    if [[ -f "$x64" ]] || [[ -f "$x64_lower" ]]; then
+        local actual="$x64"
+        [[ ! -f "$x64" ]] && actual="$x64_lower"
+        local size_kb=$(( $(stat -c %s "$actual" 2>/dev/null || printf '0') / 1024 ))
+        emit_finding "esp.fallback.bootx64" "esp_fallback" "info" "pass" \
+            "x86_64 fallback loader present" \
+            "${actual} (${size_kb} KiB)" \
+            "{\"path\":\"$(json_escape "$actual")\",\"size_kb\":${size_kb}}" '{}'
+    else
+        emit_finding "esp.fallback.bootx64" "esp_fallback" "warning" "warn" \
+            "Fallback loader EFI/BOOT/BOOTX64.EFI missing" \
+            "Firmware will not boot from removable media without an explicit NVRAM entry." \
+            "{}" \
+            "$(_remediation_json "esp.fallback.bootx64" \
+                "Populate fallback via bootloader reinstall" \
+                "sudo lamboot-repair")"
+    fi
+
+    local aa64="${ESP_MOUNT}/EFI/BOOT/BOOTAA64.EFI"
+    if [[ -f "$aa64" ]] || [[ -f "${ESP_MOUNT}/EFI/BOOT/bootaa64.efi" ]]; then
+        emit_finding "esp.fallback.bootaa64" "esp_fallback" "info" "pass" \
+            "aarch64 fallback loader present" "" "{}" '{}'
+    fi
+}
+
+check_fstab_esp() {
+    local fstab=/etc/fstab
+    [[ $LAMBOOT_OFFLINE_ACTIVE -eq 1 ]] && [[ -n "$LAMBOOT_OFFLINE_ROOT" ]] && fstab="$LAMBOOT_OFFLINE_ROOT/etc/fstab"
+
+    [[ ! -f "$fstab" ]] && {
+        emit_finding "esp.fstab.present" "esp_fstab" "warning" "skip" \
+            "fstab not readable at $fstab" "" "{}" '{}'
+        return 0
+    }
+
+    # Debian installers leave a comment `# /boot/efi was on /dev/sda1 during
+    # installation` above the real entry. A naive grep picks up the comment
+    # first — skip comment/blank lines so we see the actual mount spec.
+    if grep -qvE '^[[:space:]]*(#|$)' "$fstab" 2>/dev/null \
+       && grep -vE '^[[:space:]]*(#|$)' "$fstab" | grep -q "$ESP_MOUNT"; then
+        local line
+        line=$(grep -vE '^[[:space:]]*(#|$)' "$fstab" | grep "$ESP_MOUNT" | head -1)
+        if printf '%s' "$line" | grep -q 'UUID='; then
+            emit_finding "esp.fstab.present" "esp_fstab" "info" "pass" \
+                "ESP in fstab with UUID" "" "{}" '{}'
+        elif printf '%s' "$line" | grep -qE '^\s*/dev/'; then
+            emit_finding "esp.fstab.uuid_form" "esp_fstab" "warning" "warn" \
+                "ESP fstab entry uses device path" \
+                "Device paths may change; use UUID= form for stability." "{}" \
+                "$(_remediation_json "esp.fstab.uuid_form" \
+                    "Rewrite ESP entry to UUID form" \
+                    "sudo lamboot-repair --fix-fstab")"
+        fi
+    else
+        emit_finding "esp.fstab.present" "esp_fstab" "warning" "fail" \
+            "ESP not in fstab" \
+            "$ESP_MOUNT will not mount automatically on boot." "{}" \
+            "$(_remediation_json "esp.fstab.present" \
+                "Add ESP entry to fstab" \
+                "sudo lamboot-repair --fix-fstab")"
+    fi
+
+    # Catch-all: every invocation of this function must produce an esp_fstab
+    # finding so downstream consumers (and tests) can rely on its presence.
+    if [[ "$LAMBOOT_JSON_FINDINGS" != *'"category":"esp_fstab"'* ]]; then
+        emit_finding "esp.fstab.unknown" "esp_fstab" "warning" "skip" \
+            "ESP fstab entry form unrecognized" \
+            "Found $ESP_MOUNT in $fstab but could not classify its mount spec." \
+            "{}" \
+            "$(_remediation_json "esp.fstab.unknown" \
+                "Inspect fstab manually" \
+                "grep $ESP_MOUNT $fstab")"
+    fi
+}
+
+scan_stale_files() {
+    local -a stale_items=()
+
+    [[ -f "${ESP_MOUNT}/mach_kernel" ]] && stale_items+=("${ESP_MOUNT}/mach_kernel")
+    [[ -d "${ESP_MOUNT}/System" ]] && stale_items+=("${ESP_MOUNT}/System")
+
+    while IFS= read -r -d '' f; do
+        stale_items+=("$f")
+    done < <(find "$ESP_MOUNT" -name "*.lamboot-backup" -print0 2>/dev/null)
+
+    while IFS= read -r -d '' f; do
+        stale_items+=("$f")
+    done < <(find "$ESP_MOUNT" -name "*.lamboot-tmp.*" -print0 2>/dev/null)
+
+    if [[ $OPT_KEEP_BACKUPS -eq 0 ]]; then
+        while IFS= read -r -d '' f; do
+            stale_items+=("$f")
+        done < <(find "$ESP_MOUNT" -name "*.bak" -print0 2>/dev/null)
+    fi
+
+    printf '%s\n' "${stale_items[@]+${stale_items[@]}}"
+}
+
+check_stale_files() {
+    local count=0
+    local categories=()
+
+    [[ -f "${ESP_MOUNT}/mach_kernel" ]] && {
+        count=$((count + 1))
+        categories+=("mach_kernel")
+        emit_finding "esp.stale.macos_remnants" "esp_stale" "warning" "warn" \
+            "macOS mach_kernel remnant on ESP" \
+            "Safe to remove; installed by macOS recovery media or dual-boot history." \
+            "{\"path\":\"${ESP_MOUNT}/mach_kernel\"}" \
+            "$(_remediation_json "esp.stale.macos_remnants" \
+                "Preview removal" \
+                "sudo lamboot-esp clean")"
+    }
+
+    [[ -d "${ESP_MOUNT}/System" ]] && {
+        count=$((count + 1))
+        categories+=("System_dir")
+        emit_finding "esp.stale.macos_remnants" "esp_stale" "warning" "warn" \
+            "macOS System/ directory remnant on ESP" \
+            "Safe to remove; installed by macOS recovery media." \
+            "{\"path\":\"${ESP_MOUNT}/System\"}" \
+            "$(_remediation_json "esp.stale.macos_remnants" \
+                "Preview removal" \
+                "sudo lamboot-esp clean")"
+    }
+
+    local bak_count
+    bak_count=$(find "$ESP_MOUNT" -name "*.lamboot-backup" 2>/dev/null | wc -l | tr -d ' ')
+    [[ -z "$bak_count" ]] && bak_count=0
+    if [[ "$bak_count" -gt 0 ]]; then
+        count=$((count + bak_count))
+        emit_finding "esp.stale.backup_files" "esp_stale" "warning" "warn" \
+            "$bak_count LamBoot backup file(s) on ESP" \
+            "Consume space without boot relevance." \
+            "{\"count\":${bak_count}}" \
+            "$(_remediation_json "esp.stale.backup_files" \
+                "Preview removal" \
+                "sudo lamboot-esp clean")"
+    fi
+
+    local tmp_count
+    tmp_count=$(find "$ESP_MOUNT" -name "*.lamboot-tmp.*" 2>/dev/null | wc -l | tr -d ' ')
+    [[ -z "$tmp_count" ]] && tmp_count=0
+    if [[ "$tmp_count" -gt 0 ]]; then
+        count=$((count + tmp_count))
+        emit_finding "esp.stale.interrupted_tmp" "esp_stale" "warning" "warn" \
+            "$tmp_count interrupted-install temp file(s)" \
+            "Remnants of atomic writes that failed mid-operation." \
+            "{\"count\":${tmp_count}}" \
+            "$(_remediation_json "esp.stale.interrupted_tmp" \
+                "Preview removal" \
+                "sudo lamboot-esp clean")"
+    fi
+
+    if [[ "$count" -eq 0 ]]; then
+        emit_finding "esp.stale.none" "esp_stale" "info" "pass" \
+            "No stale files detected" "" "{}" '{}'
+    fi
+}
+
+do_check() {
+    detect_esp_for_tool
+
+    info "Checking ESP at $ESP_MOUNT"
+
+    check_partition_type_guid
+    check_partition_size
+    check_filesystem_type
+    check_filesystem_integrity
+    check_filesystem_space
+    check_mount_rw
+    check_fallback
+    check_fstab_esp
+    check_stale_files
+
+    # Inventory summary findings
+    _inventory_bootloaders_summary
+}
+
+# ── Subcommand: inventory ────────────────────────────────────────────────
+
+_inventory_bootloaders_summary() {
+    local bl_count=0
+    local uki_count=0
+    local bls_count=0
+
+    # LamBoot
+    if [[ -f "${ESP_MOUNT}/EFI/LamBoot/lambootx64.efi" ]] || [[ -f "${ESP_MOUNT}/EFI/LamBoot/lambootaa64.efi" ]]; then
+        bl_count=$((bl_count + 1))
+    fi
+
+    # GRUB / shim
+    for d in "${ESP_MOUNT}/EFI/"*; do
+        [[ -d "$d" ]] || continue
+        local name
+        name=$(basename "$d")
+        case "$name" in
+            BOOT|boot|LamBoot|Linux|loader|tools) continue ;;
+        esac
+        if [[ -f "${d}/grubx64.efi" ]] || [[ -f "${d}/shimx64.efi" ]]; then
+            bl_count=$((bl_count + 1))
+        fi
+    done
+
+    # systemd-boot
+    [[ -f "${ESP_MOUNT}/EFI/systemd/systemd-bootx64.efi" ]] && bl_count=$((bl_count + 1))
+
+    # rEFInd
+    [[ -f "${ESP_MOUNT}/EFI/refind/refind_x64.efi" ]] && bl_count=$((bl_count + 1))
+
+    # UKIs
+    if [[ -d "${ESP_MOUNT}/EFI/Linux" ]]; then
+        while IFS= read -r uki; do
+            [[ -f "$uki" ]] && uki_count=$((uki_count + 1))
+        done < <(find "${ESP_MOUNT}/EFI/Linux" -maxdepth 1 -name "*.efi" 2>/dev/null)
+    fi
+
+    # BLS entries
+    for d in "${ESP_MOUNT}/loader/entries" "${ESP_MOUNT}/EFI/loader/entries"; do
+        [[ -d "$d" ]] || continue
+        while IFS= read -r conf; do
+            [[ -f "$conf" ]] && bls_count=$((bls_count + 1))
+        done < <(find "$d" -maxdepth 1 -name "*.conf" 2>/dev/null)
+    done
+
+    emit_finding "esp.inventory.bootloaders" "esp_inventory" "info" "pass" \
+        "$bl_count bootloader(s) detected" "" \
+        "{\"count\":${bl_count}}" '{}'
+
+    if [[ "$uki_count" -gt 0 ]]; then
+        emit_finding "esp.inventory.ukis" "esp_inventory" "info" "pass" \
+            "$uki_count UKI(s) in EFI/Linux/" "" \
+            "{\"count\":${uki_count}}" '{}'
+    fi
+
+    if [[ "$bls_count" -gt 0 ]]; then
+        emit_finding "esp.inventory.bls_entries" "esp_inventory" "info" "pass" \
+            "$bls_count BLS entry/entries" "" \
+            "{\"count\":${bls_count}}" '{}'
+    fi
+}
+
+_inventory_bootloaders_detailed() {
+    # Per-binary findings for each detected bootloader
+    _emit_bl_if_present "lamboot" "${ESP_MOUNT}/EFI/LamBoot/lambootx64.efi"
+
+    for d in "${ESP_MOUNT}/EFI/"*; do
+        [[ -d "$d" ]] || continue
+        local name
+        name=$(basename "$d")
+        case "$name" in
+            BOOT|boot|LamBoot|Linux|loader|tools) continue ;;
+        esac
+        _emit_bl_if_present "grub" "${d}/grubx64.efi"
+        _emit_bl_if_present "shim" "${d}/shimx64.efi"
+    done
+
+    _emit_bl_if_present "systemd-boot" "${ESP_MOUNT}/EFI/systemd/systemd-bootx64.efi"
+    _emit_bl_if_present "refind" "${ESP_MOUNT}/EFI/refind/refind_x64.efi"
+    _emit_bl_if_present "windows" "${ESP_MOUNT}/EFI/Microsoft/Boot/bootmgfw.efi"
+}
+
+_emit_bl_if_present() {
+    local name="$1" path="$2"
+    [[ -f "$path" ]] || return 0
+    local size_kb=$(( $(stat -c %s "$path" 2>/dev/null || printf '0') / 1024 ))
+    local distro=""
+    if [[ "$path" =~ /EFI/([^/]+)/ ]]; then
+        distro="${BASH_REMATCH[1]}"
+    fi
+    emit_finding "esp.inventory.bootloader.${name}" "esp_inventory" "info" "pass" \
+        "${name}${distro:+ (${distro})}: $(basename "$path") (${size_kb} KiB)" \
+        "Located at $path." \
+        "{\"name\":\"$(json_escape "$name")\",\"path\":\"$(json_escape "$path")\",\"size_kb\":${size_kb},\"distro\":\"$(json_escape "$distro")\"}" \
+        '{}'
+}
+
+do_inventory() {
+    detect_esp_for_tool
+
+    info "Inventory of $ESP_MOUNT"
+
+    # Total stats — avoid `|| printf '0'` anti-pattern; it appends under pipefail
+    local total_files total_bytes
+    total_files=$(find "$ESP_MOUNT" -type f 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$total_files" =~ ^[0-9]+$ ]] || total_files=0
+    total_bytes=$(du -sb "$ESP_MOUNT" 2>/dev/null | head -1 | cut -f1 || true)
+    [[ "$total_bytes" =~ ^[0-9]+$ ]] || total_bytes=0
+    local total_mb=$((total_bytes / 1024 / 1024))
+
+    # Zero-count + non-root likely means permission-restricted ESP mount
+    if [[ "$total_files" -eq 0 ]] && [[ $EUID -ne 0 ]]; then
+        emit_finding "esp.inventory.totals" "esp_inventory" "warning" "skip" \
+            "ESP contents not readable as current user" \
+            "Re-run with sudo to enumerate files (ESP usually mounts with umask=0077)." \
+            "{\"files\":0,\"bytes\":0}" \
+            "$(_remediation_json "esp.inventory.totals" \
+                "Re-run inventory as root" \
+                "sudo lamboot-esp inventory")"
+    else
+        emit_finding "esp.inventory.totals" "esp_inventory" "info" "pass" \
+            "$total_files files, ${total_mb} MB total" "" \
+            "{\"files\":${total_files},\"bytes\":${total_bytes}}" '{}'
+    fi
+
+    # Device + partition identity
+    local part_uuid=""
+    [[ -n "$ESP_DEV" ]] && part_uuid=$(blkid -s UUID -o value "$ESP_DEV" 2>/dev/null || true)
+    emit_finding "esp.inventory.identity" "esp_inventory" "info" "pass" \
+        "ESP device: ${ESP_DEV:-unknown}" \
+        "Filesystem UUID: ${part_uuid:-unknown}" \
+        "{\"device\":\"$(json_escape "${ESP_DEV:-}")\",\"uuid\":\"$(json_escape "$part_uuid")\"}" \
+        '{}'
+
+    _inventory_bootloaders_detailed
+    _inventory_bootloaders_summary
+
+    # Directory sizes — same defensive parsing as above
+    local dir_ctx=""
+    for d in "${ESP_MOUNT}/EFI/"*; do
+        [[ -d "$d" ]] || continue
+        local dsize
+        dsize=$(du -sb "$d" 2>/dev/null | head -1 | cut -f1 || true)
+        [[ "$dsize" =~ ^[0-9]+$ ]] || dsize=0
+        local dname
+        dname=$(basename "$d")
+        dir_ctx="${dir_ctx:+${dir_ctx},}{\"name\":\"$(json_escape "$dname")\",\"bytes\":${dsize}}"
+    done
+    [[ -n "$dir_ctx" ]] && emit_finding "esp.inventory.directory_sizes" "esp_inventory" "info" "pass" \
+        "Top-level EFI/ subdirectories enumerated" "" \
+        "{\"directories\":[${dir_ctx}]}" '{}'
+}
+
+# ── Subcommand: clean ────────────────────────────────────────────────────
+
+do_clean() {
+    [[ $OPT_APPLY -eq 1 ]] && require_root
+
+    detect_esp_for_tool
+
+    local stale_list
+    stale_list=$(scan_stale_files)
+
+    if [[ -z "$stale_list" ]]; then
+        emit_finding "esp.clean.no_stale" "esp_clean" "info" "pass" \
+            "No stale files to remove" "" "{}" '{}'
+        info "No stale files on ESP."
+        emit_json "$EXIT_NOOP"
+        exit "$EXIT_NOOP"
+    fi
+
+    local count
+    count=$(printf '%s\n' "$stale_list" | grep -c . 2>/dev/null || true)
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+
+    if [[ $OPT_APPLY -eq 0 ]]; then
+        # Dry run
+        emit_finding "esp.clean.preview" "esp_clean" "info" "pass" \
+            "$count stale file(s) would be removed" \
+            "Pass --apply to actually remove. Files listed in context.files." \
+            "{\"count\":${count},\"files\":[$(printf '%s' "$stale_list" | awk 'NR>1{printf ","} {printf "\"%s\"", $0}' | tr -d '\n')]}" \
+            "$(_remediation_json "esp.clean.preview" \
+                "Apply the cleanup" \
+                "sudo lamboot-esp clean --apply")"
+        info "$count stale file(s) identified — run with --apply to remove"
+        emit_json "$EXIT_OK"
+        exit "$EXIT_OK"
+    fi
+
+    # Apply path
+    info "About to remove $count stale file(s) from $ESP_MOUNT:"
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        printf '    %s\n' "$f" >&2
+    done <<< "$stale_list"
+
+    if ! confirm "REMOVE STALE FILES" "yes"; then
+        record_action "esp.clean.aborted" "$ESP_MOUNT" "abort" "false" "{}" "null"
+        emit_json "$EXIT_ABORT"
+        exit "$EXIT_ABORT"
+    fi
+
+    local removed=0
+    local failures=0
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+
+        # Safety: never remove a file that's inside an active bootloader directory
+        case "$f" in
+            "${ESP_MOUNT}/EFI/LamBoot/lambootx64.efi" \
+            | "${ESP_MOUNT}/EFI/LamBoot/lambootaa64.efi" \
+            | "${ESP_MOUNT}/EFI/Linux/"*.efi \
+            | "${ESP_MOUNT}/loader/entries/"*.conf \
+            | "${ESP_MOUNT}/EFI/BOOT/"*)
+                warn "refusing to remove boot-critical file: $f"
+                continue
+                ;;
+        esac
+
+        if [[ -d "$f" ]]; then
+            if lamboot_run rm -rf "$f"; then
+                record_action "esp.clean.remove_dir" "$f" "ok" "false" '{}' "null"
+                removed=$((removed + 1))
+            else
+                record_action "esp.clean.remove_dir" "$f" "fail" "false" '{}' "null"
+                failures=$((failures + 1))
+            fi
+        else
+            if lamboot_run rm -f "$f"; then
+                record_action "esp.clean.remove_file" "$f" "ok" "false" '{}' "null"
+                removed=$((removed + 1))
+            else
+                record_action "esp.clean.remove_file" "$f" "fail" "false" '{}' "null"
+                failures=$((failures + 1))
+            fi
+        fi
+    done <<< "$stale_list"
+
+    local exit_code=0
+    [[ $failures -gt 0 ]] && exit_code=2
+
+    emit_finding "esp.clean.applied" "esp_clean" "info" "pass" \
+        "$removed file(s) removed, $failures failure(s)" "" \
+        "{\"removed\":${removed},\"failures\":${failures}}" '{}'
+
+    success "Removed $removed stale file(s)"
+    emit_json "$exit_code"
+    exit "$exit_code"
+}
+
+# ── CLI ──────────────────────────────────────────────────────────────────
+
+parse_args() {
+    local positional=()
+    while [[ $# -gt 0 ]]; do
+        parse_common_flag "$1"
+        local rc=$?
+        case $rc in
+            1) shift; continue ;;
+            2) _register_subcommands; dispatch_help; exit 0 ;;
+            3) printf 'lamboot-esp %s (lamboot-tools %s)\n' \
+                "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
+            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            5) shift
+               [[ $# -gt 0 ]] || die "--offline requires a disk path"
+               offline_setup "$1"
+               shift
+               continue ;;
+            0) ;;
+        esac
+
+        case "$1" in
+            --esp)           OPT_ESP_OVERRIDE="${2:-}"; shift 2 ;;
+            --apply)         OPT_APPLY=1; shift ;;
+            --keep-backups)  OPT_KEEP_BACKUPS=1; shift ;;
+            check|inventory|clean|help)
+                             if [[ -z "$OPT_SUBCOMMAND" ]]; then
+                                 OPT_SUBCOMMAND="$1"
+                             else
+                                 positional+=("$1")
+                             fi
+                             shift ;;
+            *)               positional+=("$1"); shift ;;
+        esac
+    done
+
+    if [[ "$OPT_SUBCOMMAND" == "help" ]]; then
+        _register_subcommands
+        if [[ ${#positional[@]} -gt 0 ]]; then
+            dispatch_help "${positional[0]}"
+        else
+            dispatch_help
+        fi
+        exit 0
+    fi
+
+    # If the first positional isn't a recognized subcommand, it's a typo —
+    # surface it rather than silently defaulting to `check`.
+    if [[ -z "$OPT_SUBCOMMAND" ]] && [[ ${#positional[@]} -gt 0 ]]; then
+        die "unknown subcommand: ${positional[0]}"
+    fi
+}
+
+main() {
+    parse_args "$@"
+
+    [[ -z "$OPT_SUBCOMMAND" ]] && OPT_SUBCOMMAND="check"
+
+    case "$OPT_SUBCOMMAND" in
+        check)     do_check ;;
+        inventory) do_inventory ;;
+        clean)     do_clean ;;
+        *)         die "unknown subcommand: $OPT_SUBCOMMAND" ;;
+    esac
+
+    # Exit code from finding severities
+    local exit_code=0
+    if [[ "$LAMBOOT_JSON_FINDINGS" == *'"severity":"critical"'* ]] || \
+       [[ "$LAMBOOT_JSON_FINDINGS" == *'"severity":"error"'* ]]; then
+        exit_code=2
+    fi
+
+    # Human-readable output if not --json
+    if [[ $LAMBOOT_JSON -eq 0 ]] && [[ -n "$LAMBOOT_JSON_FINDINGS" ]]; then
+        printf '\n' >&2
+        while IFS= read -r finding; do
+            [[ -z "$finding" ]] && continue
+            local sev title msg
+            sev=$(printf '%s' "$finding" | grep -oE '"severity":"[^"]*"' | head -1 | cut -d'"' -f4)
+            title=$(printf '%s' "$finding" | grep -oE '"title":"[^"]*"' | head -1 | cut -d'"' -f4)
+            msg=$(printf '%s' "$finding" | grep -oE '"message":"[^"]*"' | head -1 | cut -d'"' -f4)
+            [[ $LAMBOOT_QUIET -eq 1 ]] && [[ "$sev" == "info" ]] && continue
+            local marker color
+            case "$sev" in
+                critical|error) marker="✗"; color="$LAMBOOT_COLOR_ERROR" ;;
+                warning)        marker="⚠"; color="$LAMBOOT_COLOR_WARN" ;;
+                info)           marker="✓"; color="$LAMBOOT_COLOR_OK" ;;
+                *)              marker="?"; color="" ;;
+            esac
+            printf '  %s%s%s %s' "$color" "$marker" "$LAMBOOT_COLOR_RESET" "$title" >&2
+            [[ -n "$msg" ]] && printf ' — %s' "$msg" >&2
+            printf '\n' >&2
+        done < <(printf '%s' "$LAMBOOT_JSON_FINDINGS" | sed 's/},{/}\n{/g')
+    fi
+
+    emit_json "$exit_code"
+    exit "$exit_code"
+}
+
+main "$@"

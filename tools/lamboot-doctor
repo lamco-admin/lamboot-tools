@@ -1,0 +1,644 @@
+#!/bin/bash
+# lamboot-doctor — guided diagnose → repair → verify wrapper
+#
+# The "it just works" entry point. Orchestrates sibling tools per a
+# conservative default-action policy matrix. Users type sudo ONCE.
+#
+# Governed by docs/SPEC-LAMBOOT-DOCTOR.md.
+# Part of the lamboot-tools suite (SPEC-LAMBOOT-TOOLKIT-V1.md §6.7).
+
+# shellcheck source=../lib/lamboot-toolkit-lib.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
+# shellcheck source=../lib/lamboot-toolkit-help.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
+
+LAMBOOT_TOOL_NAME="lamboot-doctor"
+LAMBOOT_TOOL_VERSION="0.2.0"
+
+readonly DOC_BASE="https://lamboot.dev/tools/findings"
+readonly STATE_DIR="/var/lib/lamboot-doctor"
+
+OPT_NO_REPAIR=0
+OPT_NO_CLEAN=0
+OPT_RISK_LIMIT="moderate"
+OPT_RESUME_ID=""
+OPT_KEEP_RESUME=0
+
+# Tallies
+DOCTOR_APPLIED=0
+DOCTOR_FAILED=0
+DOCTOR_SKIPPED=0
+
+# Plan steps (parallel arrays)
+PLAN_FINDING_IDS=()
+PLAN_SEVERITIES=()
+PLAN_ACTIONS=()  # e.g. "lamboot-repair --auto" or "lamboot-esp clean"
+PLAN_POLICIES=() # "confirm" | "auto" | "manual" | "skip"
+
+# ── Help registry ────────────────────────────────────────────────────────
+
+_register_subcommands() {
+    register_subcommand \
+        --name "check" \
+        --category "Diagnostics" \
+        --summary "Guided boot health check + repair (default action)" \
+        --syntax "lamboot-doctor [--auto] [--risk-limit LEVEL] [--no-repair] [--no-clean] [--offline DISK] [--json]" \
+        --arg "--auto:Non-interactive; still confirms typed-yes for critical findings" \
+        --arg "--risk-limit LEVEL:safe|moderate|destructive (default: moderate)" \
+        --arg "--no-repair:Diagnose + show plan; don't invoke repair" \
+        --arg "--no-clean:Skip ESP clean actions even if they would apply" \
+        --arg "--offline DISK:Operate against a disk image; propagates to diagnose/repair/esp/backup" \
+        --example "sudo lamboot-doctor" \
+        --example "lamboot-doctor --no-repair" \
+        --example "sudo lamboot-doctor --auto" \
+        --example "lamboot-doctor --offline /dev/pve/vm-201-disk-1 --no-repair" \
+        --example "lamboot-doctor --json | jq .context.plan" \
+        --notes "Chains lamboot-diagnose → policy matrix → lamboot-repair / lamboot-esp clean. Never invokes lamboot-migrate automatically (always user-initiated). Sudo escalation happens at most once per run. Offline mode propagates the --offline DISK flag to every sub-tool invocation; the disk is attached once by diagnose, findings guide offline-safe repairs, and teardown happens automatically at exit." \
+        --offline-capable "true" \
+        --requires-root "false" \
+        --see-also "lamboot-diagnose, lamboot-repair, lamboot-esp, lamboot-migrate" \
+        --doc-url "https://lamboot.dev/tools/doctor" \
+        --maturity "beta"
+}
+
+# ── Remediation helper ───────────────────────────────────────────────────
+
+_remediation_json() {
+    local id="$1" summary="$2" cmd="${3:-}"
+    local doc="${DOC_BASE}/${id//.//}"
+    local cmd_field="\"\""
+    [[ -n "$cmd" ]] && cmd_field="\"$(json_escape "$cmd")\""
+    printf '{"summary":"%s","command":%s,"doc_url":"%s"}' \
+        "$(json_escape "$summary")" "$cmd_field" "$doc"
+}
+
+# ── Sibling tool resolution ──────────────────────────────────────────────
+
+_find_sibling() {
+    local tool="$1"
+
+    if command -v "$tool" >/dev/null 2>&1; then
+        command -v "$tool"
+        return 0
+    fi
+
+    # Dev-tree fallback: same directory as this tool
+    local script_dir
+    script_dir=$(cd "$(dirname "$0")" && pwd)
+    if [[ -x "${script_dir}/${tool}" ]]; then
+        printf '%s' "${script_dir}/${tool}"
+        return 0
+    fi
+
+    return 1
+}
+
+require_siblings() {
+    local missing=()
+    for tool in lamboot-diagnose lamboot-repair lamboot-esp; do
+        _find_sibling "$tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die_prerequisite "sibling tools not found: ${missing[*]}; install the lamboot-tools package"
+    fi
+}
+
+# ── Phase: run diagnose ──────────────────────────────────────────────────
+
+run_diagnose() {
+    local diagnose_bin
+    diagnose_bin=$(_find_sibling lamboot-diagnose) || die_prerequisite "lamboot-diagnose not found"
+
+    local output
+    # Preserve LAMBOOT_LIB_DIR across fork when running in dev tree.
+    # Propagate --offline DISK if the user supplied one; each sub-tool invocation
+    # runs its own offline_setup/teardown cycle against the same disk (readonly
+    # mounts, so concurrent attachment is safe across serial sub-tool calls).
+    if [[ -n "$LAMBOOT_OFFLINE_DISK" ]]; then
+        output=$(LAMBOOT_LIB_DIR="${LAMBOOT_LIB_DIR:-}" "$diagnose_bin" \
+                    --offline "$LAMBOOT_OFFLINE_DISK" --json 2>/dev/null || true)
+    else
+        output=$(LAMBOOT_LIB_DIR="${LAMBOOT_LIB_DIR:-}" "$diagnose_bin" --json 2>/dev/null || true)
+    fi
+
+    if [[ -z "$output" ]]; then
+        die "lamboot-diagnose produced no output"
+    fi
+
+    printf '%s' "$output"
+}
+
+# ── Plan: translate findings into actions per policy matrix ──────────────
+
+_severity_of() {
+    printf '%s' "$1" | grep -oE '"severity":"[^"]*"' | head -1 | cut -d'"' -f4
+}
+
+_id_of() {
+    printf '%s' "$1" | grep -oE '"id":"[^"]*"' | head -1 | cut -d'"' -f4
+}
+
+_title_of() {
+    printf '%s' "$1" | grep -oE '"title":"[^"]*"' | head -1 | cut -d'"' -f4
+}
+
+_remediation_command_of() {
+    printf '%s' "$1" | grep -oE '"remediation":\{[^}]*\}' | head -1 \
+        | grep -oE '"command":"[^"]*"' | head -1 | cut -d'"' -f4
+}
+
+build_plan_from_findings() {
+    local findings_blob="$1"
+
+    # Split into individual finding objects. They're comma-joined; replace },{ with }\n{
+    local split
+    split=$(printf '%s' "$findings_blob" | sed 's/},{/}\n{/g')
+
+    while IFS= read -r finding; do
+        [[ -z "$finding" ]] && continue
+
+        local id sev title cmd
+        id=$(_id_of "$finding")
+        sev=$(_severity_of "$finding")
+        title=$(_title_of "$finding")
+        cmd=$(_remediation_command_of "$finding")
+
+        [[ -z "$id" ]] && continue
+
+        # Info severity: not surfaced
+        [[ "$sev" == "info" ]] && continue
+
+        # Default policy per matrix (§3)
+        local policy="skip" action=""
+
+        case "$sev" in
+            critical)
+                policy="confirm"
+                ;;
+            error)
+                if [[ $LAMBOOT_AUTO -eq 1 ]]; then
+                    policy="auto"
+                else
+                    policy="confirm"
+                fi
+                ;;
+            warning)
+                policy="manual"
+                ;;
+        esac
+
+        # Exception: migrate recommendations are never auto-invoked
+        if [[ "$cmd" == *"lamboot-migrate"* ]]; then
+            policy="manual"
+        fi
+
+        # Exception: partition_table.type is manual regardless
+        if [[ "$id" == "partition_table.type" ]]; then
+            policy="manual"
+        fi
+
+        # Exception: esp.stale.* needs --auto AND below-10% space to auto-apply
+        if [[ "$id" == esp.stale.* ]] && [[ $OPT_NO_CLEAN -eq 1 ]]; then
+            policy="skip"
+        fi
+
+        # Map the remediation command to a safe sibling invocation
+        action=$(_map_action_from_command "$cmd" "$id")
+
+        # If we can't map it, downgrade to manual (print only)
+        if [[ -z "$action" ]]; then
+            policy="manual"
+        fi
+
+        # --no-repair: downgrade every would-be-executed step to manual
+        if [[ $OPT_NO_REPAIR -eq 1 ]]; then
+            [[ "$policy" == "auto" ]] || [[ "$policy" == "confirm" ]] && policy="manual"
+        fi
+
+        PLAN_FINDING_IDS+=("$id")
+        PLAN_SEVERITIES+=("$sev")
+        PLAN_ACTIONS+=("$action")
+        PLAN_POLICIES+=("$policy")
+    done <<< "$split"
+}
+
+# Translate a remediation.command string into a doctor-safe sibling invocation.
+# Returns the command to run, or empty if we can't or won't run it.
+_map_action_from_command() {
+    local cmd="$1"
+    local id="$2"
+
+    # Strip leading "sudo " if present
+    cmd="${cmd#sudo }"
+
+    # Propagate --offline DISK to any sub-tool invocation we generate.
+    # esp clean is suppressed entirely in offline mode — the action is unsafe
+    # without live NVRAM sync and the stale-file detector needs runtime context.
+    local offline_suffix=""
+    if [[ -n "$LAMBOOT_OFFLINE_DISK" ]]; then
+        offline_suffix=" --offline $LAMBOOT_OFFLINE_DISK"
+    fi
+
+    case "$cmd" in
+        "")
+            printf ''
+            ;;
+        "lamboot-repair --fix-fstab"*)
+            printf 'lamboot-repair --fix-fstab --auto --yes%s' "$offline_suffix"
+            ;;
+        "lamboot-repair --auto"*|"lamboot-repair "*)
+            printf 'lamboot-repair --auto --yes%s' "$offline_suffix"
+            ;;
+        "lamboot-esp clean --apply"*)
+            # Skip ESP clean in offline mode — would need live bootloader-active
+            # detection we deliberately don't trust from an offline snapshot.
+            [[ -n "$LAMBOOT_OFFLINE_DISK" ]] && { printf ''; return; }
+            printf 'lamboot-esp clean --apply --yes'
+            ;;
+        "lamboot-esp clean --dry-run"|"lamboot-esp clean"*)
+            [[ -n "$LAMBOOT_OFFLINE_DISK" ]] && { printf ''; return; }
+            # Preview-only unless in --auto mode with full ESP
+            if [[ $LAMBOOT_AUTO -eq 1 ]] && _esp_is_full; then
+                printf 'lamboot-esp clean --apply --yes'
+            else
+                printf ''
+            fi
+            ;;
+        "lamboot-migrate"*)
+            printf ''
+            ;;
+        "lamboot-esp repair"*)
+            printf 'lamboot-repair --auto --yes%s' "$offline_suffix"
+            ;;
+        *)
+            printf ''
+            ;;
+    esac
+}
+
+_esp_is_full() {
+    local esp
+    esp=$(detect_esp 2>/dev/null || true)
+    [[ -z "$esp" ]] && return 1
+    local avail_kb total_kb
+    avail_kb=$(df -k --output=avail "$esp" 2>/dev/null | tail -1 | tr -d ' ' || true)
+    total_kb=$(df -k --output=size "$esp" 2>/dev/null | tail -1 | tr -d ' ' || true)
+    [[ -z "$avail_kb" ]] && return 1
+    [[ -z "$total_kb" ]] && return 1
+    [[ "$total_kb" -le 0 ]] && return 1
+    local free_pct=$((avail_kb * 100 / total_kb))
+    [[ "$free_pct" -lt 10 ]]
+}
+
+# ── Show plan ────────────────────────────────────────────────────────────
+
+show_plan() {
+    local count=${#PLAN_FINDING_IDS[@]}
+    if [[ $count -eq 0 ]]; then
+        info "No findings require action."
+        return 0
+    fi
+
+    printf '\nFound %d issue%s:\n\n' "$count" "$([[ $count -ne 1 ]] && printf 's' || true)" >&2
+
+    local i
+    for i in "${!PLAN_FINDING_IDS[@]}"; do
+        local sev="${PLAN_SEVERITIES[$i]}"
+        local id="${PLAN_FINDING_IDS[$i]}"
+        local action="${PLAN_ACTIONS[$i]}"
+        local policy="${PLAN_POLICIES[$i]}"
+
+        local sev_color="" marker=""
+        case "$sev" in
+            critical) sev_color="$LAMBOOT_COLOR_ERROR"; marker="!" ;;
+            error)    sev_color="$LAMBOOT_COLOR_ERROR"; marker="X" ;;
+            warning)  sev_color="$LAMBOOT_COLOR_WARN";  marker="?" ;;
+        esac
+
+        printf '  %s[%s]%s %s\n' "$sev_color" "$sev" "$LAMBOOT_COLOR_RESET" "$id" >&2
+        case "$policy" in
+            confirm)
+                printf '      Action: %s\n      Policy: confirm required (%s severity)\n' \
+                    "$action" "$sev" >&2
+                ;;
+            auto)
+                printf '      Action: %s\n      Policy: auto-apply (--auto mode)\n' \
+                    "$action" >&2
+                ;;
+            manual)
+                printf '      Suggestion: (run manually) %s\n      Policy: %s — user action\n' \
+                    "${action:-see remediation URL}" "$sev" >&2
+                ;;
+            skip)
+                printf '      Skipped by policy or --no-clean/--no-repair.\n' >&2
+                ;;
+        esac
+        printf '\n' >&2
+    done
+}
+
+# ── Check if plan requires root ──────────────────────────────────────────
+
+plan_needs_root() {
+    local i
+    for i in "${!PLAN_POLICIES[@]}"; do
+        local p="${PLAN_POLICIES[$i]}"
+        if [[ "$p" == "auto" ]] || [[ "$p" == "confirm" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ── Escalation pattern ───────────────────────────────────────────────────
+
+maybe_escalate() {
+    [[ $EUID -eq 0 ]] && return 0
+    [[ -n "$OPT_RESUME_ID" ]] && return 0  # already resumed
+    plan_needs_root || return 0
+
+    info "Plan requires root — re-executing under sudo..."
+
+    [[ -n "$LAMBOOT_RUN_ID" ]] || generate_run_id
+
+    # Save diagnostic output so resumed instance doesn't re-scan
+    mkdir -p "$STATE_DIR" 2>/dev/null || {
+        # Fallback if we can't create /var/lib/lamboot-doctor/ as non-root
+        warn "cannot create $STATE_DIR; re-diagnose will run after sudo"
+    }
+
+    # Drop the diagnostic JSON into a tmp file if possible
+    # (the sudo process will re-run diagnose if the state file is missing)
+    local state_file="$STATE_DIR/${LAMBOOT_RUN_ID}.json"
+    if [[ -d "$STATE_DIR" ]] && [[ -w "$STATE_DIR" ]]; then
+        printf '%s' "${CACHED_DIAGNOSE_OUTPUT:-}" > "$state_file" 2>/dev/null || true
+    fi
+
+    # Re-exec under sudo with --doctor-resume
+    exec sudo --preserve-env=LAMBOOT_LIB_DIR "$0" \
+        --doctor-resume "$LAMBOOT_RUN_ID" "${ORIGINAL_ARGS[@]}"
+}
+
+# ── Execute plan ─────────────────────────────────────────────────────────
+
+execute_plan() {
+    local count=${#PLAN_FINDING_IDS[@]}
+    [[ $count -eq 0 ]] && return 0
+
+    # Interactive confirmation for the entire plan (unless all-manual)
+    local has_executable=0
+    for p in "${PLAN_POLICIES[@]}"; do
+        [[ "$p" == "auto" ]] || [[ "$p" == "confirm" ]] && has_executable=1
+    done
+
+    if [[ $has_executable -eq 1 ]] && [[ $LAMBOOT_AUTO -eq 0 ]] && [[ $LAMBOOT_YES -eq 0 ]]; then
+        if ! confirm "Continue with plan" "yes"; then
+            record_action "doctor.plan_declined" "plan" "abort" "false" '{}' "null"
+            emit_json "$EXIT_ABORT"
+            exit "$EXIT_ABORT"
+        fi
+    fi
+
+    local i
+    for i in "${!PLAN_FINDING_IDS[@]}"; do
+        local id="${PLAN_FINDING_IDS[$i]}"
+        local sev="${PLAN_SEVERITIES[$i]}"
+        local action="${PLAN_ACTIONS[$i]}"
+        local policy="${PLAN_POLICIES[$i]}"
+
+        case "$policy" in
+            manual|skip)
+                DOCTOR_SKIPPED=$((DOCTOR_SKIPPED + 1))
+                record_action "doctor.step.skipped" "$id" "skipped" "false" \
+                    "{\"policy\":\"$policy\",\"severity\":\"$sev\"}" "null"
+                continue
+                ;;
+            confirm)
+                # Critical always reconfirms regardless of --auto
+                if ! confirm "Apply fix for [$sev] $id" "yes"; then
+                    DOCTOR_SKIPPED=$((DOCTOR_SKIPPED + 1))
+                    record_action "doctor.step.declined" "$id" "abort" "false" \
+                        "{\"severity\":\"$sev\"}" "null"
+                    continue
+                fi
+                ;;
+            auto)
+                : # proceed without per-step confirm
+                ;;
+        esac
+
+        info "Applying: $id → $action"
+
+        if [[ $LAMBOOT_DRY_RUN -eq 1 ]]; then
+            printf 'DRY-RUN: would exec: %s\n' "$action" >&2
+            record_action "doctor.step.applied" "$id" "ok" "true" \
+                "{\"action\":\"$(json_escape "$action")\",\"dry_run\":true}" "null"
+            DOCTOR_APPLIED=$((DOCTOR_APPLIED + 1))
+            continue
+        fi
+
+        # Execute via shell — siblings are trusted toolkit binaries
+        # shellcheck disable=SC2086  # deliberate word-split to pass flags
+        if LAMBOOT_LIB_DIR="${LAMBOOT_LIB_DIR:-}" eval "$action"; then
+            success "applied: $id"
+            record_action "doctor.step.applied" "$id" "ok" "true" \
+                "{\"action\":\"$(json_escape "$action")\",\"severity\":\"$sev\"}" "null"
+            DOCTOR_APPLIED=$((DOCTOR_APPLIED + 1))
+        else
+            warn "failed: $id"
+            record_action "doctor.step.failed" "$id" "fail" "false" \
+                "{\"action\":\"$(json_escape "$action")\",\"severity\":\"$sev\"}" "null"
+            DOCTOR_FAILED=$((DOCTOR_FAILED + 1))
+        fi
+    done
+}
+
+# ── Phase: verify ────────────────────────────────────────────────────────
+
+run_verify() {
+    [[ $DOCTOR_APPLIED -eq 0 ]] && return 0
+
+    info "Phase: Verify"
+
+    local diagnose_bin
+    diagnose_bin=$(_find_sibling lamboot-diagnose) || return 1
+
+    # Quick re-scan to confirm fixes took effect. Summary counts only.
+    local output
+    output=$(LAMBOOT_LIB_DIR="${LAMBOOT_LIB_DIR:-}" "$diagnose_bin" --json 2>/dev/null || true)
+
+    if [[ -z "$output" ]]; then
+        warn "verification scan produced no output"
+        return 0
+    fi
+
+    local verify_critical verify_error
+    verify_critical=$(printf '%s' "$output" | grep -o '"severity":"critical"' | wc -l | tr -d ' ')
+    verify_error=$(printf '%s' "$output" | grep -o '"severity":"error"' | wc -l | tr -d ' ')
+    [[ -z "$verify_critical" ]] && verify_critical=0
+    [[ -z "$verify_error" ]] && verify_error=0
+
+    emit_finding "doctor.verify.summary" "doctor" "info" "pass" \
+        "Post-repair verification: $verify_critical critical, $verify_error error remaining" \
+        "If non-zero, re-run doctor or inspect with lamboot-diagnose." \
+        "{\"critical\":${verify_critical},\"error\":${verify_error}}" '{}'
+}
+
+# ── Show summary ─────────────────────────────────────────────────────────
+
+print_summary() {
+    [[ $LAMBOOT_JSON -eq 1 ]] && return 0
+
+    printf '\n%sSummary:%s %d applied, %d manual, %d failed.\n' \
+        "$LAMBOOT_COLOR_INFO" "$LAMBOOT_COLOR_RESET" \
+        "$DOCTOR_APPLIED" "$DOCTOR_SKIPPED" "$DOCTOR_FAILED" >&2
+
+    # Manual steps: collect and list
+    local manual_actions=()
+    local i
+    for i in "${!PLAN_FINDING_IDS[@]}"; do
+        local p="${PLAN_POLICIES[$i]}"
+        local a="${PLAN_ACTIONS[$i]}"
+        if [[ "$p" == "manual" ]] && [[ -n "$a" ]]; then
+            manual_actions+=("sudo $a")
+        fi
+    done
+
+    if [[ ${#manual_actions[@]} -gt 0 ]]; then
+        printf '\nManual steps:\n' >&2
+        local mas
+        for mas in "${manual_actions[@]}"; do
+            printf '  %s\n' "$mas" >&2
+        done
+        printf '\n' >&2
+    fi
+}
+
+# ── Cleanup ──────────────────────────────────────────────────────────────
+
+cleanup_resume_state() {
+    [[ $OPT_KEEP_RESUME -eq 1 ]] && return 0
+    [[ -z "$LAMBOOT_RUN_ID" ]] && return 0
+    local state_file="$STATE_DIR/${LAMBOOT_RUN_ID}.json"
+    [[ -f "$state_file" ]] && rm -f "$state_file" 2>/dev/null || true
+}
+
+# ── Main orchestration ──────────────────────────────────────────────────
+
+do_check() {
+    require_siblings
+
+    # Load cached diagnostic output if resuming post-sudo
+    local diag_output=""
+    if [[ -n "$OPT_RESUME_ID" ]]; then
+        LAMBOOT_RUN_ID="$OPT_RESUME_ID"
+        local state_file="$STATE_DIR/${OPT_RESUME_ID}.json"
+        if [[ -f "$state_file" ]]; then
+            diag_output=$(cat "$state_file")
+            verbose "loaded cached diagnostic output from $state_file"
+        else
+            verbose "no cached state found; running diagnose fresh"
+        fi
+    fi
+
+    if [[ -z "$diag_output" ]]; then
+        info "Phase: Diagnose"
+        diag_output=$(run_diagnose)
+        CACHED_DIAGNOSE_OUTPUT="$diag_output"
+    fi
+
+    # Extract findings array from the diagnose output
+    local findings_blob
+    findings_blob=$(printf '%s' "$diag_output" | grep -oE '"findings":\[.*\],"actions_taken"' | sed 's/"findings":\[//;s/\],"actions_taken"//')
+
+    build_plan_from_findings "$findings_blob"
+
+    info "Phase: Plan"
+    show_plan
+
+    local plan_count=${#PLAN_FINDING_IDS[@]}
+    if [[ $plan_count -eq 0 ]]; then
+        info "System is healthy — nothing to do."
+        emit_finding "doctor.check.healthy" "doctor" "info" "pass" \
+            "No issues requiring action" "" "{}" '{}'
+        emit_json "$EXIT_NOOP"
+        exit "$EXIT_NOOP"
+    fi
+
+    # Emit a summary finding about the plan
+    emit_finding "doctor.plan.summary" "doctor" "info" "pass" \
+        "Built plan for $plan_count issue(s)" "" \
+        "{\"total\":${plan_count}}" '{}'
+
+    # Escalate if needed
+    maybe_escalate
+
+    # Execute
+    info "Phase: Execute"
+    execute_plan
+
+    # Verify
+    run_verify
+
+    # Summary
+    print_summary
+
+    # Cleanup
+    cleanup_resume_state
+
+    local exit_code="$EXIT_OK"
+    if [[ $DOCTOR_FAILED -gt 0 ]] && [[ $DOCTOR_APPLIED -gt 0 ]]; then
+        exit_code="$EXIT_PARTIAL"
+    elif [[ $DOCTOR_FAILED -gt 0 ]]; then
+        exit_code="$EXIT_ERROR"
+    fi
+
+    emit_json "$exit_code"
+    exit "$exit_code"
+}
+
+# ── CLI ──────────────────────────────────────────────────────────────────
+
+ORIGINAL_ARGS=("$@")
+CACHED_DIAGNOSE_OUTPUT=""
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        parse_common_flag "$1"
+        local rc=$?
+        case $rc in
+            1) shift; continue ;;
+            2) _register_subcommands; dispatch_help; exit 0 ;;
+            3) printf 'lamboot-doctor %s (lamboot-tools %s)\n' \
+                "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
+            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            5) LAMBOOT_OFFLINE_DISK="${2:-}"; [[ -n "$LAMBOOT_OFFLINE_DISK" ]] || die "--offline requires DISK argument"; shift 2; continue ;;
+            0) ;;
+        esac
+
+        case "$1" in
+            --no-repair)          OPT_NO_REPAIR=1; shift ;;
+            --no-clean)           OPT_NO_CLEAN=1; shift ;;
+            --risk-limit)         OPT_RISK_LIMIT="${2:-moderate}"; shift 2 ;;
+            --doctor-resume)      OPT_RESUME_ID="${2:-}"; shift 2 ;;
+            --keep-resume-state)  OPT_KEEP_RESUME=1; shift ;;
+            help)                 _register_subcommands
+                                  if [[ -n "${2:-}" ]]; then
+                                      dispatch_help "$2"
+                                  else
+                                      dispatch_help
+                                  fi
+                                  exit 0 ;;
+            check)                shift ;;
+            -*)                   die "unknown option: $1" ;;
+            *)                    die "unknown argument: $1" ;;
+        esac
+    done
+}
+
+main() {
+    parse_args "$@"
+    do_check
+}
+
+main "$@"

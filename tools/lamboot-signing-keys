@@ -1,0 +1,1341 @@
+#!/bin/bash
+# lamboot-signing-keys — Secure Boot key lifecycle helper
+#
+# Dual-mode per founder decision Q1=Scope3: covers both release-engineering
+# (lamboot-dev/KEY-GENERATION.md procedures) and user-facing Secure Boot key
+# management (mokutil/OVMF vars/sbsign wrappers).
+#
+# RSA-2048 enforcement on db / MOK-bound keys per Debian bug #1013320.
+# RSA-4096 allowed for PK/KEK (firmware-level, not shim-path).
+#
+# Governed by docs/SPEC-LAMBOOT-SIGNING-KEYS.md.
+# Part of the lamboot-tools suite (SPEC-LAMBOOT-TOOLKIT-V1.md §3.1).
+
+# shellcheck source=../lib/lamboot-toolkit-lib.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
+# shellcheck source=../lib/lamboot-toolkit-help.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
+
+LAMBOOT_TOOL_NAME="lamboot-signing-keys"
+LAMBOOT_TOOL_VERSION="0.2.0"
+
+readonly DOC_BASE="https://lamboot.dev/tools/findings"
+
+OPT_SUBCOMMAND=""
+OPT_MODE="auto"
+OPT_TYPE="db"
+OPT_SIZE=""
+OPT_CN=""
+OPT_DAYS=""
+OPT_OUTPUT=""
+OPT_OUTPUT_DIR=""
+OPT_INPUT=""
+OPT_KEY=""
+OPT_CERT=""
+OPT_FORCE_4096=0
+OPT_PASSPHRASE_SRC="prompt"
+OPT_NEW_CN=""
+OPT_SBAT=""              # explicit SBAT CSV line (e.g. "lamboot,1,LamCo,lamboot,0.8.4,...")
+OPT_SBAT_FILE=""         # path to SBAT CSV file; overrides OPT_SBAT if both given
+OPT_NO_SBAT=0            # skip SBAT injection (not recommended; for debugging)
+OPT_OLD_KEY=""           # rotate: existing key being retired
+OPT_OLD_CERT=""          # rotate: existing cert being retired
+OPT_PARENT_KEY=""        # rotate: parent key used to cross-sign new cert
+OPT_PARENT_CERT=""       # rotate: parent cert used to cross-sign new cert
+
+# ── Help registry ────────────────────────────────────────────────────────
+
+_register_subcommands() {
+    register_subcommand \
+        --name "generate" \
+        --category "Keys" \
+        --summary "Generate a signing keypair + cert" \
+        --syntax "lamboot-signing-keys generate [--type db|kek|pk] [--size N] [--cn NAME] [--days N] [--output PREFIX]" \
+        --arg "--type db|kek|pk:Key role (default: db)" \
+        --arg "--size N:RSA key size (default: 2048 for db, 4096 for pk/kek)" \
+        --arg "--cn NAME:Subject CommonName" \
+        --arg "--days N:Validity (default: 1095 for db, 3650 for pk/kek)" \
+        --arg "--output PREFIX:Output prefix; produces PREFIX.key + PREFIX.crt + PREFIX.der (default: ./<type>)" \
+        --arg "--force-4096:Override RSA-2048 constraint for db (dangerous; shim freezes per Debian #1013320)" \
+        --example "lamboot-signing-keys generate --type db --cn 'My db Key 2026'" \
+        --example "lamboot-signing-keys generate --type pk --output /tmp/mypk" \
+        --notes "RSA-2048 is enforced for db keys because Debian bug #1013320 causes shim to freeze verifying RSA-4096 MOK certs. RSA-4096 is safe for PK/KEK. Private key is 0600; cert is 0644." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "inspect, mok-enroll, status" \
+        --doc-url "https://lamboot.dev/tools/signing-keys/generate" \
+        --maturity "experimental"
+
+    register_subcommand \
+        --name "rotate" \
+        --category "Keys" \
+        --summary "Rotate a db/kek/pk keypair, cross-signing with the parent key" \
+        --syntax "lamboot-signing-keys rotate TYPE --old-key K --old-cert C [--new-cn NAME] [--parent-key K --parent-cert C] [--output-dir DIR]" \
+        --arg "TYPE:db | kek | pk" \
+        --arg "--old-key PATH:Existing private key being rotated" \
+        --arg "--old-cert PATH:Existing cert being rotated" \
+        --arg "--new-cn NAME:CN for the new cert (default: inherits old CN with '-rotated-YYYYMMDD' suffix)" \
+        --arg "--parent-key PATH:Parent private key for cross-sign (KEK for db rotation, PK for KEK rotation). Optional; if absent, rotation produces a self-signed new cert and emits a warning." \
+        --arg "--parent-cert PATH:Parent cert for cross-sign (must match --parent-key)" \
+        --arg "--output-dir DIR:Rotation artifacts directory (default: ./rotation-TYPE-YYYYMMDD-HHMMSS)" \
+        --example "sudo lamboot-signing-keys rotate db --old-key keys/db.key --old-cert keys/db.crt --parent-key keys/kek.key --parent-cert keys/kek.crt" \
+        --example "sudo lamboot-signing-keys rotate kek --old-key keys/kek.key --old-cert keys/kek.crt --parent-key keys/pk.key --parent-cert keys/pk.crt" \
+        --example "sudo lamboot-signing-keys rotate pk --old-key keys/pk.key --old-cert keys/pk.crt" \
+        --notes "Generates a new keypair with the same RSA size + validity defaults as generate, then cross-signs the new cert with the parent key (db←KEK, KEK←PK, PK←self). Produces a timestamped rotation directory containing old + new keypairs, a transition manifest, and re-enrollment instructions. Both old and new keys remain valid during the transition window; stragglers can be re-signed with either old or new db until distribution completes. See KEY-GENERATION.md §6.1." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "generate, generate-hierarchy, mok-enroll" \
+        --doc-url "https://lamboot.dev/tools/signing-keys/rotate" \
+        --maturity "experimental"
+
+    register_subcommand \
+        --name "inspect" \
+        --category "Keys" \
+        --summary "Display cert subject, algorithm, key size, validity" \
+        --syntax "lamboot-signing-keys inspect KEYFILE_OR_CERT [--json]" \
+        --arg "KEYFILE_OR_CERT:Path to .key, .crt, .der, or .pem" \
+        --example "lamboot-signing-keys inspect /etc/keys/db.crt" \
+        --example "lamboot-signing-keys inspect myKey.der --json" \
+        --notes "Parses via openssl. Warns on RSA-4096 leaf certs, expiring certs (<90 days), or inconsistent CA flags." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "generate" \
+        --doc-url "https://lamboot.dev/tools/signing-keys/inspect" \
+        --maturity "experimental"
+
+    register_subcommand \
+        --name "status" \
+        --category "Keys" \
+        --summary "Show current Secure Boot state + enrolled certs" \
+        --syntax "lamboot-signing-keys status [--json]" \
+        --example "lamboot-signing-keys status" \
+        --example "sudo lamboot-signing-keys status" \
+        --notes "Reads /sys/firmware/efi/efivars/{SecureBoot,SetupMode,AuditMode}-*. Runs mokutil --list-enrolled if available." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "mok-list, mok-enroll" \
+        --doc-url "https://lamboot.dev/tools/signing-keys/status" \
+        --maturity "experimental"
+
+    register_subcommand \
+        --name "mok-enroll" \
+        --category "User MOK" \
+        --summary "Stage a cert for MOK enrollment (user-mode)" \
+        --syntax "lamboot-signing-keys mok-enroll CERT" \
+        --arg "CERT:Path to cert to enroll (.der or .crt)" \
+        --example "sudo lamboot-signing-keys mok-enroll /etc/keys/db.der" \
+        --notes "Wraps mokutil --import. Prompts for one-time enrollment password. Reboot required to complete via MokManager." \
+        --offline-capable "false" \
+        --requires-root "true" \
+        --see-also "mok-list, mok-delete, generate" \
+        --doc-url "https://lamboot.dev/tools/signing-keys/mok-enroll" \
+        --maturity "experimental"
+
+    register_subcommand \
+        --name "mok-list" \
+        --category "User MOK" \
+        --summary "List MOK-enrolled certs" \
+        --syntax "lamboot-signing-keys mok-list [--json]" \
+        --example "lamboot-signing-keys mok-list" \
+        --notes "Wraps mokutil --list-enrolled." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "mok-enroll" \
+        --doc-url "https://lamboot.dev/tools/signing-keys/mok-list" \
+        --maturity "experimental"
+
+    register_subcommand \
+        --name "mok-delete" \
+        --category "User MOK" \
+        --summary "Stage MOK deletion (reverses mok-enroll)" \
+        --syntax "lamboot-signing-keys mok-delete CERT" \
+        --arg "CERT:Path to cert to remove from MOK" \
+        --example "sudo lamboot-signing-keys mok-delete /etc/keys/db.der" \
+        --notes "Wraps mokutil --delete. Reboot required." \
+        --offline-capable "false" \
+        --requires-root "true" \
+        --see-also "mok-enroll" \
+        --doc-url "https://lamboot.dev/tools/signing-keys/mok-delete" \
+        --maturity "experimental"
+
+    register_subcommand \
+        --name "ovmf-vars" \
+        --category "OVMF" \
+        --summary "Build OVMF_VARS.fd with cert pre-enrolled in db" \
+        --syntax "lamboot-signing-keys ovmf-vars OUTPUT.fd --cert CERT" \
+        --arg "OUTPUT.fd:Output OVMF vars file" \
+        --arg "--cert PATH:Certificate to embed in db" \
+        --example "sudo lamboot-signing-keys ovmf-vars OVMF_VARS_custom.fd --cert /etc/keys/db.crt" \
+        --notes "Wraps virt-fw-vars. Consumes stock OVMF_VARS_4M.ms.fd template. Used for Proxmox Config 4 per OVMF-VARS-PROXMOX.md." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "generate, lamboot-pve-ovmf-vars" \
+        --doc-url "https://lamboot.dev/tools/signing-keys/ovmf-vars" \
+        --maturity "experimental"
+
+    register_subcommand \
+        --name "generate-hierarchy" \
+        --category "Release Eng" \
+        --summary "Generate full PK + KEK + db hierarchy (Scope 1)" \
+        --syntax "lamboot-signing-keys generate-hierarchy [--output-dir DIR] [--cn-prefix NAME]" \
+        --arg "--output-dir DIR:Output directory (default: ./keys-gen/)" \
+        --example "lamboot-signing-keys generate-hierarchy --output-dir ./keys-gen/" \
+        --notes "Produces PK (RSA 4096, CA:TRUE, 10y), KEK (RSA 4096, CA:TRUE, 10y), db (RSA 2048, CA:FALSE, codeSigning, 3y) per ~/lamboot-dev/docs/KEY-GENERATION.md §3. Prompts for three passphrases." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "generate, sign-binary" \
+        --doc-url "https://lamboot.dev/tools/signing-keys/generate-hierarchy" \
+        --maturity "experimental"
+
+    register_subcommand \
+        --name "sign-binary" \
+        --category "Release Eng" \
+        --summary "Sign a binary (Scope 1)" \
+        --syntax "lamboot-signing-keys sign-binary BINARY --key KEY --cert CERT [--output OUT] [--sbat CSV|--sbat-file PATH|--no-sbat]" \
+        --arg "BINARY:File to sign" \
+        --arg "--key PATH:Private key" \
+        --arg "--cert PATH:Cert" \
+        --arg "--sbat CSV:Inline SBAT CSV line (e.g. \"lamboot,1,LamCo,lamboot,0.8.4,https://lamboot.dev/sbat\")" \
+        --arg "--sbat-file PATH:Path to SBAT CSV file (header row + one entry per component); overrides --sbat" \
+        --arg "--no-sbat:Skip SBAT section injection (NOT recommended — shim may refuse to chain unsigned SBAT binaries)" \
+        --example "lamboot-signing-keys sign-binary dist/lambootx64.efi --key keys/db.key --cert keys/db.crt" \
+        --example "lamboot-signing-keys sign-binary dist/lambootx64.efi --key keys/db.key --cert keys/db.crt --sbat-file /etc/lamboot/sbat.csv" \
+        --notes "Injects a .sbat PE section before sbsign if not present. Resolution order: --sbat-file > --sbat > /etc/lamboot/sbat.csv > built-in default. Uses objcopy --add-section .sbat=PATH with appropriate flags. SBAT format per https://github.com/rhboot/shim/blob/main/SBAT.md. Pass --no-sbat to skip injection entirely (e.g. when binary already has .sbat)." \
+        --offline-capable "false" \
+        --requires-root "false" \
+        --see-also "generate-hierarchy, lamboot-uki-build" \
+        --doc-url "https://lamboot.dev/tools/signing-keys/sign-binary" \
+        --maturity "experimental"
+}
+
+# ── Remediation helper ───────────────────────────────────────────────────
+
+_remediation_json() {
+    local id="$1" summary="$2" cmd="${3:-}"
+    local doc="${DOC_BASE}/${id//.//}"
+    local cmd_field="\"\""
+    [[ -n "$cmd" ]] && cmd_field="\"$(json_escape "$cmd")\""
+    printf '{"summary":"%s","command":%s,"doc_url":"%s"}' \
+        "$(json_escape "$summary")" "$cmd_field" "$doc"
+}
+
+# ── Size constraint enforcement (Debian #1013320) ────────────────────────
+
+enforce_size_constraint() {
+    local type="$1" size="$2"
+
+    if [[ "$size" == "4096" ]]; then
+        case "$type" in
+            db|leaf)
+                if [[ $OPT_FORCE_4096 -eq 0 ]]; then
+                    emit_finding "keys.rsa4096_refused" "signing_keys" "critical" "fail" \
+                        "Refusing RSA-4096 for $type key" \
+                        "Debian bug #1013320 causes shim to freeze verifying RSA-4096 MOK certs. Use --force-4096 to override (dangerous)." \
+                        "{\"type\":\"$type\",\"size\":${size}}" \
+                        "$(_remediation_json "keys.rsa4096_refused" \
+                            "Use RSA-2048 (default) instead" \
+                            "lamboot-signing-keys generate --type $type --size 2048")"
+                    emit_json "$EXIT_UNSAFE"
+                    exit "$EXIT_UNSAFE"
+                else
+                    warn "RSA-4096 for db key: accepted via --force-4096 (risks shim freeze per Debian #1013320)"
+                    emit_finding "keys.rsa4096_override" "signing_keys" "warning" "warn" \
+                        "RSA-4096 for db key (--force-4096)" \
+                        "This may cause shim-verified boot to hang. Test thoroughly before deploying." \
+                        "{\"type\":\"$type\",\"size\":${size}}" \
+                        '{}'
+                fi
+                ;;
+        esac
+    fi
+}
+
+# Resolve effective key size given --type + --size
+resolve_size() {
+    local type="$1"
+    if [[ -n "$OPT_SIZE" ]]; then
+        printf '%s' "$OPT_SIZE"
+        return
+    fi
+    case "$type" in
+        db|leaf)    printf '2048' ;;
+        pk|kek)     printf '4096' ;;
+        *)          printf '2048' ;;
+    esac
+}
+
+# Resolve effective validity
+resolve_days() {
+    local type="$1"
+    if [[ -n "$OPT_DAYS" ]]; then
+        printf '%s' "$OPT_DAYS"
+        return
+    fi
+    case "$type" in
+        db|leaf)    printf '1095' ;;  # 3 years
+        pk|kek)     printf '3650' ;;  # 10 years
+        *)          printf '1095' ;;
+    esac
+}
+
+# ── Subcommand: generate ─────────────────────────────────────────────────
+
+do_generate() {
+    local type="$OPT_TYPE"
+    local size cn days prefix
+
+    size=$(resolve_size "$type")
+    days=$(resolve_days "$type")
+    cn="${OPT_CN:-LamBoot-tools-generated $type Key}"
+    prefix="${OPT_OUTPUT:-./$type}"
+
+    # Safety check runs first: RSA-4096 refusal for db/leaf keys must fire
+    # even in environments without openssl installed, since it's a hard
+    # safety constraint (Debian bug #1013320) independent of tool presence.
+    enforce_size_constraint "$type" "$size"
+
+    local outdir
+    outdir=$(dirname "$prefix")
+    [[ -d "$outdir" ]] || { mkdir -p "$outdir" || die "cannot create $outdir"; }
+
+    # Refuse to overwrite unless --force
+    if [[ -f "${prefix}.key" ]] && [[ $LAMBOOT_FORCE -eq 0 ]]; then
+        die "key file exists: ${prefix}.key (use --force to overwrite)"
+    fi
+
+    local is_ca eku="" basic_constraints key_usage="digitalSignature"
+    case "$type" in
+        pk|kek)
+            is_ca="TRUE"
+            basic_constraints="critical, CA:TRUE"
+            key_usage="critical, digitalSignature, keyCertSign"
+            ;;
+        db|leaf)
+            is_ca="FALSE"
+            basic_constraints="critical, CA:FALSE"
+            eku="codeSigning"
+            key_usage="critical, digitalSignature"
+            ;;
+    esac
+
+    info "Generating $type key: RSA-$size, CN='$cn', $days-day validity"
+
+    if [[ $LAMBOOT_DRY_RUN -eq 1 ]]; then
+        info "DRY-RUN: would write ${prefix}.{key,crt,der}"
+        record_action "keys.generate.dry_run" "$prefix" "ok" "false" \
+            "{\"type\":\"$type\",\"size\":$size,\"cn\":\"$(json_escape "$cn")\"}" "null"
+        emit_json "$EXIT_OK"
+        exit "$EXIT_OK"
+    fi
+
+    # Real generation requires openssl; dry-run bailed above, safety refusal
+    # ran first, so if we reach here we're actually going to mutate the disk.
+    require_tool openssl "install openssl (should be ubiquitous)"
+
+    # Build OpenSSL config
+    local cnf
+    cnf=$(mktemp -t lamboot-signing-cnf.XXXXXX)
+    cat > "$cnf" <<EOF
+[ req ]
+default_bits       = $size
+default_md         = sha256
+prompt             = no
+encrypt_key        = yes
+distinguished_name = req_dn
+x509_extensions    = v3_ext
+
+[ req_dn ]
+CN = $cn
+
+[ v3_ext ]
+basicConstraints = $basic_constraints
+keyUsage = $key_usage
+$([[ -n "$eku" ]] && printf 'extendedKeyUsage = %s' "$eku")
+subjectKeyIdentifier = hash
+$([[ "$is_ca" == "TRUE" ]] && printf 'authorityKeyIdentifier = keyid:always')
+EOF
+
+    # Generate private key (AES-256 encrypted)
+    lamboot_run openssl genrsa -aes256 -out "${prefix}.key" "$size" \
+        || { rm -f "$cnf"; die "openssl genrsa failed"; }
+
+    chmod 0600 "${prefix}.key"
+
+    # Generate self-signed cert
+    lamboot_run openssl req -new -x509 -sha256 -days "$days" \
+        -key "${prefix}.key" -out "${prefix}.crt" -config "$cnf" \
+        || { rm -f "$cnf"; die "openssl req failed"; }
+
+    chmod 0644 "${prefix}.crt"
+
+    # Produce DER form for firmware enrollment
+    lamboot_run openssl x509 -in "${prefix}.crt" -outform DER -out "${prefix}.der" \
+        || { rm -f "$cnf"; die "openssl x509 DER conversion failed"; }
+
+    chmod 0644 "${prefix}.der"
+
+    rm -f "$cnf"
+
+    local subj
+    subj=$(openssl x509 -in "${prefix}.crt" -noout -subject 2>/dev/null | sed 's/^subject= *//')
+
+    emit_finding "keys.generate.complete" "signing_keys" "info" "pass" \
+        "Generated $type keypair at $prefix" \
+        "Subject: $subj. Files: ${prefix}.{key,crt,der}" \
+        "{\"prefix\":\"$(json_escape "$prefix")\",\"type\":\"$type\",\"size\":$size,\"days\":$days}" \
+        '{}'
+    record_action "keys.generate.keypair" "$prefix" "ok" "false" \
+        "{\"type\":\"$type\",\"size\":$size}" "null"
+
+    success "Generated ${prefix}.key (0600), ${prefix}.crt (0644), ${prefix}.der (0644)"
+    success "Subject: $subj"
+
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── Subcommand: inspect ──────────────────────────────────────────────────
+
+do_inspect() {
+    [[ -n "$OPT_INPUT" ]] || die "inspect requires file path as first positional argument"
+    [[ -f "$OPT_INPUT" ]] || die "file not found: $OPT_INPUT"
+
+    require_tool openssl "install openssl"
+
+    local file="$OPT_INPUT"
+
+    # Determine file format
+    local ext="${file##*.}"
+    local inform="PEM"
+    case "$ext" in
+        der)  inform="DER" ;;
+        *)    inform="PEM" ;;
+    esac
+
+    # Try as cert first
+    local cert_text=""
+    cert_text=$(openssl x509 -in "$file" -inform "$inform" -noout -text 2>/dev/null || true)
+
+    if [[ -z "$cert_text" ]]; then
+        # Might be a private key
+        if openssl rsa -in "$file" -noout -check 2>/dev/null; then
+            local keysize
+            keysize=$(openssl rsa -in "$file" -noout -text 2>/dev/null | grep -oE 'Private-Key: \([0-9]+ bit' | grep -oE '[0-9]+' | head -1)
+            [[ -z "$keysize" ]] && keysize=0
+            emit_finding "keys.inspect.private_key" "signing_keys" "info" "pass" \
+                "Private RSA key, ${keysize} bit" "" \
+                "{\"file\":\"$(json_escape "$file")\",\"size\":$keysize}" '{}'
+            if [[ "$keysize" == "4096" ]]; then
+                emit_finding "keys.inspect.private_key_size_warn" "signing_keys" "warning" "warn" \
+                    "RSA-4096 key — not safe for MOK-enrolled use" \
+                    "If this key signs binaries loaded via shim, shim will freeze (Debian #1013320)." \
+                    "{\"size\":4096}" \
+                    "$(_remediation_json "keys.inspect.private_key_size_warn" \
+                        "Use RSA-2048 for MOK-bound keys" \
+                        "lamboot-signing-keys generate --type db --size 2048")"
+            fi
+            emit_json "$EXIT_OK"
+            exit "$EXIT_OK"
+        fi
+        die "unrecognized file format: $file"
+    fi
+
+    # Cert path: extract fields
+    local subject issuer serial not_before not_after sig_alg key_size eku_text ca_flag
+    subject=$(openssl x509 -in "$file" -inform "$inform" -noout -subject 2>/dev/null | sed 's/^subject= *//')
+    issuer=$(openssl x509 -in "$file" -inform "$inform" -noout -issuer 2>/dev/null | sed 's/^issuer= *//')
+    serial=$(openssl x509 -in "$file" -inform "$inform" -noout -serial 2>/dev/null | sed 's/^serial= *//')
+    not_before=$(openssl x509 -in "$file" -inform "$inform" -noout -startdate 2>/dev/null | sed 's/^notBefore= *//')
+    not_after=$(openssl x509 -in "$file" -inform "$inform" -noout -enddate 2>/dev/null | sed 's/^notAfter= *//')
+    sig_alg=$(printf '%s' "$cert_text" | grep -oE 'Signature Algorithm: [^[:space:]]+' | head -1 | cut -d' ' -f3)
+    key_size=$(printf '%s' "$cert_text" | grep -oE 'Public-Key: \([0-9]+ bit' | grep -oE '[0-9]+' | head -1)
+    [[ -z "$key_size" ]] && key_size=0
+
+    if printf '%s' "$cert_text" | grep -q 'CA:TRUE'; then
+        ca_flag="TRUE"
+    else
+        ca_flag="FALSE"
+    fi
+
+    eku_text=$(printf '%s' "$cert_text" | grep -A1 'X509v3 Extended Key Usage' | tail -1 | sed 's/^ *//' || true)
+
+    emit_finding "keys.inspect.subject" "signing_keys" "info" "pass" \
+        "Subject: $subject" "" \
+        "{\"subject\":\"$(json_escape "$subject")\"}" '{}'
+
+    emit_finding "keys.inspect.issuer" "signing_keys" "info" "pass" \
+        "Issuer: $issuer" "" \
+        "{\"issuer\":\"$(json_escape "$issuer")\"}" '{}'
+
+    emit_finding "keys.inspect.algorithm" "signing_keys" "info" "pass" \
+        "Signature algorithm: $sig_alg" "" \
+        "{\"algorithm\":\"$(json_escape "$sig_alg")\"}" '{}'
+
+    emit_finding "keys.inspect.key_size" "signing_keys" "info" "pass" \
+        "Key size: ${key_size} bit" "" \
+        "{\"size\":$key_size}" '{}'
+
+    emit_finding "keys.inspect.validity" "signing_keys" "info" "pass" \
+        "Valid: $not_before → $not_after" "" \
+        "{\"not_before\":\"$(json_escape "$not_before")\",\"not_after\":\"$(json_escape "$not_after")\"}" '{}'
+
+    emit_finding "keys.inspect.ca_flag" "signing_keys" "info" "pass" \
+        "CA: $ca_flag" "" \
+        "{\"ca\":\"$ca_flag\"}" '{}'
+
+    [[ -n "$eku_text" ]] && emit_finding "keys.inspect.eku" "signing_keys" "info" "pass" \
+        "Extended Key Usage: $eku_text" "" \
+        "{\"eku\":\"$(json_escape "$eku_text")\"}" '{}'
+
+    # Warning: RSA 4096 leaf cert (MOK hazard)
+    if [[ "$key_size" == "4096" ]] && [[ "$ca_flag" == "FALSE" ]]; then
+        emit_finding "keys.inspect.rsa4096_leaf_warn" "signing_keys" "warning" "warn" \
+            "RSA-4096 leaf cert — hazardous for MOK" \
+            "If enrolled in MOK, shim may freeze when verifying binaries signed by this cert (Debian #1013320)." \
+            "{\"key_size\":4096}" \
+            "$(_remediation_json "keys.inspect.rsa4096_leaf_warn" \
+                "Regenerate at RSA-2048" \
+                "lamboot-signing-keys generate --type db --size 2048")"
+    fi
+
+    # Warning: cert expired or expires within 90 days
+    if command -v date >/dev/null 2>&1; then
+        local exp_epoch now_epoch days_left
+        exp_epoch=$(date -d "$not_after" +%s 2>/dev/null || printf '0')
+        now_epoch=$(date +%s)
+        if [[ "$exp_epoch" != "0" ]]; then
+            days_left=$(( (exp_epoch - now_epoch) / 86400 ))
+            if [[ "$days_left" -lt 0 ]]; then
+                emit_finding "keys.inspect.expired" "signing_keys" "error" "fail" \
+                    "Certificate has EXPIRED" \
+                    "Expired $(( -days_left )) days ago." \
+                    "{\"days_past_expiry\":$((-days_left))}" \
+                    "$(_remediation_json "keys.inspect.expired" \
+                        "Rotate the key" \
+                        "lamboot-signing-keys generate --type db")"
+            elif [[ "$days_left" -lt 90 ]]; then
+                emit_finding "keys.inspect.expiring_soon" "signing_keys" "warning" "warn" \
+                    "Certificate expires in $days_left days" \
+                    "Rotate before expiry to avoid boot disruption." \
+                    "{\"days_until_expiry\":$days_left}" \
+                    "$(_remediation_json "keys.inspect.expiring_soon" \
+                        "Plan key rotation" \
+                        "lamboot-signing-keys generate --type db")"
+            fi
+        fi
+    fi
+
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── Subcommand: status ───────────────────────────────────────────────────
+
+do_status() {
+    # Secure Boot state
+    local sb_var="/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+    local sm_var="/sys/firmware/efi/efivars/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+
+    [[ $LAMBOOT_JSON -eq 0 ]] && printf '\nSecure Boot Status\n==================\n' >&2
+
+    if [[ ! -d /sys/firmware/efi ]]; then
+        emit_finding "keys.status.not_uefi" "signing_keys" "info" "skip" \
+            "System is in BIOS mode" "No Secure Boot state available." "{}" '{}'
+        [[ $LAMBOOT_JSON -eq 0 ]] && printf '  System is in BIOS mode\n' >&2
+    else
+        if [[ -r "$sb_var" ]]; then
+            local sb_val
+            sb_val=$(od -An -t u1 -j4 -N1 "$sb_var" 2>/dev/null | tr -d ' ' || printf '0')
+            local state="disabled"
+            [[ "$sb_val" == "1" ]] && state="enabled"
+            emit_finding "keys.status.secure_boot" "signing_keys" "info" "pass" \
+                "Secure Boot: $state" "" \
+                "{\"enabled\":$([[ "$sb_val" == "1" ]] && printf 'true' || printf 'false')}" '{}'
+            [[ $LAMBOOT_JSON -eq 0 ]] && printf '  Secure Boot: %s\n' "$state" >&2
+        fi
+
+        if [[ -r "$sm_var" ]]; then
+            local sm_val
+            sm_val=$(od -An -t u1 -j4 -N1 "$sm_var" 2>/dev/null | tr -d ' ' || printf '0')
+            local mode="normal"
+            [[ "$sm_val" == "1" ]] && mode="Setup Mode"
+            emit_finding "keys.status.setup_mode" "signing_keys" "info" "pass" \
+                "Mode: $mode" "" \
+                "{\"setup_mode\":$([[ "$sm_val" == "1" ]] && printf 'true' || printf 'false')}" '{}'
+            [[ $LAMBOOT_JSON -eq 0 ]] && printf '  Mode: %s\n' "$mode" >&2
+        fi
+    fi
+
+    # MOK enrolled count
+    if command -v mokutil >/dev/null 2>&1; then
+        local mok_count
+        mok_count=$(mokutil --list-enrolled 2>/dev/null | grep -c 'SHA1 Fingerprint' || true)
+        mok_count="${mok_count:-0}"
+        [[ "$mok_count" =~ ^[0-9]+$ ]] || mok_count=0
+
+        emit_finding "keys.status.mok_count" "signing_keys" "info" "pass" \
+            "MOK-enrolled certs: $mok_count" "" \
+            "{\"count\":$mok_count}" '{}'
+        [[ $LAMBOOT_JSON -eq 0 ]] && printf '  MOK certs:   %d enrolled\n' "$mok_count" >&2
+    else
+        emit_finding "keys.status.mokutil_missing" "signing_keys" "info" "skip" \
+            "mokutil not available" \
+            "MOK operations require shim-mokutil package." "{}" \
+            "$(_remediation_json "keys.status.mokutil_missing" \
+                "Install mokutil" \
+                "sudo apt install mokutil || sudo dnf install mokutil")"
+        [[ $LAMBOOT_JSON -eq 0 ]] && printf '  MOK:         mokutil not installed\n' >&2
+    fi
+
+    # Pending imports
+    if command -v mokutil >/dev/null 2>&1; then
+        local pending
+        pending=$(mokutil --list-new 2>&1 || true)
+        if [[ "$pending" == *"SHA1 Fingerprint"* ]]; then
+            emit_finding "keys.status.pending_mok" "signing_keys" "warning" "warn" \
+                "MOK imports pending" \
+                "Reboot to complete enrollment via MokManager." "{}" \
+                "$(_remediation_json "keys.status.pending_mok" \
+                    "Reboot to process pending MOK imports" \
+                    "sudo reboot")"
+            [[ $LAMBOOT_JSON -eq 0 ]] && printf '  ⚠ MOK imports pending — reboot to complete\n' >&2
+        fi
+    fi
+
+    [[ $LAMBOOT_JSON -eq 0 ]] && printf '\n' >&2
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── Subcommand: mok-enroll ───────────────────────────────────────────────
+
+do_mok_enroll() {
+    require_root
+    require_tool mokutil "install shim-mokutil (Debian/Ubuntu) or mokutil (Fedora)"
+
+    [[ -n "$OPT_INPUT" ]] || die "mok-enroll requires CERT path as first positional argument"
+    [[ -f "$OPT_INPUT" ]] || die "cert file not found: $OPT_INPUT"
+
+    # Check key size constraint
+    local key_size
+    key_size=$(openssl x509 -in "$OPT_INPUT" -inform DER -noout -text 2>/dev/null \
+        || openssl x509 -in "$OPT_INPUT" -noout -text 2>/dev/null \
+        | grep -oE 'Public-Key: \([0-9]+ bit' | grep -oE '[0-9]+' | head -1)
+    key_size="${key_size:-2048}"
+
+    if [[ "$key_size" == "4096" ]] && [[ $OPT_FORCE_4096 -eq 0 ]]; then
+        emit_finding "keys.mok_enroll.rsa4096_refused" "signing_keys" "critical" "fail" \
+            "Refusing to enroll RSA-4096 cert in MOK" \
+            "Debian bug #1013320 causes shim to freeze. Use --force-4096 if you're sure." "{}" \
+            "$(_remediation_json "keys.mok_enroll.rsa4096_refused" \
+                "Generate an RSA-2048 cert instead" \
+                "lamboot-signing-keys generate --type db --size 2048")"
+        emit_json "$EXIT_UNSAFE"
+        exit "$EXIT_UNSAFE"
+    fi
+
+    info "Staging MOK enrollment: $OPT_INPUT"
+    info "You will be prompted for a one-time enrollment password."
+    info "After reboot, enter this password in MokManager to complete enrollment."
+
+    lamboot_run mokutil --import "$OPT_INPUT" \
+        || die "mokutil --import failed"
+
+    emit_finding "keys.mok_enroll.staged" "signing_keys" "info" "pass" \
+        "MOK enrollment staged for $OPT_INPUT" \
+        "Reboot to complete via MokManager UI." \
+        "{\"cert\":\"$(json_escape "$OPT_INPUT")\"}" \
+        "$(_remediation_json "keys.mok_enroll.staged" \
+            "Reboot to complete enrollment" \
+            "sudo reboot")"
+    record_action "keys.mok.enroll_staged" "$OPT_INPUT" "ok" "true" '{}' "null"
+
+    success "Enrollment staged — reboot to complete"
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── Subcommand: mok-list ─────────────────────────────────────────────────
+
+do_mok_list() {
+    require_tool mokutil "install shim-mokutil (Debian/Ubuntu) or mokutil (Fedora)"
+
+    local output
+    output=$(mokutil --list-enrolled 2>&1 || true)
+
+    if [[ -z "$output" ]] || [[ "$output" == *"No MOK"* ]]; then
+        emit_finding "keys.mok_list.empty" "signing_keys" "info" "pass" \
+            "No MOK-enrolled certs" "" "{}" '{}'
+        emit_json "$EXIT_OK"
+        exit "$EXIT_OK"
+    fi
+
+    # Parse per-cert blocks — look for "SHA1 Fingerprint" and "subject=" lines
+    local count=0
+    while IFS= read -r line; do
+        if [[ "$line" == *"Subject:"* ]]; then
+            count=$((count + 1))
+            local subj
+            subj=$(printf '%s' "$line" | sed 's/^[[:space:]]*Subject: *//')
+            emit_finding "keys.mok_list.cert" "signing_keys" "info" "pass" \
+                "MOK cert: $subj" "" \
+                "{\"subject\":\"$(json_escape "$subj")\"}" '{}'
+        fi
+    done <<< "$output"
+
+    emit_finding "keys.mok_list.count" "signing_keys" "info" "pass" \
+        "$count MOK-enrolled cert(s)" "" \
+        "{\"count\":$count}" '{}'
+
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── Subcommand: mok-delete ───────────────────────────────────────────────
+
+do_mok_delete() {
+    require_root
+    require_tool mokutil
+
+    [[ -n "$OPT_INPUT" ]] || die "mok-delete requires CERT path as first positional argument"
+    [[ -f "$OPT_INPUT" ]] || die "cert file not found: $OPT_INPUT"
+
+    if ! confirm "STAGE MOK DELETION of $OPT_INPUT" "yes"; then
+        emit_json "$EXIT_ABORT"
+        exit "$EXIT_ABORT"
+    fi
+
+    lamboot_run mokutil --delete "$OPT_INPUT" \
+        || die "mokutil --delete failed"
+
+    emit_finding "keys.mok_delete.staged" "signing_keys" "info" "pass" \
+        "MOK deletion staged for $OPT_INPUT" \
+        "Reboot to complete via MokManager UI." \
+        "{\"cert\":\"$(json_escape "$OPT_INPUT")\"}" '{}'
+    record_action "keys.mok.delete_staged" "$OPT_INPUT" "ok" "true" '{}' "null"
+
+    success "Deletion staged — reboot to complete"
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── Subcommand: ovmf-vars ────────────────────────────────────────────────
+
+do_ovmf_vars() {
+    [[ -n "$OPT_OUTPUT" ]] || die "ovmf-vars requires OUTPUT.fd as first positional argument"
+    [[ -n "$OPT_CERT" ]] || die "ovmf-vars requires --cert PATH"
+    [[ -f "$OPT_CERT" ]] || die "cert file not found: $OPT_CERT"
+
+    require_tool virt-fw-vars "install virt-firmware (pip install virt-firmware)"
+
+    # Find stock OVMF VARS template
+    local tpl=""
+    for candidate in \
+        /usr/share/OVMF/OVMF_VARS_4M.ms.fd \
+        /usr/share/edk2/ovmf/OVMF_VARS.fd \
+        /usr/share/qemu/OVMF_VARS.fd; do
+        if [[ -f "$candidate" ]]; then
+            tpl="$candidate"
+            break
+        fi
+    done
+
+    [[ -n "$tpl" ]] || die_prerequisite "OVMF_VARS template not found; install ovmf package"
+    verbose "using OVMF VARS template: $tpl"
+
+    lamboot_run cp "$tpl" "$OPT_OUTPUT" || die "cannot copy template to $OPT_OUTPUT"
+
+    # Append our cert to db
+    lamboot_run virt-fw-vars --input "$OPT_OUTPUT" --output "$OPT_OUTPUT" --add-db "$OPT_CERT" \
+        || die "virt-fw-vars --add-db failed"
+
+    emit_finding "keys.ovmf_vars.built" "signing_keys" "info" "pass" \
+        "OVMF_VARS built with cert pre-enrolled" \
+        "Output: $OPT_OUTPUT, cert: $OPT_CERT" \
+        "{\"output\":\"$(json_escape "$OPT_OUTPUT")\",\"cert\":\"$(json_escape "$OPT_CERT")\",\"template\":\"$(json_escape "$tpl")\"}" \
+        '{}'
+    record_action "keys.ovmf.build" "$OPT_OUTPUT" "ok" "false" \
+        "{\"cert\":\"$(json_escape "$OPT_CERT")\"}" "null"
+
+    success "Built $OPT_OUTPUT with cert pre-enrolled"
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── Subcommand: generate-hierarchy (Scope 1) ─────────────────────────────
+
+do_generate_hierarchy() {
+    require_tool openssl
+
+    local outdir="${OPT_OUTPUT_DIR:-./keys-gen}"
+    local cn_prefix="${OPT_CN:-LamBoot}"
+
+    mkdir -p "$outdir" || die "cannot create $outdir"
+    chmod 0700 "$outdir"
+
+    info "Generating full PK + KEK + db hierarchy in $outdir"
+    info "You will be prompted for THREE distinct passphrases."
+
+    if [[ $LAMBOOT_DRY_RUN -eq 1 ]]; then
+        info "DRY-RUN: would generate PK (RSA 4096), KEK (RSA 4096), db (RSA 2048) in $outdir"
+        emit_json "$EXIT_OK"
+        exit "$EXIT_OK"
+    fi
+
+    # PK
+    local pk_prefix="$outdir/PK"
+    OPT_TYPE="pk" OPT_CN="${cn_prefix} Platform Key" OPT_OUTPUT="$pk_prefix" \
+        OPT_SIZE=4096 OPT_DAYS=3650 do_generate_inline
+
+    # KEK
+    local kek_prefix="$outdir/KEK"
+    OPT_TYPE="kek" OPT_CN="${cn_prefix} Key Exchange Key" OPT_OUTPUT="$kek_prefix" \
+        OPT_SIZE=4096 OPT_DAYS=3650 do_generate_inline
+
+    # db
+    local year
+    year=$(date +%Y)
+    local db_prefix="$outdir/db"
+    OPT_TYPE="db" OPT_CN="${cn_prefix} Release Signing Key $year" OPT_OUTPUT="$db_prefix" \
+        OPT_SIZE=2048 OPT_DAYS=1095 do_generate_inline
+
+    emit_finding "keys.hierarchy.complete" "signing_keys" "info" "pass" \
+        "Generated full PK/KEK/db hierarchy in $outdir" \
+        "Store PK.key and KEK.key offline (USB + safe). Keep db.key on signing host (0600)." \
+        "{\"output_dir\":\"$(json_escape "$outdir")\"}" \
+        "$(_remediation_json "keys.hierarchy.complete" \
+            "Read KEY-GENERATION.md §4 for offline storage discipline" \
+            "less ~/lamboot-dev/docs/KEY-GENERATION.md")"
+
+    success "Hierarchy generated in $outdir"
+    success "IMPORTANT: Move PK.key and KEK.key to offline storage."
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+do_generate_inline() {
+    # Helper: inline version of do_generate that doesn't emit JSON / exit.
+    # Used by do_generate_hierarchy to chain three generations.
+    local type="$OPT_TYPE"
+    local size="$OPT_SIZE"
+    local cn="$OPT_CN"
+    local days="$OPT_DAYS"
+    local prefix="$OPT_OUTPUT"
+
+    enforce_size_constraint "$type" "$size"
+
+    local is_ca eku="" basic_constraints key_usage="digitalSignature"
+    case "$type" in
+        pk|kek)
+            is_ca="TRUE"
+            basic_constraints="critical, CA:TRUE"
+            key_usage="critical, digitalSignature, keyCertSign"
+            ;;
+        db|leaf)
+            is_ca="FALSE"
+            basic_constraints="critical, CA:FALSE"
+            eku="codeSigning"
+            key_usage="critical, digitalSignature"
+            ;;
+    esac
+
+    local cnf
+    cnf=$(mktemp -t lamboot-signing-cnf.XXXXXX)
+    cat > "$cnf" <<EOF
+[ req ]
+default_bits       = $size
+default_md         = sha256
+prompt             = no
+encrypt_key        = yes
+distinguished_name = req_dn
+x509_extensions    = v3_ext
+
+[ req_dn ]
+CN = $cn
+
+[ v3_ext ]
+basicConstraints = $basic_constraints
+keyUsage = $key_usage
+$([[ -n "$eku" ]] && printf 'extendedKeyUsage = %s' "$eku")
+subjectKeyIdentifier = hash
+$([[ "$is_ca" == "TRUE" ]] && printf 'authorityKeyIdentifier = keyid:always')
+EOF
+
+    info "Generating ${type}: RSA-${size}, $days days"
+    openssl genrsa -aes256 -out "${prefix}.key" "$size" || { rm -f "$cnf"; die "openssl genrsa failed"; }
+    chmod 0600 "${prefix}.key"
+    openssl req -new -x509 -sha256 -days "$days" -key "${prefix}.key" -out "${prefix}.crt" -config "$cnf" \
+        || { rm -f "$cnf"; die "openssl req failed"; }
+    chmod 0644 "${prefix}.crt"
+    openssl x509 -in "${prefix}.crt" -outform DER -out "${prefix}.der" || die "der conversion failed"
+    chmod 0644 "${prefix}.der"
+    rm -f "$cnf"
+
+    record_action "keys.hierarchy.gen_${type}" "$prefix" "ok" "false" \
+        "{\"type\":\"$type\",\"size\":$size}" "null"
+}
+
+# ── Subcommand: sign-binary ──────────────────────────────────────────────
+
+_binary_has_sbat_section() {
+    # PE sections can be enumerated via objdump -h. Returns 0 if .sbat present.
+    local binary="$1"
+    command -v objdump >/dev/null 2>&1 || return 2  # can't check
+    objdump -h "$binary" 2>/dev/null | awk '{print $2}' | grep -Fxq '.sbat'
+}
+
+_resolve_sbat_content() {
+    # Resolution order (highest-to-lowest): --sbat-file, --sbat, /etc/lamboot/sbat.csv, default.
+    # Prints SBAT CSV content on stdout; returns 0 on success or 1 if nothing resolved.
+    if [[ -n "$OPT_SBAT_FILE" ]]; then
+        [[ -f "$OPT_SBAT_FILE" ]] || die "--sbat-file not found: $OPT_SBAT_FILE"
+        cat "$OPT_SBAT_FILE"
+        return 0
+    fi
+    if [[ -n "$OPT_SBAT" ]]; then
+        # Single-line SBAT: prepend the mandatory header row per shim SBAT.md
+        printf 'sbat,1,SBAT Version,sbat,1,https://github.com/rhboot/shim/blob/main/SBAT.md\n'
+        printf '%s\n' "$OPT_SBAT"
+        return 0
+    fi
+    if [[ -f /etc/lamboot/sbat.csv ]]; then
+        cat /etc/lamboot/sbat.csv
+        return 0
+    fi
+    # Built-in default — attributes the binary to lamboot-tools signing pipeline.
+    # Component ID "lamboot-tools.signed" distinguishes it from upstream lamboot
+    # binaries (component ID "lamboot") and from shim (component ID "shim").
+    local version="${LAMBOOT_TOOLKIT_VERSION:-unknown}"
+    printf 'sbat,1,SBAT Version,sbat,1,https://github.com/rhboot/shim/blob/main/SBAT.md\n'
+    printf 'lamboot-tools.signed,1,Lamco Development,lamboot-tools,%s,https://lamboot.dev/tools/sbat\n' "$version"
+    return 0
+}
+
+_inject_sbat_section() {
+    # Injects .sbat PE section into an EFI binary in-place.
+    # Uses objcopy --add-section with CONTENTS,ALLOC,LOAD,READONLY,DATA flags
+    # (standard PE section attributes for data sections — same set used by
+    # shim's own build system when it injects its .sbat).
+    local binary="$1" sbat_content="$2"
+    local tmp_sbat
+    tmp_sbat=$(mktemp -t lamboot-signing-sbat.XXXXXX)
+    # Track for cleanup in case of early exit
+    printf '%s' "$sbat_content" > "$tmp_sbat"
+
+    # Ensure the CSV ends with a newline so objcopy doesn't truncate the last entry
+    [[ "$(tail -c 1 "$tmp_sbat")" == $'\n' ]] || printf '\n' >> "$tmp_sbat"
+
+    require_tool objcopy "install binutils"
+
+    lamboot_run objcopy \
+        --add-section ".sbat=$tmp_sbat" \
+        --set-section-flags ".sbat=contents,alloc,load,readonly,data" \
+        "$binary" "$binary"
+    local rc=$?
+    rm -f "$tmp_sbat"
+    [[ $rc -eq 0 ]] || die "objcopy --add-section .sbat failed (rc=$rc)"
+}
+
+do_sign_binary() {
+    [[ -n "$OPT_INPUT" ]] || die "sign-binary requires BINARY path as first positional argument"
+    [[ -f "$OPT_INPUT" ]] || die "binary not found: $OPT_INPUT"
+    [[ -n "$OPT_KEY" ]] || die "--key required"
+    [[ -n "$OPT_CERT" ]] || die "--cert required"
+    [[ -f "$OPT_KEY" ]] || die "key file not found: $OPT_KEY"
+    [[ -f "$OPT_CERT" ]] || die "cert file not found: $OPT_CERT"
+
+    require_tool sbsign "install sbsigntool (Debian/Ubuntu) or sbsigntools (Fedora)"
+
+    local output="${OPT_OUTPUT:-$OPT_INPUT}"
+
+    # Work on a copy so we can inject SBAT without mutating the input until
+    # sbsign succeeds. If output == input, we still stage the intermediate.
+    local staging
+    staging=$(mktemp -t lamboot-signing-stage.XXXXXX)
+    cp "$OPT_INPUT" "$staging" || { rm -f "$staging"; die "cannot stage input for signing"; }
+
+    # SBAT injection phase.
+    local sbat_action="skipped"
+    if [[ $OPT_NO_SBAT -eq 1 ]]; then
+        verbose "SBAT injection explicitly disabled via --no-sbat"
+    elif _binary_has_sbat_section "$staging"; then
+        sbat_action="preserved (already present)"
+        verbose ".sbat section already present; not overwriting"
+    else
+        local sbat_content
+        sbat_content=$(_resolve_sbat_content)
+        _inject_sbat_section "$staging" "$sbat_content"
+        sbat_action="injected"
+    fi
+
+    # Signing phase.
+    lamboot_run sbsign --key "$OPT_KEY" --cert "$OPT_CERT" --output "$output" "$staging" \
+        || { rm -f "$staging"; die "sbsign failed"; }
+    rm -f "$staging"
+
+    emit_finding "keys.sign_binary.complete" "signing_keys" "info" "pass" \
+        "Binary signed → $output (SBAT: $sbat_action)" "" \
+        "{\"input\":\"$(json_escape "$OPT_INPUT")\",\"output\":\"$(json_escape "$output")\",\"sbat\":\"$sbat_action\"}" \
+        '{}'
+    record_action "keys.sign.binary" "$output" "ok" "false" \
+        "{\"cert\":\"$(json_escape "$OPT_CERT")\",\"sbat\":\"$sbat_action\"}" "null"
+
+    success "Signed → $output  (SBAT: $sbat_action)"
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+# ── CLI ──────────────────────────────────────────────────────────────────
+
+parse_args() {
+    local positional=()
+    while [[ $# -gt 0 ]]; do
+        parse_common_flag "$1"
+        local rc=$?
+        case $rc in
+            1) shift; continue ;;
+            2) _register_subcommands; dispatch_help; exit 0 ;;
+            3) printf 'lamboot-signing-keys %s (lamboot-tools %s)\n' \
+                "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
+            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            5) shift; shift; continue ;;
+            0) ;;
+        esac
+
+        case "$1" in
+            --mode)           OPT_MODE="${2:-auto}"; shift 2 ;;
+            --type)           OPT_TYPE="${2:-db}"; shift 2 ;;
+            --size)           OPT_SIZE="${2:-}"; shift 2 ;;
+            --cn)             OPT_CN="${2:-}"; shift 2 ;;
+            --days)           OPT_DAYS="${2:-}"; shift 2 ;;
+            --output)         OPT_OUTPUT="${2:-}"; shift 2 ;;
+            --output-dir)     OPT_OUTPUT_DIR="${2:-}"; shift 2 ;;
+            --key)            OPT_KEY="${2:-}"; shift 2 ;;
+            --cert)           OPT_CERT="${2:-}"; shift 2 ;;
+            --force-4096)     OPT_FORCE_4096=1; shift ;;
+            --passphrase)     OPT_PASSPHRASE_SRC="${2:-}"; shift 2 ;;
+            --new-cn)         OPT_NEW_CN="${2:-}"; shift 2 ;;
+            --sbat)           OPT_SBAT="${2:-}"; shift 2 ;;
+            --sbat-file)      OPT_SBAT_FILE="${2:-}"; shift 2 ;;
+            --no-sbat)        OPT_NO_SBAT=1; shift ;;
+            --old-key)        OPT_OLD_KEY="${2:-}"; shift 2 ;;
+            --old-cert)       OPT_OLD_CERT="${2:-}"; shift 2 ;;
+            --parent-key)     OPT_PARENT_KEY="${2:-}"; shift 2 ;;
+            --parent-cert)    OPT_PARENT_CERT="${2:-}"; shift 2 ;;
+            generate|inspect|status|mok-enroll|mok-list|mok-delete|ovmf-vars|generate-hierarchy|sign-binary|rotate|help)
+                if [[ -z "$OPT_SUBCOMMAND" ]]; then
+                    OPT_SUBCOMMAND="$1"
+                else
+                    positional+=("$1")
+                fi
+                shift ;;
+            -*)               die "unknown option: $1" ;;
+            *)                positional+=("$1"); shift ;;
+        esac
+    done
+
+    if [[ "$OPT_SUBCOMMAND" == "help" ]]; then
+        _register_subcommands
+        if [[ ${#positional[@]} -gt 0 ]]; then
+            dispatch_help "${positional[0]}"
+        else
+            dispatch_help
+        fi
+        exit 0
+    fi
+
+    # First positional is the file/binary argument
+    if [[ ${#positional[@]} -gt 0 ]]; then
+        case "$OPT_SUBCOMMAND" in
+            inspect|mok-enroll|mok-delete|sign-binary) OPT_INPUT="${positional[0]}" ;;
+            ovmf-vars) OPT_OUTPUT="${positional[0]}" ;;
+            rotate)    OPT_TYPE="${positional[0]}" ;;
+        esac
+    fi
+}
+
+# ── Subcommand: rotate ───────────────────────────────────────────────────
+#
+# Rotation flow (per SPEC-LAMBOOT-SIGNING-KEYS.md §3.10 + KEY-GENERATION.md §6.1):
+#
+#   1. Validate TYPE (db|kek|pk) and the --old-key / --old-cert pair.
+#   2. For db/kek rotations, validate the --parent-key / --parent-cert pair;
+#      for pk rotation, parent is self (PK is root of trust).
+#      If parent missing for db/kek, emit a warning-level finding and produce
+#      a self-signed new cert (user must cross-sign offline).
+#   3. Generate a new private key with the type's default RSA size.
+#   4. Build an OpenSSL config cloning the old cert's DN + extensions, plus
+#      the new CN (defaulting to old CN + "-rotated-YYYYMMDD").
+#   5. Emit either:
+#        (a) a cross-signed new cert (new_pub signed by parent_priv), OR
+#        (b) a self-signed new cert (new_pub signed by new_priv), with a
+#            "manual cross-sign required" warning finding.
+#   6. Copy the old keypair, the new keypair, the cross-sign intermediate
+#      (if any), and a rotation manifest JSON into a timestamped output dir.
+#   7. Emit a re-enrollment instructions finding with remediation command
+#      pointing at the correct tool (mokutil --import for db, or
+#      lamboot-signing-keys ovmf-vars for KEK/PK distribution).
+
+_rotate_resolve_new_cn() {
+    local old_cert="$1"
+    local old_cn
+    old_cn=$(openssl x509 -in "$old_cert" -noout -subject 2>/dev/null \
+                | sed -E 's/.*CN *= *([^,]*).*/\1/' | sed 's/^ *//;s/ *$//')
+    if [[ -n "$OPT_NEW_CN" ]]; then
+        printf '%s' "$OPT_NEW_CN"
+    elif [[ -n "$old_cn" ]]; then
+        printf '%s-rotated-%s' "$old_cn" "$(date -u +%Y%m%d)"
+    else
+        printf 'LamBoot-%s-rotated-%s' "$OPT_TYPE" "$(date -u +%Y%m%d)"
+    fi
+}
+
+do_rotate() {
+    require_tool openssl "install openssl (should be ubiquitous)"
+
+    local type="$OPT_TYPE"
+    case "$type" in
+        db|kek|pk) ;;
+        "")  die "rotate requires TYPE as first positional argument (db|kek|pk)" ;;
+        *)   die "rotate TYPE must be one of: db, kek, pk (got: $type)" ;;
+    esac
+
+    [[ -n "$OPT_OLD_KEY"  ]] || die "--old-key required"
+    [[ -n "$OPT_OLD_CERT" ]] || die "--old-cert required"
+    [[ -f "$OPT_OLD_KEY"  ]] || die "old key not found: $OPT_OLD_KEY"
+    [[ -f "$OPT_OLD_CERT" ]] || die "old cert not found: $OPT_OLD_CERT"
+
+    # Validate old-key/old-cert pair before touching anything.
+    local old_pub_hash old_cert_pub_hash
+    old_pub_hash=$(openssl rsa -in "$OPT_OLD_KEY" -pubout 2>/dev/null | openssl sha256 | awk '{print $NF}')
+    old_cert_pub_hash=$(openssl x509 -in "$OPT_OLD_CERT" -pubkey -noout 2>/dev/null | openssl sha256 | awk '{print $NF}')
+    if [[ -z "$old_pub_hash" ]] || [[ "$old_pub_hash" != "$old_cert_pub_hash" ]]; then
+        die "old key and old cert do not match (public-key hash mismatch)"
+    fi
+
+    # Parent validation (for cross-sign).
+    local can_cross_sign=0
+    case "$type" in
+        db|kek)
+            if [[ -n "$OPT_PARENT_KEY" ]] && [[ -n "$OPT_PARENT_CERT" ]]; then
+                [[ -f "$OPT_PARENT_KEY" ]]  || die "parent key not found: $OPT_PARENT_KEY"
+                [[ -f "$OPT_PARENT_CERT" ]] || die "parent cert not found: $OPT_PARENT_CERT"
+                local p_key_hash p_cert_hash
+                p_key_hash=$(openssl rsa -in "$OPT_PARENT_KEY" -pubout 2>/dev/null | openssl sha256 | awk '{print $NF}')
+                p_cert_hash=$(openssl x509 -in "$OPT_PARENT_CERT" -pubkey -noout 2>/dev/null | openssl sha256 | awk '{print $NF}')
+                [[ "$p_key_hash" == "$p_cert_hash" ]] || die "parent key and parent cert do not match"
+                can_cross_sign=1
+            else
+                warn "no --parent-key/--parent-cert provided; will produce self-signed new cert and emit a manual-cross-sign warning"
+            fi
+            ;;
+        pk)
+            # PK is self-signed by definition; a cross-sign only makes sense if
+            # you're changing PK, which is also self-signed. Emit a distinct
+            # informational finding about the transition.
+            can_cross_sign=0
+            ;;
+    esac
+
+    local size days
+    size=$(resolve_size "$type")
+    days=$(resolve_days "$type")
+    enforce_size_constraint "$type" "$size"
+
+    local new_cn
+    new_cn=$(_rotate_resolve_new_cn "$OPT_OLD_CERT")
+
+    local ts
+    ts=$(date -u +%Y%m%d-%H%M%S)
+    local outdir="${OPT_OUTPUT_DIR:-./rotation-${type}-${ts}}"
+    [[ -d "$outdir" ]] && [[ $LAMBOOT_FORCE -eq 0 ]] \
+        && die "output directory already exists: $outdir (use --force to overwrite)"
+    mkdir -p "$outdir" || die "cannot create output directory: $outdir"
+    chmod 0700 "$outdir"
+
+    info "Rotating $type key: RSA-$size, new CN='$new_cn', output dir=$outdir"
+
+    if [[ $LAMBOOT_DRY_RUN -eq 1 ]]; then
+        info "DRY-RUN: would generate new keypair + cross-sign + write rotation manifest"
+        record_action "keys.rotate.dry_run" "$outdir" "ok" "false" \
+            "{\"type\":\"$type\",\"size\":$size,\"new_cn\":\"$(json_escape "$new_cn")\",\"can_cross_sign\":$can_cross_sign}" "null"
+        emit_json "$EXIT_OK"
+        exit "$EXIT_OK"
+    fi
+
+    # Copy the old keypair into the rotation dir (dual-valid window).
+    cp "$OPT_OLD_KEY"  "${outdir}/${type}.old.key"  || die "cannot copy old key"
+    cp "$OPT_OLD_CERT" "${outdir}/${type}.old.crt" || die "cannot copy old cert"
+    openssl x509 -in "$OPT_OLD_CERT" -outform DER -out "${outdir}/${type}.old.der" 2>/dev/null || true
+    chmod 0600 "${outdir}/${type}.old.key"
+
+    # Build OpenSSL config for the new cert, preserving key-usage + CA semantics.
+    local is_ca basic_constraints key_usage="digitalSignature" eku=""
+    case "$type" in
+        pk|kek)
+            is_ca="TRUE"
+            basic_constraints="critical, CA:TRUE"
+            key_usage="critical, digitalSignature, keyCertSign"
+            ;;
+        db)
+            is_ca="FALSE"
+            basic_constraints="critical, CA:FALSE"
+            eku="codeSigning"
+            key_usage="critical, digitalSignature"
+            ;;
+    esac
+
+    local cnf
+    cnf=$(mktemp -t lamboot-signing-cnf.XXXXXX)
+    cat > "$cnf" <<EOF
+[ req ]
+default_bits       = $size
+default_md         = sha256
+prompt             = no
+encrypt_key        = yes
+distinguished_name = req_dn
+req_extensions     = v3_ext
+x509_extensions    = v3_ext
+
+[ req_dn ]
+CN = $new_cn
+
+[ v3_ext ]
+basicConstraints = $basic_constraints
+keyUsage = $key_usage
+$([[ -n "$eku" ]] && printf 'extendedKeyUsage = %s' "$eku")
+subjectKeyIdentifier = hash
+EOF
+
+    # Generate new private key.
+    lamboot_run openssl genrsa -aes256 -out "${outdir}/${type}.new.key" "$size" \
+        || { rm -f "$cnf"; die "openssl genrsa failed"; }
+    chmod 0600 "${outdir}/${type}.new.key"
+
+    # Build the new cert — either cross-signed by parent, or self-signed.
+    if [[ $can_cross_sign -eq 1 ]]; then
+        # 1. Generate a CSR for the new key.
+        lamboot_run openssl req -new -sha256 \
+            -key "${outdir}/${type}.new.key" \
+            -out "${outdir}/${type}.new.csr" \
+            -config "$cnf" \
+            || { rm -f "$cnf"; die "openssl req CSR generation failed"; }
+
+        # 2. Sign the CSR with the parent key.
+        lamboot_run openssl x509 -req -sha256 -days "$days" \
+            -in   "${outdir}/${type}.new.csr" \
+            -CA   "$OPT_PARENT_CERT" \
+            -CAkey "$OPT_PARENT_KEY" \
+            -CAcreateserial \
+            -out "${outdir}/${type}.new.crt" \
+            -extfile "$cnf" -extensions v3_ext \
+            || { rm -f "$cnf"; die "openssl x509 cross-sign failed"; }
+    else
+        # Self-signed.
+        lamboot_run openssl req -new -x509 -sha256 -days "$days" \
+            -key "${outdir}/${type}.new.key" \
+            -out "${outdir}/${type}.new.crt" \
+            -config "$cnf" \
+            || { rm -f "$cnf"; die "openssl req self-sign failed"; }
+    fi
+    chmod 0644 "${outdir}/${type}.new.crt"
+
+    # Produce DER form for firmware enrollment.
+    lamboot_run openssl x509 -in "${outdir}/${type}.new.crt" \
+        -outform DER -out "${outdir}/${type}.new.der" \
+        || { rm -f "$cnf"; die "openssl DER conversion failed"; }
+    chmod 0644 "${outdir}/${type}.new.der"
+
+    rm -f "$cnf"
+
+    # Rotation manifest JSON.
+    local old_subj new_subj old_fp new_fp
+    old_subj=$(openssl x509 -in "${outdir}/${type}.old.crt" -noout -subject 2>/dev/null | sed 's/^subject= *//')
+    new_subj=$(openssl x509 -in "${outdir}/${type}.new.crt" -noout -subject 2>/dev/null | sed 's/^subject= *//')
+    old_fp=$(openssl x509 -in "${outdir}/${type}.old.crt" -noout -fingerprint -sha256 2>/dev/null | sed 's/^SHA256 Fingerprint=//')
+    new_fp=$(openssl x509 -in "${outdir}/${type}.new.crt" -noout -fingerprint -sha256 2>/dev/null | sed 's/^SHA256 Fingerprint=//')
+
+    cat > "${outdir}/rotation.json" <<EOF
+{
+  "schema_version": "1",
+  "rotation_type": "$type",
+  "rotated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "toolkit_version": "$LAMBOOT_TOOLKIT_VERSION",
+  "old": {
+    "key":  "${type}.old.key",
+    "cert": "${type}.old.crt",
+    "der":  "${type}.old.der",
+    "subject":     "$(json_escape "$old_subj")",
+    "sha256_fingerprint": "$(json_escape "$old_fp")"
+  },
+  "new": {
+    "key":  "${type}.new.key",
+    "cert": "${type}.new.crt",
+    "der":  "${type}.new.der",
+    "subject":     "$(json_escape "$new_subj")",
+    "sha256_fingerprint": "$(json_escape "$new_fp")",
+    "cross_signed": $([[ $can_cross_sign -eq 1 ]] && printf 'true' || printf 'false'),
+    "rsa_bits": $size,
+    "days_valid": $days
+  },
+  "transition_window": {
+    "dual_valid": true,
+    "note": "Both old and new keys remain valid for signing during the distribution window. Sign new artifacts with the NEW key; keep the OLD key accessible for re-signing stragglers and for emergency rollback."
+  }
+}
+EOF
+    chmod 0644 "${outdir}/rotation.json"
+
+    # Emit findings.
+    local re_enroll_cmd
+    case "$type" in
+        db)   re_enroll_cmd="sudo mokutil --import ${outdir}/${type}.new.der" ;;
+        kek)  re_enroll_cmd="sudo lamboot-signing-keys ovmf-vars /path/to/OVMF_VARS.fd --cert ${outdir}/${type}.new.crt  # then redistribute to VMs" ;;
+        pk)   re_enroll_cmd="manually update firmware PK via hardware setup mode — NEVER ship a PK rotation without physical-presence confirmation" ;;
+    esac
+
+    emit_finding "keys.rotate.complete" "signing_keys" "info" "pass" \
+        "Rotated $type key → $outdir" \
+        "Old: $old_subj | New: $new_subj | Cross-signed: $([[ $can_cross_sign -eq 1 ]] && printf 'YES' || printf 'NO (self-signed; cross-sign with parent manually before distribution)')" \
+        "{\"type\":\"$type\",\"output_dir\":\"$(json_escape "$outdir")\",\"cross_signed\":$([[ $can_cross_sign -eq 1 ]] && printf 'true' || printf 'false')}" \
+        "{\"summary\":\"Re-enroll the new cert\",\"command\":\"$(json_escape "$re_enroll_cmd")\",\"doc_url\":\"https://lamboot.dev/tools/signing-keys/rotate\"}"
+
+    if [[ $can_cross_sign -eq 0 ]] && [[ "$type" != "pk" ]]; then
+        emit_finding "keys.rotate.manual_cross_sign_required" "signing_keys" "warning" "warn" \
+            "Cross-sign NOT performed; manual step required before distribution" \
+            "The new $type cert is self-signed. Before distribution, cross-sign it with the parent $([[ "$type" == "db" ]] && printf 'KEK' || printf 'PK') using: openssl x509 -req -CA <parent.crt> -CAkey <parent.key> -CAcreateserial -in ${outdir}/${type}.new.csr -out ${outdir}/${type}.new.crt -days $days" \
+            "{\"output_dir\":\"$(json_escape "$outdir")\"}" \
+            '{}'
+    fi
+
+    record_action "keys.rotate.keypair" "$outdir" "ok" "true" \
+        "{\"type\":\"$type\",\"size\":$size,\"cross_signed\":$([[ $can_cross_sign -eq 1 ]] && printf 'true' || printf 'false')}" "null"
+
+    success "Rotation artifacts at $outdir (old + new keypairs; rotation.json manifest)"
+    success "Re-enroll: $re_enroll_cmd"
+
+    emit_json "$EXIT_OK"
+    exit "$EXIT_OK"
+}
+
+main() {
+    parse_args "$@"
+
+    [[ -z "$OPT_SUBCOMMAND" ]] && die "no subcommand (try: lamboot-signing-keys help)"
+
+    case "$OPT_SUBCOMMAND" in
+        generate)           do_generate ;;
+        inspect)            do_inspect ;;
+        status)             do_status ;;
+        mok-enroll)         do_mok_enroll ;;
+        mok-list)           do_mok_list ;;
+        mok-delete)         do_mok_delete ;;
+        ovmf-vars)          do_ovmf_vars ;;
+        generate-hierarchy) do_generate_hierarchy ;;
+        sign-binary)        do_sign_binary ;;
+        rotate)             do_rotate ;;
+        *)                  die "unknown subcommand: $OPT_SUBCOMMAND" ;;
+    esac
+}
+
+main "$@"

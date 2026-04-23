@@ -1,0 +1,6 @@
+# Mirror checksums for lamboot-toolkit-pve
+# Generated: 2026-04-23T11:59:16Z
+# Source: /home/greg/lamboot-dev
+
+89bfdeb4ffd402cf0dd359fd48839b0c6cdb5187e00a25b9f39a2afdc40c51b1  lamboot-pve-monitor  (from tools/lamboot-monitor.py)
+bd2d533e3cf5170bbd178b018872cef6e6228c5a7ebb7b52a28d6e2394255b7a  lamboot-pve-ovmf-vars  (from tools/build-ovmf-vars.sh)

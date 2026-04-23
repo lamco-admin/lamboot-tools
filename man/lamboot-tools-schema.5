@@ -1,0 +1,255 @@
+.\" lamboot-tools-schema(5) — unified JSON output reference
+.TH "LAMBOOT-TOOLS-SCHEMA" "5" "2026-04-22" "lamboot-tools 0.2.0" "lamboot-tools"
+.SH NAME
+lamboot-tools-schema \- unified JSON output schema v1 for lamboot-tools
+.SH DESCRIPTION
+Every tool in the
+.BR lamboot-tools (7)
+suite emits JSON conforming to the schema described in this page when
+invoked with \fB\-\-json\fR. This schema is SEMVER-STABLE within major
+toolkit versions: additive changes are permitted (new optional fields);
+breaking changes bump the toolkit major version and \fBschema_version\fR
+in lockstep.
+.SH ENVELOPE
+.PP
+.RS 4
+.nf
+{
+  "schema_version": "v1",
+  "tool": "<tool-name>",
+  "version": "<per-tool semver>",
+  "toolkit_version": "<toolkit semver>",
+  "timestamp": "<ISO-8601 UTC>",
+  "host": "<hostname>",
+  "run_id": "<ISO-timestamp-dashes-6hex>",
+  "command": "<argv joined>",
+  "dry_run": true|false,
+  "exit_code": 0..7,
+  "summary": {
+    "status": "pass|warn|fail|noop|error|unsafe|abort",
+    "findings_total": N,
+    "findings_by_severity": {
+      "critical": N,
+      "error":    N,
+      "warning":  N,
+      "info":     N
+    }
+  },
+  "findings":     [ <finding>, ... ],
+  "actions_taken":[ <action>,  ... ],
+  "backup_dir":   "<path>" | null
+}
+.fi
+.RE
+.SS Envelope fields
+.TP
+.B schema_version
+Always \fB"v1"\fR in toolkit v0.2. Changes with major toolkit bumps.
+.TP
+.B tool
+The executable name (\fBlamboot-diagnose\fR, etc).
+.TP
+.B version
+Per-tool semantic version.
+.TP
+.B toolkit_version
+The unified \fBlamboot-tools\fR release version bundling this tool.
+.TP
+.B run_id
+Unique within host across time. Format:
+\fB<ISO-timestamp-with-dashes>\-<6-hex-random>\fR. Correlates log lines,
+backup dirs, and JSON output from one invocation.
+.TP
+.B command
+Exact argv joined by single spaces. Any \fBtype-password\fR source values
+are redacted to \fB***\fR.
+.TP
+.B exit_code
+Matches the process exit code; always present, always accurate.
+.SH FINDINGS
+Each entry in \fBfindings[]\fR:
+.PP
+.RS 4
+.nf
+{
+  "id":          "<dotted.path.id>",
+  "category":    "<broad-grouping>",
+  "severity":    "critical|error|warning|info",
+  "status":      "pass|warn|fail|skip",
+  "title":       "<short summary>",
+  "message":     "<detailed message with substitutions>",
+  "context":     { <tool-specific keys and values> },
+  "remediation": {
+    "summary":   "<one-sentence plan>",
+    "command":   "<suggested shell command>",
+    "doc_url":   "<https://lamboot.dev/tools/findings/.../...>"
+  }
+}
+.fi
+.RE
+.SS Finding IDs
+Dotted-path stable identifiers: \fB<category>.<specific>[.<subspecific>]\fR.
+Examples:
+.IP
+\fBesp.free_space\fR
+.br
+\fBbootloader.grub.pe_format\fR
+.br
+\fBfstab.uuid_form\fR
+.br
+\fBtrust.shim.absent\fR
+.PP
+IDs are SEMVER-STABLE within the toolkit's major version. Adding new IDs
+is additive; renaming existing IDs is a major-version event.
+.SS Severity vs status
+These fields are orthogonal:
+.IP
+\fBseverity\fR answers "how bad is this if unaddressed":
+.RS 2
+.IP \(bu 2
+\fBcritical\fR \(em booting the system will fail
+.IP \(bu 2
+\fBerror\fR \(em some capability broken (not boot-fatal)
+.IP \(bu 2
+\fBwarning\fR \(em works but risky or suboptimal
+.IP \(bu 2
+\fBinfo\fR \(em fine as-is, reported for visibility
+.RE
+.IP
+\fBstatus\fR answers "what did this check report":
+.RS 2
+.IP \(bu 2
+\fBpass\fR \(em check ran, expected condition met
+.IP \(bu 2
+\fBwarn\fR \(em check ran, condition marginal
+.IP \(bu 2
+\fBfail\fR \(em check ran, condition failed
+.IP \(bu 2
+\fBskip\fR \(em check did not run (prerequisite missing, filter)
+.RE
+.SS Remediation
+The \fBremediation\fR object is present for every finding at severity
+\fBwarning\fR or above. Fields:
+.TP
+.B summary
+One-sentence human-readable remediation plan.
+.TP
+.B command
+Suggested shell command. \fBAdvisory only at v0.2\fR \(em never invoked
+automatically by tools. A future \fBlamboot-toolkit run-remediation\fR
+subcommand may execute these after confirmation; not in v0.2 scope.
+.TP
+.B doc_url
+Always resolves to
+.UR https://lamboot.dev/tools/findings/
+.UE
+sub-path. Every dotted-path ID has a permanent URL.
+.SH ACTIONS
+Tools that mutate state populate \fBactions_taken[]\fR. Each entry:
+.PP
+.RS 4
+.nf
+{
+  "action":      "<dotted.verb>",
+  "target":      "<path-or-identifier>",
+  "result":      "ok|fail|skipped|abort",
+  "reversible":  true|false,
+  "backup_ref":  "<path>" | null,
+  "dry_run":     true|false,
+  "details":     { <tool-specific> }
+}
+.fi
+.RE
+.PP
+Verb namespace parallels finding IDs:
+\fBpartition.create\fR, \fBfstab.rewrite\fR, \fBefibootmgr.create_entry\fR,
+\fBesp.file_delete\fR, and so on.
+.SH BACKUP DIRECTORY CONTRACT
+When a tool writes a backup, it uses this layout:
+.PP
+.RS 4
+.nf
+/var/backups/lamboot-<tool>-<run_id>/
+  MANIFEST.json         tool metadata + planned actions
+  <per-tool artifacts>  tool-defined
+  SUCCESS.flag          written iff verification passed
+  ROLLBACK.log          append-only; rollback attempts
+.fi
+.RE
+.PP
+\fBMANIFEST.json\fR is authoritative \(em any tool reading a backup MUST
+validate the manifest before acting.
+.SH SCHEMA VERSIONING
+Pinning: consumers should check \fBschema_version == "v1"\fR and handle
+any non-matching version by aborting or falling back to a known-safe
+pass-through.
+.PP
+\fBAdditive\fR changes (new optional fields, new severity/status tokens,
+new category names): do NOT bump schema_version. Consumers that don't
+know about new fields simply ignore them.
+.PP
+\fBBreaking\fR changes (field removal, renaming, semantics change): bump
+\fBschema_version\fR AND the toolkit major version in lockstep.
+.SH CONSUMPTION GUARANTEES
+.IP \(bu 2
+Every tool's \fB\-\-json\fR output passes \fBjq -e .\fR on stdout
+regardless of the process exit code.
+.IP \(bu 2
+Every tool's \fB\-\-json-schema\fR output is a valid JSON Schema (draft
+2020-12) describing the envelope and the tool-specific \fBcontext\fR
+shape.
+.IP \(bu 2
+No log lines go to stdout when \fB\-\-json\fR is active. All human output
+goes to stderr.
+.IP \(bu 2
+Color codes are suppressed on stdout when \fB\-\-json\fR is active.
+.SH EXAMPLE
+A typical
+.B lamboot-diagnose
+run (elided for brevity):
+.PP
+.RS 4
+.nf
+{
+  "schema_version": "v1",
+  "tool": "lamboot-diagnose",
+  "version": "0.2.0",
+  "toolkit_version": "0.2.0",
+  "timestamp": "2026-04-22T14:37:22Z",
+  "host": "laptop-01",
+  "run_id": "2026-04-22T14-37-22-a1b2c3",
+  "command": "lamboot-diagnose --json",
+  "dry_run": false,
+  "exit_code": 2,
+  "summary": {
+    "status": "fail",
+    "findings_total": 19,
+    "findings_by_severity": {"critical": 1, "error": 1, "warning": 2, "info": 15}
+  },
+  "findings": [
+    {
+      "id": "esp.free_space",
+      "category": "esp",
+      "severity": "warning",
+      "status": "warn",
+      "title": "ESP is 89% full",
+      "message": "ESP at /boot/efi has 54 MB free of 512 MB",
+      "context": {"esp_mount": "/boot/efi", "free_bytes": 56623104, "total_bytes": 536870912},
+      "remediation": {
+        "summary": "Remove stale kernel images to free space",
+        "command": "sudo lamboot-esp clean --dry-run",
+        "doc_url": "https://lamboot.dev/tools/findings/esp/free_space"
+      }
+    }
+  ],
+  "actions_taken": [],
+  "backup_dir": null
+}
+.fi
+.RE
+.SH SEE ALSO
+.BR lamboot-tools (7),
+.BR lamboot-diagnose (1),
+.BR jq (1)
+.SH LICENSE
+MIT OR Apache-2.0

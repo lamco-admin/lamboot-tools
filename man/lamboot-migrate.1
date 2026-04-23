@@ -1,0 +1,469 @@
+.\" lamboot-migrate(1) — auto-generated from help registry
+.\" Source: tools/lamboot-migrate
+.\" Generated: 2026-04-23T12:02:39Z
+.\" DO NOT EDIT — regenerate via `make man` or `scripts/registry-to-man`.
+.TH "LAMBOOT-MIGRATE" "1" "2026-04-23" "lamboot-migrate 1.0.0" "lamboot-tools"
+.SH NAME
+lamboot-migrate \- part of the lamboot-tools suite
+.SH SYNOPSIS
+.B lamboot-migrate
+[\fIGLOBAL FLAGS\fR] [\fISUBCOMMAND\fR] [\fIARGS\fR]
+.SH DESCRIPTION
+lamboot-migrate is part of
+.BR lamboot-tools (7),
+"The Linux UEFI boot toolkit." See that page for suite-level conventions
+and cross-tool composition.
+.PP
+This page documents every subcommand registered in lamboot-migrate's help
+registry. Every subcommand is also accessible via
+.BI "lamboot-migrate help " SUBCOMMAND
+at runtime.
+.SH SUBCOMMANDS
+.SS to\-uefi
+.PP
+.I Convert BIOS/MBR system to UEFI/GPT
+.PP
+.B Category:
+Migration
+.br
+.B Maturity:
+stable
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-migrate to\-uefi [\-\-disk DEV] [\-\-esp\-size MB] [\-\-bootloader NAME] [\-\-method A|B|C|auto] [\-\-cmdline STR] [\-\-backup\-dir PATH] [\-\-skip\-verify] [\-\-keep\-legacy\-mbr]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B \-\-disk DEV
+Target disk (default: auto\-detect root disk)
+.TP
+.B \-\-esp\-size MB
+ESP partition size in MB (default: 550)
+.TP
+.B \-\-bootloader NAME
+grub\-efi (default), lamboot, or systemd\-boot
+.TP
+.B \-\-method A
+\-\-method A
+.TP
+.B B
+B
+.TP
+.B C
+C
+.TP
+.B auto
+Proxmox VM method selector (default: auto)
+.TP
+.B \-\-cmdline STR
+Override kernel cmdline for new BLS entries
+.TP
+.B \-\-backup\-dir PATH
+Where to store the backup (default: /var/backups/lamboot\-migrate\-<ts>/)
+.TP
+.B \-\-skip\-verify
+Don\'t run verification suite after conversion
+.TP
+.B \-\-keep\-legacy\-mbr
+Leave MBR boot code (protective) — default
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-migrate to\-uefi \-\-disk /dev/sda
+sudo lamboot\-migrate to\-uefi \-\-dry\-run
+sudo lamboot\-migrate to\-uefi \-\-bootloader lamboot \-\-esp\-size 1024
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Runs a 10\-phase pipeline with safety gates at each step. The first 6 phases are reversible with no disk changes (rollback runs a diff). After Phase 4 (MBR→GPT), rollback requires the backup dir. Always back up your system before running. For boot disk migration on physical hardware, run from live media.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Requires root (sudo)
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+to\-lamboot, verify, rollback, status
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/migrate/to-uefi
+.UE
+.RE
+.PP
+.SS to\-lamboot
+.PP
+.I Migrate UEFI system from another bootloader to LamBoot
+.PP
+.B Category:
+Migration
+.br
+.B Maturity:
+stable
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-migrate to\-lamboot [\-\-esp PATH] [\-\-preserve\-grub|\-\-remove\-grub] [\-\-force]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B \-\-esp PATH
+ESP mount point (default: auto\-detect)
+.TP
+.B \-\-preserve\-grub
+Keep existing bootloader as fallback (default)
+.TP
+.B \-\-remove\-grub
+Remove GRUB packages + ESP files + NVRAM entries after verify passes (DANGEROUS)
+.TP
+.B \-\-force
+Skip typed\-yes confirmation when \-\-remove\-grub is used
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-migrate to\-lamboot
+sudo lamboot\-migrate to\-lamboot \-\-preserve\-grub
+sudo lamboot\-migrate to\-lamboot \-\-remove\-grub    # asks for confirmation
+sudo lamboot\-migrate to\-lamboot \-\-remove\-grub \-\-force
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Invokes lamboot\-install. With \-\-preserve\-grub (default) the prior bootloader stays as a UEFI fallback. With \-\-remove\-grub the tool runs verify first; if all 11 checks pass, it uninstalls the distro\'s GRUB packages, removes GRUB files from the ESP, and deletes GRUB Boot#### entries from NVRAM. Refuses to remove if verify fails. Requires typed\-yes confirmation unless \-\-force.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Requires root (sudo)
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+to\-uefi, rollback
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/migrate/to-lamboot
+.UE
+.RE
+.PP
+.SS verify
+.PP
+.I Run the 11\-check post\-conversion verification suite
+.PP
+.B Category:
+Verification
+.br
+.B Maturity:
+stable
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-migrate verify [\-\-all] [\-\-path BACKUP\-DIR] [\-\-json]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B \-\-all
+Run all checks (default)
+.TP
+.B \-\-path PATH
+Verify a backup directory produced by \-\-backup\-dir
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-migrate verify
+sudo lamboot\-migrate verify \-\-json
+sudo lamboot\-migrate verify \-\-path /var/backups/lamboot\-migrate\-2026\-04\-22...
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Runs 11 independent checks per SDS\-7 §9. Exits 0 if all pass, 1 if any fail. Safe to run repeatedly. Read\-only — does not modify state.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+to\-uefi, rollback
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/migrate/verify
+.UE
+.RE
+.PP
+.SS rollback
+.PP
+.I Revert the most recent to\-uefi run using its backup
+.PP
+.B Category:
+Recovery
+.br
+.B Maturity:
+stable
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-migrate rollback [\-\-backup\-dir PATH]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B \-\-backup\-dir PATH
+Specific backup to restore (default: most recent)
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-migrate rollback
+sudo lamboot\-migrate rollback \-\-backup\-dir /var/backups/lamboot\-migrate\-2026\-04\-22...
+sudo lamboot\-migrate rollback \-\-dry\-run
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Restores the original MBR partition table, original fstab, and original /etc/default/grub. Removes the UEFI boot entry created during to\-uefi. You will need to switch firmware back to Legacy/CSM after rollback to boot off the restored MBR.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Requires root (sudo)
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+to\-uefi, verify
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/migrate/rollback
+.UE
+.RE
+.PP
+.SS status
+.PP
+.I Show current boot configuration and migration readiness
+.PP
+.B Category:
+Information
+.br
+.B Maturity:
+stable
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-migrate status [\-\-json]
+.fi
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+lamboot\-migrate status
+lamboot\-migrate status \-\-json 
+ jq .findings
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Read\-only; runs unprivileged. Reports boot mode, partition table type, ESP state, installed bootloaders, fstab form, and migration readiness.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+to\-uefi, verify
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/migrate/status
+.UE
+.RE
+.PP
+.SH GLOBAL FLAGS
+Every subcommand accepts these universal flags (documented in
+.BR lamboot-tools (7)):
+.TP
+.BR \-\-help ", " \-h
+Show inline help
+.TP
+.B \-\-version
+Print tool and toolkit version
+.TP
+.B \-\-json
+Emit unified JSON output (schema v1)
+.TP
+.B \-\-json-schema
+Print the JSON schema this tool emits
+.TP
+.BR \-\-verbose ", " \-v
+Informational output beyond the default
+.TP
+.BR \-\-quiet ", " \-q
+Only warnings and errors
+.TP
+.B \-\-no-color
+Disable ANSI color (auto on non-TTY)
+.TP
+.B \-\-dry-run
+Print planned actions without executing
+.TP
+.BR \-\-yes ", " \-y
+Answer yes to interactive prompts
+.TP
+.B \-\-force
+Skip safety checks (per-subcommand semantics)
+.TP
+.B \-\-auto
+Non-interactive full automation (implies \fB\-\-yes\fR)
+.TP
+.BI \-\-offline " DISK"
+Operate on an unmounted disk or image
+.TP
+.B \-\-suggest-next-command
+Print the recommended follow-up command
+.SH EXIT STATUS
+.TP
+.B 0
+Success
+.TP
+.B 1
+Fatal error
+.TP
+.B 2
+Partial \- some operations succeeded, some failed
+.TP
+.B 3
+Nothing to do (already in requested state)
+.TP
+.B 4
+Refused due to a safety check
+.TP
+.B 5
+User declined interactive confirmation
+.TP
+.B 6
+Operation does not apply to this system
+.TP
+.B 7
+Required tool or capability is missing
+.SH FILES
+.TP
+.I /usr/lib/lamboot-tools/lamboot-toolkit-lib.sh
+Shared library sourced by every tool
+.TP
+.I /usr/lib/lamboot-tools/lamboot-toolkit-help.sh
+Help registry driver
+.TP
+.I /var/backups/lamboot-*-<timestamp>/
+Per-run backup directory (when a tool mutates state)
+.SH ENVIRONMENT
+.TP
+.B LAMBOOT_LIB_DIR
+Override shared library directory (default:
+.IR /usr/lib/lamboot-tools ).
+.TP
+.B NO_COLOR
+When set (to any value), disables ANSI color (freedesktop convention).
+.SH SEE ALSO
+.BR lamboot-tools (7),
+.BR lamboot-toolkit (1),
+.BR lamboot-diagnose (1),
+.BR lamboot-esp (1),
+.BR lamboot-backup (1),
+.BR lamboot-repair (1),
+.BR lamboot-migrate (1),
+.BR lamboot-doctor (1),
+.BR lamboot-uki-build (1),
+.BR lamboot-signing-keys (1)
+.PP
+Full documentation at
+.UR https://lamboot.dev/tools/
+.UE
+.SH AUTHORS
+The lamboot-tools suite is developed by
+.B Lamco Development
+(https://lamco.io). Source:
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.SH LICENSE
+MIT OR Apache-2.0
