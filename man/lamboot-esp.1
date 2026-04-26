@@ -1,8 +1,8 @@
 .\" lamboot-esp(1) — auto-generated from help registry
 .\" Source: tools/lamboot-esp
-.\" Generated: 2026-04-23T12:02:39Z
+.\" Generated: 2026-04-26T02:45:15Z
 .\" DO NOT EDIT — regenerate via `make man` or `scripts/registry-to-man`.
-.TH "LAMBOOT-ESP" "1" "2026-04-23" "lamboot-esp 0.2.0" "lamboot-tools"
+.TH "LAMBOOT-ESP" "1" "2026-04-25" "lamboot-esp 0.3.0" "lamboot-tools"
 .SH NAME
 lamboot-esp \- part of the lamboot-tools suite
 .SH SYNOPSIS
@@ -187,6 +187,81 @@ check, inventory
 .PP
 .RS 4
 .UR https://lamboot.dev/tools/esp/clean
+.UE
+.RE
+.PP
+.SS deploy
+.PP
+.I Deploy LamBoot files to a (possibly offline) ESP
+.PP
+.B Category:
+Maintenance
+.br
+.B Maturity:
+stable
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-esp deploy \-\-src DIR [\-\-signed] [\-\-no\-modules] [\-\-driver NAME ...] [\-\-esp PATH] [\-\-offline DISK] [\-\-manifest\-version VER] [\-\-manifest\-distro ID] [\-\-json]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B \-\-src DIR
+Path to a LamBoot dist/ tree (must contain EFI/LamBoot/lambootx64{,\-signed}.efi etc.)
+.TP
+.B \-\-signed
+Use the \-signed.efi binaries from dist/ (rename rule applied)
+.TP
+.B \-\-no\-modules
+Skip diagnostic modules (LamBoot still boots without them)
+.TP
+.B \-\-driver NAME
+Deploy a UEFI FS driver (e.g. ext4_x64.efi). Repeatable. Default: none.
+.TP
+.B \-\-manifest\-version VER
+Override the manifest\'s Version field (default: dist/EFI/LamBoot/lamboot\-version or \'unknown\')
+.TP
+.B \-\-manifest\-distro ID
+Override the manifest\'s Distro field (default: \'offline\-deploy\')
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-esp deploy \-\-offline /dev/vg/vm\-201\-disk\-1 \-\-src ~/lamboot\-dev/dist \-\-signed
+sudo lamboot\-esp deploy \-\-esp /boot/efi \-\-src dist \-\-signed \-\-driver ext4_x64.efi
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Uses the esp\-deploy.sh canonical lib (mirrored from lamboot\-dev) so file layout matches lamboot\-install exactly. Source files named *\-signed.efi are renamed to canonical names on the ESP — that rule lives in the lib so online/offline deploys can never drift. Does NOT touch NVRAM Boot#### entries; pair with lamboot\-repair \-\-nvram or virt\-fw\-vars \-\-append\-boot\-filepath. Does NOT regenerate BLS entries; pair with lamboot\-repair \-\-offline \-\-apply.
+.RE
+.PP
+.B OFFLINE:
+Yes \- supports \fB\-\-offline\fR \fIDISK\fR
+.br
+.B PRIVILEGE:
+Requires root (sudo)
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+check, inventory, clean, lamboot\-repair
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://lamboot.dev/tools/esp/deploy
 .UE
 .RE
 .PP

@@ -1,7 +1,8 @@
 # Mirror checksums for lamboot-tools core
-# Generated: 2026-04-23T11:59:15Z
+# Generated: 2026-04-25T03:53:08Z
 # Source: /home/greg/lamboot-dev
 
 8156280ddc8b5d3b68ced527c8286ead8f6e3668fed8bea5a4b714c8de6732d2  lamboot-inspect  (from tools/lamboot-inspect)
 9c8eec153a2a2e58abb380a96924decec36cf12c3aa7fd8021b01826d67aa13e  lamboot_inspect/  (tree hash from tools/lamboot_inspect)
 39844a6bd38360b5bd776e94c7ee05311ef5e692589ed54823cb64a58abfb2db  man/lamboot-inspect.1  (from tools/lamboot-inspect.1)
+4f131bb37c425c03de6e7e8d9b6472c1b26b9506d6c29997a7e198750970031c  lib/esp-deploy.sh  (from lib/esp-deploy.sh)

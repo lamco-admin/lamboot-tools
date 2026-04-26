@@ -13,7 +13,7 @@ source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
 source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
 
 LAMBOOT_TOOL_NAME="lamboot-diagnose"
-LAMBOOT_TOOL_VERSION="0.2.0"
+LAMBOOT_TOOL_VERSION="0.3.0"
 
 # ── ESP partition type GUID constant ─────────────────────────────────────
 readonly ESP_PARTTYPE_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
@@ -324,11 +324,42 @@ check_category_esp() {
 
     # Fallback path
     if _id_active "esp.fallback_path"; then
-        if [[ -f "${esp}/EFI/BOOT/BOOTX64.EFI" ]] || [[ -f "${esp}/EFI/BOOT/bootx64.efi" ]]; then
-            emit_finding "esp.fallback_path" "esp" "info" "pass" \
-                "Fallback loader present" \
-                "EFI/BOOT/BOOTX64.EFI exists for removable-media boot." \
-                "{}" '{}'
+        local bootx="${esp}/EFI/BOOT/BOOTX64.EFI"
+        [[ -f "$bootx" ]] || bootx="${esp}/EFI/BOOT/bootx64.efi"
+        if [[ -f "$bootx" ]]; then
+            local lamboot="${esp}/EFI/LamBoot/lambootx64.efi"
+            # If both BOOTX64.EFI and a LamBoot canonical binary are present
+            # but they're different binaries, the firmware HARDDISK fallback
+            # path tries BOOTX64.EFI — which under Secure Boot may be
+            # Access-Denied if it's a foreign unsigned bootloader (e.g.
+            # systemd-boot copy on Arch family). Surface this so users
+            # know auto-boot may fail. Remediation lives in lamboot-repair
+            # (repair.fallback.replace_with_lamboot).
+            if [[ -f "$lamboot" ]]; then
+                local h_bootx h_lamboot
+                h_bootx=$(sha256sum "$bootx" 2>/dev/null | cut -d' ' -f1)
+                h_lamboot=$(sha256sum "$lamboot" 2>/dev/null | cut -d' ' -f1)
+                if [[ -n "$h_bootx" ]] && [[ -n "$h_lamboot" ]] \
+                   && [[ "$h_bootx" != "$h_lamboot" ]]; then
+                    emit_finding "esp.fallback_path" "esp" "warning" "warn" \
+                        "Fallback loader is not LamBoot" \
+                        "$bootx exists but is a different binary than $lamboot. Under Secure Boot the firmware HARDDISK fallback may Access-Denied this binary if it's not signed by a cert in db. Replace with LamBoot's signed binary for belt-and-suspenders boot, or accept the foreign loader if you want it as a fallback OS." \
+                        "{\"bootx64_sha256\":\"$(json_escape "$h_bootx")\",\"lamboot_sha256\":\"$(json_escape "$h_lamboot")\"}" \
+                        "$(_remediation_json "esp.fallback_path" \
+                            "Replace BOOTX64.EFI with LamBoot's signed binary" \
+                            "sudo lamboot-repair --auto")"
+                else
+                    emit_finding "esp.fallback_path" "esp" "info" "pass" \
+                        "Fallback loader is LamBoot" \
+                        "EFI/BOOT/BOOTX64.EFI matches /EFI/LamBoot/lambootx64.efi — firmware HARDDISK fallback will boot LamBoot." \
+                        "{}" '{}'
+                fi
+            else
+                emit_finding "esp.fallback_path" "esp" "info" "pass" \
+                    "Fallback loader present" \
+                    "EFI/BOOT/BOOTX64.EFI exists for removable-media boot." \
+                    "{}" '{}'
+            fi
         else
             emit_finding "esp.fallback_path" "esp" "warning" "warn" \
                 "Fallback loader missing" \

@@ -8,11 +8,30 @@ Versioning: hybrid model per `SPEC-LAMBOOT-TOOLKIT-V1.md` §8 — unified
 
 ---
 
+## [0.3.0]
+
+### Mirrored
+
+- `lib/esp-deploy.sh` re-mirrored from `lamboot-dev` v0.9.0 (sha256
+  `4f131bb37c425c03de6e7e8d9b6472c1b26b9506d6c29997a7e198750970031c`).
+  Encodes the canonical ESP file-layout + -signed.efi → bare rename
+  rule shared with `lamboot-install`. Same content as v0.2.0; bump
+  reflects the coordinated v0.9.0 lamboot-dev release.
+
+### Coordinated
+
+- Coordinated release with `lamboot-dev v0.9.0` per
+  `docs/CROSS-REPO-STATUS.md` §1.3. Lamboot-dev v0.9.0 ships first-time
+  Pop!_OS auto-discovery + EFI Fallback chainload self-loop guard +
+  the complete v0.9.x SDS ladder. Toolkit v0.3.0 is the lockstep
+  release exposing `lamboot-esp deploy` for the offline install path
+  used during the Pop!_OS recovery.
+
 ## [Unreleased]
 
 ---
 
-## [0.2.0] — 2026-04-23
+## [0.2.0]
 
 **Released.** Public at
 https://github.com/lamco-admin/lamboot-tools/releases/tag/v0.2.0
@@ -20,7 +39,7 @@ Signed with lamco-admin release key
 `405CB1E36258DA1DA406A852A236DDB84E0EC96E` (Greg Lamberson).
 
 Coordinated with lamboot-dev v0.8.4 (fw_cfg file-reference hookscript
-rewrite — SHIPPED 2026-04-23T04:39Z).
+rewrite).
 
 **Release artifact SHA256:**
 - `lamboot-tools-0.2.0.tar.gz` → `0d876863a13c5cd4aabd0e557727f4c49dad517d0eb78b85707df0e40d701e6b`

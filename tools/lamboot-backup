@@ -14,7 +14,7 @@ source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
 source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
 
 LAMBOOT_TOOL_NAME="lamboot-backup"
-LAMBOOT_TOOL_VERSION="0.2.0"
+LAMBOOT_TOOL_VERSION="0.3.0"
 
 readonly DOC_BASE="https://lamboot.dev/tools/findings"
 

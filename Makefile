@@ -23,7 +23,8 @@ BUILD_DIR   = build
 SOURCED_DIR = $(BUILD_DIR)/sourced
 INLINED_DIR = $(BUILD_DIR)/inlined
 
-LIB_FILES   = lib/lamboot-toolkit-lib.sh lib/lamboot-toolkit-help.sh
+LIB_FILES   = lib/lamboot-toolkit-lib.sh lib/lamboot-toolkit-help.sh lib/esp-deploy.sh
+LIB_PY_FILES = lib/_nvram_set_first_boot.py
 
 CORE_TOOLS = \
     lamboot-diagnose \
@@ -85,11 +86,17 @@ build: build-sourced build-inlined
 
 build-sourced: $(SOURCED_DIR)/.stamp
 
-$(SOURCED_DIR)/.stamp: $(LIB_FILES) $(foreach t,$(CORE_TOOLS),tools/$(t))
+$(SOURCED_DIR)/.stamp: $(LIB_FILES) $(foreach t,$(CORE_TOOLS),tools/$(t)) Makefile
 	@mkdir -p $(SOURCED_DIR)
+	@# Patch the hardcoded `LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools` default to
+	@# the configured $(LIBDIR). When PREFIX=/usr (distro package) this is a
+	@# no-op; when PREFIX=/usr/local (local make install) the tools correctly
+	@# source the lib we actually installed, instead of silently loading a
+	@# stale `/usr/lib/lamboot-tools/` left over from a prior install.
 	@for tool in $(CORE_TOOLS); do \
 	    if [ -f tools/$$tool ]; then \
-	        cp tools/$$tool $(SOURCED_DIR)/$$tool; \
+	        sed 's|LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools|LAMBOOT_LIB_DIR:-$(LIBDIR)|g' \
+	            tools/$$tool > $(SOURCED_DIR)/$$tool; \
 	        chmod +x $(SOURCED_DIR)/$$tool; \
 	    fi; \
 	done
@@ -116,6 +123,10 @@ install: build-sourced
 	$(INSTALL) -d $(DESTDIR)$(DOCDIR)
 	@for lib in $(LIB_FILES); do \
 	    $(INSTALL) -m 644 $$lib $(DESTDIR)$(LIBDIR)/$$(basename $$lib); \
+	    echo "  installed $(LIBDIR)/$$(basename $$lib)"; \
+	done
+	@for lib in $(LIB_PY_FILES); do \
+	    $(INSTALL) -m 755 $$lib $(DESTDIR)$(LIBDIR)/$$(basename $$lib); \
 	    echo "  installed $(LIBDIR)/$$(basename $$lib)"; \
 	done
 	@for tool in $(CORE_TOOLS); do \
@@ -210,6 +221,8 @@ uninstall:
 	@rm -rf $(DESTDIR)$(LIBDIR)/lamboot_inspect
 	@rm -f $(DESTDIR)$(LIBDIR)/lamboot-toolkit-lib.sh
 	@rm -f $(DESTDIR)$(LIBDIR)/lamboot-toolkit-help.sh
+	@rm -f $(DESTDIR)$(LIBDIR)/esp-deploy.sh
+	@rm -f $(DESTDIR)$(LIBDIR)/_nvram_set_first_boot.py
 	@rmdir $(DESTDIR)$(LIBDIR) 2>/dev/null || true
 	@for page in man/*.1 man/*.5 man/*.7; do \
 	    [ -f $$page ] || continue; \

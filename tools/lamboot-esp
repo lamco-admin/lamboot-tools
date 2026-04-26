@@ -1,8 +1,9 @@
 #!/bin/bash
 # lamboot-esp — EFI System Partition health + management
 #
-# Three subcommands: check, inventory, clean. Goes deep on the ESP layer;
-# complements lamboot-diagnose which covers the full boot chain.
+# Four subcommands: check, inventory, clean, deploy. Goes deep on the
+# ESP layer; complements lamboot-diagnose which covers the full boot
+# chain.
 #
 # Governed by docs/SPEC-LAMBOOT-ESP.md.
 # Part of the lamboot-tools suite (SPEC-LAMBOOT-TOOLKIT-V1.md §3.1).
@@ -11,9 +12,13 @@
 source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
 # shellcheck source=../lib/lamboot-toolkit-help.sh
 source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
+# shellcheck source=../lib/esp-deploy.sh
+# Mirrored from lamboot-dev at release-build time. Encodes the canonical
+# ESP file-layout + -signed.efi → bare rename rule used by `deploy`.
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/esp-deploy.sh"
 
 LAMBOOT_TOOL_NAME="lamboot-esp"
-LAMBOOT_TOOL_VERSION="0.2.0"
+LAMBOOT_TOOL_VERSION="0.3.0"
 
 readonly ESP_PARTTYPE_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
 readonly DOC_BASE="https://lamboot.dev/tools/findings"
@@ -22,6 +27,12 @@ OPT_SUBCOMMAND=""
 OPT_ESP_OVERRIDE=""
 OPT_APPLY=0
 OPT_KEEP_BACKUPS=0
+OPT_DEPLOY_SRC=""
+OPT_DEPLOY_SIGNED=0
+OPT_DEPLOY_NO_MODULES=0
+OPT_DEPLOY_DRIVER_LIST=""    # newline-sep driver basenames for esp_deploy_drivers
+OPT_DEPLOY_VERSION=""
+OPT_DEPLOY_DISTRO=""
 
 ESP_MOUNT=""
 ESP_DEV=""
@@ -73,6 +84,26 @@ _register_subcommands() {
         --requires-root "true" \
         --see-also "check, inventory" \
         --doc-url "https://lamboot.dev/tools/esp/clean" \
+        --maturity "stable"
+
+    register_subcommand \
+        --name "deploy" \
+        --category "Maintenance" \
+        --summary "Deploy LamBoot files to a (possibly offline) ESP" \
+        --syntax "lamboot-esp deploy --src DIR [--signed] [--no-modules] [--driver NAME ...] [--esp PATH] [--offline DISK] [--manifest-version VER] [--manifest-distro ID] [--json]" \
+        --arg "--src DIR:Path to a LamBoot dist/ tree (must contain EFI/LamBoot/lambootx64{,-signed}.efi etc.)" \
+        --arg "--signed:Use the -signed.efi binaries from dist/ (rename rule applied)" \
+        --arg "--no-modules:Skip diagnostic modules (LamBoot still boots without them)" \
+        --arg "--driver NAME:Deploy a UEFI FS driver (e.g. ext4_x64.efi). Repeatable. Default: none." \
+        --arg "--manifest-version VER:Override the manifest's Version field (default: dist/EFI/LamBoot/lamboot-version or 'unknown')" \
+        --arg "--manifest-distro ID:Override the manifest's Distro field (default: 'offline-deploy')" \
+        --example "sudo lamboot-esp deploy --offline /dev/vg/vm-201-disk-1 --src ~/lamboot-dev/dist --signed" \
+        --example "sudo lamboot-esp deploy --esp /boot/efi --src dist --signed --driver ext4_x64.efi" \
+        --notes "Uses the esp-deploy.sh canonical lib (mirrored from lamboot-dev) so file layout matches lamboot-install exactly. Source files named *-signed.efi are renamed to canonical names on the ESP — that rule lives in the lib so online/offline deploys can never drift. Does NOT touch NVRAM Boot#### entries; pair with lamboot-repair --nvram or virt-fw-vars --append-boot-filepath. Does NOT regenerate BLS entries; pair with lamboot-repair --offline --apply." \
+        --offline-capable "true" \
+        --requires-root "true" \
+        --see-also "check, inventory, clean, lamboot-repair" \
+        --doc-url "https://lamboot.dev/tools/esp/deploy" \
         --maturity "stable"
 }
 
@@ -236,6 +267,20 @@ check_filesystem_space() {
 }
 
 check_mount_rw() {
+    # In offline mode the ESP is always mounted read-only by design — the
+    # offline_setup() loopback/nbd attach uses `mount -o ro`. Reporting "RO
+    # is a problem" in that context is a false-positive and the suggested
+    # remediation (`mount -o remount,rw`) would fight the tool's own setup.
+    # Skip the check entirely; offline diagnosis runs against an image, not
+    # a live system, so RW status is not a meaningful health signal.
+    if [[ $LAMBOOT_OFFLINE_ACTIVE -eq 1 ]]; then
+        emit_finding "esp.filesystem.mount_rw" "esp_filesystem" "info" "skip" \
+            "ESP mount RW status not meaningful in offline mode" \
+            "Offline mode mounts read-only by design." \
+            "{\"offline\":true}" '{}'
+        return 0
+    fi
+
     local opts
     opts=$(findmnt -n -o OPTIONS "$ESP_MOUNT" 2>/dev/null || true)
     if printf '%s' "$opts" | grep -q '\brw\b'; then
@@ -284,34 +329,70 @@ check_fstab_esp() {
     local fstab=/etc/fstab
     [[ $LAMBOOT_OFFLINE_ACTIVE -eq 1 ]] && [[ -n "$LAMBOOT_OFFLINE_ROOT" ]] && fstab="$LAMBOOT_OFFLINE_ROOT/etc/fstab"
 
+    # In offline mode without a detected rootfs (LAMBOOT_OFFLINE_ROOT empty),
+    # we have no fstab to check — emit a skip rather than reading the host's.
+    if [[ $LAMBOOT_OFFLINE_ACTIVE -eq 1 ]] && [[ -z "$LAMBOOT_OFFLINE_ROOT" ]]; then
+        emit_finding "esp.fstab.present" "esp_fstab" "info" "skip" \
+            "fstab check skipped (no rootfs detected on offline disk)" "" \
+            "{\"offline\":true,\"have_root\":false}" '{}'
+        return 0
+    fi
+
     [[ ! -f "$fstab" ]] && {
         emit_finding "esp.fstab.present" "esp_fstab" "warning" "skip" \
             "fstab not readable at $fstab" "" "{}" '{}'
         return 0
     }
 
+    # In offline mode the runtime ESP_MOUNT is `/tmp/lamboot-offline.XXX/esp`
+    # which never appears in the offline rootfs's fstab — search by the ESP's
+    # UUID and PARTUUID instead. Online mode keeps the original mount-path
+    # search (which also catches "/boot/efi" / "/efi" / non-UUID entries).
+    local search_terms=()
+    if [[ $LAMBOOT_OFFLINE_ACTIVE -eq 1 ]]; then
+        local esp_uuid esp_partuuid
+        esp_uuid=$(blkid -o value -s UUID "$ESP_DEV" 2>/dev/null || true)
+        esp_partuuid=$(blkid -o value -s PARTUUID "$ESP_DEV" 2>/dev/null || true)
+        [[ -n "$esp_uuid" ]]      && search_terms+=("UUID=$esp_uuid")
+        [[ -n "$esp_partuuid" ]]  && search_terms+=("PARTUUID=$esp_partuuid")
+        # Also catch literal /efi or /boot/efi mount-point references.
+        search_terms+=("/boot/efi" "/efi")
+    else
+        search_terms+=("$ESP_MOUNT")
+    fi
+
     # Debian installers leave a comment `# /boot/efi was on /dev/sda1 during
     # installation` above the real entry. A naive grep picks up the comment
     # first — skip comment/blank lines so we see the actual mount spec.
-    if grep -qvE '^[[:space:]]*(#|$)' "$fstab" 2>/dev/null \
-       && grep -vE '^[[:space:]]*(#|$)' "$fstab" | grep -q "$ESP_MOUNT"; then
-        local line
-        line=$(grep -vE '^[[:space:]]*(#|$)' "$fstab" | grep "$ESP_MOUNT" | head -1)
-        if printf '%s' "$line" | grep -q 'UUID='; then
+    local fstab_body match_line=""
+    fstab_body=$(grep -vE '^[[:space:]]*(#|$)' "$fstab" 2>/dev/null || true)
+    local term
+    for term in "${search_terms[@]}"; do
+        match_line=$(printf '%s\n' "$fstab_body" | grep -F "$term" | head -1)
+        [[ -n "$match_line" ]] && break
+    done
+
+    if [[ -n "$match_line" ]]; then
+        if printf '%s' "$match_line" | grep -q 'UUID='; then
             emit_finding "esp.fstab.present" "esp_fstab" "info" "pass" \
                 "ESP in fstab with UUID" "" "{}" '{}'
-        elif printf '%s' "$line" | grep -qE '^\s*/dev/'; then
+        elif printf '%s' "$match_line" | grep -qE '^\s*/dev/'; then
             emit_finding "esp.fstab.uuid_form" "esp_fstab" "warning" "warn" \
                 "ESP fstab entry uses device path" \
                 "Device paths may change; use UUID= form for stability." "{}" \
                 "$(_remediation_json "esp.fstab.uuid_form" \
                     "Rewrite ESP entry to UUID form" \
                     "sudo lamboot-repair --fix-fstab")"
+        else
+            emit_finding "esp.fstab.present" "esp_fstab" "info" "pass" \
+                "ESP in fstab" "" "{}" '{}'
         fi
     else
+        local mount_label="$ESP_MOUNT"
+        [[ $LAMBOOT_OFFLINE_ACTIVE -eq 1 ]] && mount_label="ESP"
         emit_finding "esp.fstab.present" "esp_fstab" "warning" "fail" \
             "ESP not in fstab" \
-            "$ESP_MOUNT will not mount automatically on boot." "{}" \
+            "$mount_label will not mount automatically on boot." "{}" \
             "$(_remediation_json "esp.fstab.present" \
                 "Add ESP entry to fstab" \
                 "sudo lamboot-repair --fix-fstab")"
@@ -685,6 +766,157 @@ do_clean() {
     exit "$exit_code"
 }
 
+# ── Subcommand: deploy ───────────────────────────────────────────────────
+#
+# Lays down LamBoot files on a (possibly offline-mounted) ESP using the
+# canonical esp-deploy.sh lib. The lib is the single source of truth for
+# file paths and the -signed.efi → bare rename rule shared with
+# lamboot-install. Does NOT touch NVRAM Boot#### or BLS entries —
+# orthogonal concerns owned by lamboot-repair.
+
+_deploy_detect_arch() {
+    case "$(uname -m)" in
+        x86_64)  printf 'x86_64' ;;
+        aarch64) printf 'aarch64' ;;
+        *)       printf 'x86_64' ;;
+    esac
+}
+
+_deploy_remount_esp_rw() {
+    # Try to remount the mount point read-write. Returns 0 if (a) the
+    # remount succeeded, or (b) it was already writable (we just probe a
+    # temp file). Returns 1 only when we genuinely cannot write.
+    local mp="$1"
+    mount -o remount,rw "$mp" 2>/dev/null
+    local probe="${mp}/.lamboot-esp-deploy-probe.$$"
+    if : > "$probe" 2>/dev/null; then
+        rm -f "$probe"
+        return 0
+    fi
+    return 1
+}
+
+do_deploy() {
+    require_root
+
+    if [[ -z "$OPT_DEPLOY_SRC" ]]; then
+        emit_finding "esp.deploy.missing_src" "esp_deploy" "critical" "fail" \
+            "--src DIR is required" \
+            "Pass --src pointing at a LamBoot dist/ tree (containing EFI/LamBoot/lambootx64{,-signed}.efi etc.)." \
+            '{}' \
+            "$(_remediation_json "esp.deploy.missing_src" \
+                "Provide --src pointing at a dist/ tree" \
+                "lamboot-esp deploy --src ~/lamboot-dev/dist --signed")"
+        emit_json 5
+        exit 5
+    fi
+
+    if [[ ! -d "$OPT_DEPLOY_SRC" ]]; then
+        emit_finding "esp.deploy.bad_src" "esp_deploy" "critical" "fail" \
+            "--src DIR not found: $OPT_DEPLOY_SRC" "" \
+            "{\"src\":\"$(json_escape "$OPT_DEPLOY_SRC")\"}" '{}'
+        emit_json 5
+        exit 5
+    fi
+
+    local arch
+    arch=$(_deploy_detect_arch)
+    local src_bin_name
+    src_bin_name=$(esp_efi_source_filename "$arch" "$OPT_DEPLOY_SIGNED")
+    if [[ ! -f "${OPT_DEPLOY_SRC}/EFI/LamBoot/${src_bin_name}" ]]; then
+        emit_finding "esp.deploy.no_binary" "esp_deploy" "critical" "fail" \
+            "Source binary not found in dist tree" \
+            "Expected ${OPT_DEPLOY_SRC}/EFI/LamBoot/${src_bin_name}. Build with --signed first if --signed was requested." \
+            "{\"expected\":\"$(json_escape "${OPT_DEPLOY_SRC}/EFI/LamBoot/${src_bin_name}")\"}" '{}'
+        emit_json 5
+        exit 5
+    fi
+
+    detect_esp_for_tool
+
+    if ! _deploy_remount_esp_rw "$ESP_MOUNT"; then
+        emit_finding "esp.deploy.remount_failed" "esp_deploy" "critical" "fail" \
+            "Could not remount ESP read-write" \
+            "Underlying mount failed remount; ensure the ESP is not held by another process." \
+            "{\"esp\":\"$(json_escape "$ESP_MOUNT")\"}" '{}'
+        emit_json 2
+        exit 2
+    fi
+    # Restore RO on exit so we don't leave a writable offline ESP behind.
+    # shellcheck disable=SC2064  # ESP_MOUNT captured intentionally at trap-set time
+    trap "mount -o remount,ro '$ESP_MOUNT' 2>/dev/null || true" RETURN
+
+    verbose "deploy: arch=${arch} signed=${OPT_DEPLOY_SIGNED} src=${OPT_DEPLOY_SRC} esp=${ESP_MOUNT}"
+
+    # Collect installed paths from each lib call so we can write a manifest
+    # over the union. esp_deploy_* echo one rel-path per file installed.
+    local installed_paths=()
+    local rel
+    if rel=$(esp_deploy_binary "$ESP_MOUNT" "$OPT_DEPLOY_SRC" "$arch" "$OPT_DEPLOY_SIGNED"); then
+        [[ -n "$rel" ]] && installed_paths+=("$rel")
+        record_action "esp.deploy.binary" "$rel" "ok" "true" \
+            "{\"signed\":$( ((OPT_DEPLOY_SIGNED)) && printf true || printf false )}" "null"
+    else
+        record_action "esp.deploy.binary" "$src_bin_name" "fail" "false" '{}' "null"
+        emit_finding "esp.deploy.binary_failed" "esp_deploy" "critical" "fail" \
+            "Binary deploy failed" "" '{}' '{}'
+        emit_json 2
+        exit 2
+    fi
+
+    if (( ! OPT_DEPLOY_NO_MODULES )); then
+        while IFS= read -r rel; do
+            [[ -n "$rel" ]] || continue
+            installed_paths+=("$rel")
+            record_action "esp.deploy.module" "$rel" "ok" "true" '{}' "null"
+        done < <(esp_deploy_modules "$ESP_MOUNT" "$OPT_DEPLOY_SRC" "$OPT_DEPLOY_SIGNED")
+    fi
+
+    if [[ -n "$OPT_DEPLOY_DRIVER_LIST" ]]; then
+        # Extra arg unpacking: lib expects newline-sep FS list as last arg
+        while IFS= read -r rel; do
+            [[ -n "$rel" ]] || continue
+            installed_paths+=("$rel")
+            record_action "esp.deploy.driver" "$rel" "ok" "true" '{}' "null"
+        done < <(esp_deploy_drivers "$ESP_MOUNT" "$OPT_DEPLOY_SRC" "$arch" \
+                    "$OPT_DEPLOY_SIGNED" "$OPT_DEPLOY_DRIVER_LIST")
+    fi
+
+    if rel=$(esp_deploy_policy "$ESP_MOUNT" "$OPT_DEPLOY_SRC" 1); then
+        [[ -n "$rel" ]] && installed_paths+=("$rel")
+        record_action "esp.deploy.policy" "${rel:-policy.toml}" "ok" "true" '{}' "null"
+    fi
+
+    local version="${OPT_DEPLOY_VERSION:-unknown}"
+    local distro="${OPT_DEPLOY_DISTRO:-offline-deploy}"
+    if [[ -z "$OPT_DEPLOY_VERSION" ]] && [[ -f "${OPT_DEPLOY_SRC}/EFI/LamBoot/lamboot-version" ]]; then
+        version=$(head -1 "${OPT_DEPLOY_SRC}/EFI/LamBoot/lamboot-version" | tr -d '\n')
+    fi
+
+    if printf '%s\n' "${installed_paths[@]}" | esp_manifest_write "$ESP_MOUNT" "$version" "$arch" "$distro"; then
+        record_action "esp.deploy.manifest" "$LAMBOOT_ESP_MANIFEST_REL" "ok" "true" \
+            "{\"entries\":${#installed_paths[@]}}" "null"
+    else
+        record_action "esp.deploy.manifest" "$LAMBOOT_ESP_MANIFEST_REL" "fail" "false" '{}' "null"
+        emit_finding "esp.deploy.manifest_failed" "esp_deploy" "warning" "warn" \
+            "Failed to write install manifest" \
+            "Files were deployed but no .install-manifest was written; --remove won't have a clean record." \
+            '{}' '{}'
+    fi
+
+    emit_finding "esp.deploy.complete" "esp_deploy" "info" "pass" \
+        "Deployed ${#installed_paths[@]} file(s) to ${ESP_MOUNT}/EFI/LamBoot/" \
+        "" \
+        "{\"count\":${#installed_paths[@]},\"version\":\"$(json_escape "$version")\",\"arch\":\"$(json_escape "$arch")\",\"signed\":$( ((OPT_DEPLOY_SIGNED)) && printf true || printf false )}" \
+        "$(_remediation_json "esp.deploy.complete" \
+            "Add NVRAM Boot entry pointing at \\\\EFI\\\\LamBoot\\\\$(esp_efi_binary_name "$arch")" \
+            "lamboot-repair --offline DISK --nvram VARS --apply")"
+
+    success "Deployed ${#installed_paths[@]} file(s) to ${ESP_MOUNT}/EFI/LamBoot/"
+    emit_json 0
+    exit 0
+}
+
 # ── CLI ──────────────────────────────────────────────────────────────────
 
 parse_args() {
@@ -710,7 +942,20 @@ parse_args() {
             --esp)           OPT_ESP_OVERRIDE="${2:-}"; shift 2 ;;
             --apply)         OPT_APPLY=1; shift ;;
             --keep-backups)  OPT_KEEP_BACKUPS=1; shift ;;
-            check|inventory|clean|help)
+            --src)           OPT_DEPLOY_SRC="${2:-}"; shift 2 ;;
+            --signed)        OPT_DEPLOY_SIGNED=1; shift ;;
+            --no-modules)    OPT_DEPLOY_NO_MODULES=1; shift ;;
+            --driver)
+                             [[ -n "${2:-}" ]] || die "--driver requires a name"
+                             if [[ -z "$OPT_DEPLOY_DRIVER_LIST" ]]; then
+                                 OPT_DEPLOY_DRIVER_LIST="$2"
+                             else
+                                 OPT_DEPLOY_DRIVER_LIST="${OPT_DEPLOY_DRIVER_LIST}"$'\n'"$2"
+                             fi
+                             shift 2 ;;
+            --manifest-version) OPT_DEPLOY_VERSION="${2:-}"; shift 2 ;;
+            --manifest-distro)  OPT_DEPLOY_DISTRO="${2:-}"; shift 2 ;;
+            check|inventory|clean|deploy|help)
                              if [[ -z "$OPT_SUBCOMMAND" ]]; then
                                  OPT_SUBCOMMAND="$1"
                              else
@@ -747,6 +992,7 @@ main() {
         check)     do_check ;;
         inventory) do_inventory ;;
         clean)     do_clean ;;
+        deploy)    do_deploy ;;
         *)         die "unknown subcommand: $OPT_SUBCOMMAND" ;;
     esac
 

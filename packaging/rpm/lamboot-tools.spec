@@ -1,5 +1,5 @@
 Name:           lamboot-tools
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        The Linux UEFI boot toolkit — diagnose, repair, migrate
 License:        MIT OR Apache-2.0
@@ -218,6 +218,14 @@ fi
 %dir %{_prefix}/lib/lamboot-tools
 %{_prefix}/lib/lamboot-tools/lamboot-toolkit-lib.sh
 %{_prefix}/lib/lamboot-tools/lamboot-toolkit-help.sh
+# esp-deploy.sh is mirrored from lamboot-dev/lib/ at release-build time
+# (see publish/mirror-from-lamboot-dev.sh). It encodes the canonical ESP
+# file-layout knowledge consumed by lamboot-esp's offline-deploy action.
+%{_prefix}/lib/lamboot-tools/esp-deploy.sh
+# _nvram_set_first_boot.py bridges to virt.firmware's Python API to
+# reorder BootOrder (the virt-fw-vars CLI does not expose this).
+# Used by lamboot-repair's repair.nvram.set_first action.
+%{_prefix}/lib/lamboot-tools/_nvram_set_first_boot.py
 
 # Man pages
 %{_mandir}/man1/lamboot-diagnose.1*

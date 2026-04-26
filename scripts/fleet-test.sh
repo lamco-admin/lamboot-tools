@@ -72,7 +72,21 @@ TIER1_VMIDS_LAMBOOT=(
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 require_proxmox() {
-    command -v qm >/dev/null 2>&1 || fail "qm not found — fleet-test must run on Proxmox host"
+    # Graceful skip when the runner isn't a Proxmox host. The Tier 1 matrix
+    # infrastructure is explicitly known-pending in docs/CROSS-REPO-STATUS.md
+    # (handed off to lamco-admin). Hard-failing the scheduled workflow every
+    # night while that's being provisioned generates false-positive noise.
+    # When qm appears on the runner, this script proceeds normally without
+    # any further code change.
+    if ! command -v qm >/dev/null 2>&1; then
+        warn "qm not found — fleet-test skipped (runner is not a Proxmox host)"
+        warn "Tier 1 infrastructure is ops-pending per docs/CROSS-REPO-STATUS.md"
+        warn "This exit code of 0 is deliberate; see scripts/fleet-test.sh:require_proxmox"
+        mkdir -p "$RESULTS_DIR"
+        printf '{"status":"skipped","reason":"qm-not-found","date":"%s"}\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RESULTS_DIR/SKIPPED.json"
+        exit 0
+    fi
     [[ -f "$TOOLKIT_TARBALL" ]] || fail "toolkit tarball not found: $TOOLKIT_TARBALL (run 'make build' first?)"
 }
 

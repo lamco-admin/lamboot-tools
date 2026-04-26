@@ -119,12 +119,24 @@ else
     fail "verify check count wrong: got $migrate_verify_checks, want 11"
 fi
 
-# ── Claim 5: lamboot-repair defines 9 repair actions ─────────────────────
+# ── Claim 5: lamboot-repair defines its declared repair actions ──────────
+# v0.2.0 had 9 (online: esp.mount, esp.fsck, fallback.install,
+# nvram.create_lamboot, nvram.set_bootorder, fstab.add_esp,
+# lamboot.reset_crash, lamboot.reset_state, lamboot.enable_mark_success).
+# v0.2.0-dev (post-VM-123 toolkit work) adds 4 actions:
+# offline.regen_bls (chroot+kernel-install BLS regen),
+# nvram.add_lamboot_entry (virt-fw-vars Boot#### append),
+# fallback.replace_with_lamboot (when BOOTX64.EFI is foreign+unsigned under
+# SB, replace with LamBoot's signed binary so firmware HARDDISK fallback
+# succeeds — exactly the manual fix VM 123 needed),
+# nvram.set_first (move LamBoot Boot#### to head of BootOrder via
+# virt.firmware Python API since virt-fw-vars CLI doesn't expose reorder).
+# Total 13.
 repair_actions=$(grep -cE '^\s*plan_add "repair\.' "$REPO_ROOT/tools/lamboot-repair" 2>/dev/null || echo 0)
-if [[ "$repair_actions" -eq 9 ]]; then
-    ok "lamboot-repair has 9 plan_add invocations"
+if [[ "$repair_actions" -eq 13 ]]; then
+    ok "lamboot-repair has 13 plan_add invocations"
 else
-    fail "repair action count wrong: got $repair_actions, want 9"
+    fail "repair action count wrong: got $repair_actions, want 13"
 fi
 
 # ── Claim 6: lamboot-signing-keys 10 subcommands ─────────────────────────
@@ -147,12 +159,14 @@ else
     fail "enforce_size_constraint function missing"
 fi
 
-# ── Claim 8: lamboot-esp has 3 subcommands ───────────────────────────────
+# ── Claim 8: lamboot-esp has 4 subcommands ───────────────────────────────
+# v0.2.0-dev added `deploy` (offline ESP install via mirrored esp-deploy.sh
+# canonical lib from lamboot-dev). Was 3 (check, inventory, clean).
 esp_subcmds=$(grep -cE '^\s*--name "' "$REPO_ROOT/tools/lamboot-esp" 2>/dev/null || echo 0)
-if [[ "$esp_subcmds" -eq 3 ]]; then
-    ok "lamboot-esp has 3 subcommands"
+if [[ "$esp_subcmds" -eq 4 ]]; then
+    ok "lamboot-esp has 4 subcommands"
 else
-    fail "esp subcommand count wrong: got $esp_subcmds, want 3"
+    fail "esp subcommand count wrong: got $esp_subcmds, want 4"
 fi
 
 # ── Claim 9: lamboot-backup has 4 subcommands ────────────────────────────

@@ -15,7 +15,7 @@
 # Versioning — single source of truth for the toolkit version
 # ────────────────────────────────────────────────────────────────────────────
 
-readonly LAMBOOT_TOOLKIT_VERSION="0.2.0"
+readonly LAMBOOT_TOOLKIT_VERSION="0.3.0"
 readonly LAMBOOT_TOOLKIT_SCHEMA_VERSION="v1"
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -539,12 +539,19 @@ offline_setup() {
     local mount_base
     mount_base=$(mktemp -d -t lamboot-offline.XXXXXX) || die "mktemp failed"
 
+    # Enumerate partitions via lsblk so every naming convention works:
+    # loop/nbd `p1`, nvme/zvol `-part1`, plain `sdX1`. Glob-based detection
+    # previously missed zvol `-partN` entirely, silently falling through.
     local esp_found=""
     local root_found=""
-    for part in "${LAMBOOT_OFFLINE_LOOP_DEV}"p* "${LAMBOOT_OFFLINE_LOOP_DEV}"[0-9]*; do
+    local parts
+    parts=$(lsblk -lnpo NAME,FSTYPE "$LAMBOOT_OFFLINE_LOOP_DEV" 2>/dev/null | tail -n +2)
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local part fstype
+        part=$(printf '%s\n' "$line" | awk '{print $1}')
+        fstype=$(printf '%s\n' "$line" | awk '{print $2}')
         [[ -b "$part" ]] || continue
-        local fstype
-        fstype=$(blkid -o value -s TYPE "$part" 2>/dev/null || true)
         case "$fstype" in
             vfat)
                 if [[ -z "$esp_found" ]]; then
@@ -573,17 +580,29 @@ offline_setup() {
                 fi
                 ;;
         esac
-    done
+    done <<< "$parts"
 
     LAMBOOT_OFFLINE_ESP="$esp_found"
     LAMBOOT_OFFLINE_ROOT="$root_found"
 
     [[ -n "$esp_found" ]] && verbose "offline ESP detected at $esp_found"
     [[ -n "$root_found" ]] && verbose "offline rootfs detected at $root_found"
+
+    # Refuse to silently fall back to host-ESP detection when the caller
+    # explicitly asked for offline mode. `detect_esp` honours LAMBOOT_OFFLINE_*,
+    # but only when both ACTIVE=1 and ESP is non-empty — so an empty ESP here
+    # would cause the tool to scan the host's `/boot/efi` instead. Fail loud.
+    if [[ -z "$esp_found" ]]; then
+        die "offline_setup: no vfat ESP found on $disk (partitions: $(printf '%s' "$parts" | awk '{printf "%s(%s) ", $1, ($2?$2:"-")}'))"
+    fi
 }
 
 offline_teardown() {
     [[ $LAMBOOT_OFFLINE_ACTIVE -eq 1 ]] || return 0
+
+    # Tear down chroot scaffolding first if we set it up (idempotent —
+    # offline_chroot_teardown is a no-op when no chroot is active).
+    offline_chroot_teardown
 
     [[ -n "$LAMBOOT_OFFLINE_ESP" ]] && umount "$LAMBOOT_OFFLINE_ESP" 2>/dev/null || true
     [[ -n "$LAMBOOT_OFFLINE_ROOT" ]] && umount "$LAMBOOT_OFFLINE_ROOT" 2>/dev/null || true
@@ -595,6 +614,114 @@ offline_teardown() {
     fi
 
     LAMBOOT_OFFLINE_ACTIVE=0
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Offline chroot — bind /dev/proc/sys, mount ESP at /efi or /boot/efi inside
+# the rootfs, and remount rootfs rw so commands like kernel-install or
+# bootctl can write boot entries. Used by lamboot-repair --apply for BLS
+# regeneration when the offline diagnose finds zero entries.
+# ────────────────────────────────────────────────────────────────────────────
+
+LAMBOOT_OFFLINE_CHROOT_ACTIVE=0
+LAMBOOT_OFFLINE_CHROOT_BINDS=()
+
+offline_chroot_setup() {
+    [[ $LAMBOOT_OFFLINE_ACTIVE -eq 1 ]] || die "offline_chroot_setup: offline mode not active"
+    [[ -n "$LAMBOOT_OFFLINE_ROOT" ]] || die "offline_chroot_setup: no rootfs detected on offline disk"
+    [[ -n "$LAMBOOT_OFFLINE_ESP" ]]  || die "offline_chroot_setup: no ESP detected on offline disk"
+    [[ $LAMBOOT_OFFLINE_CHROOT_ACTIVE -eq 1 ]] && return 0
+
+    require_root
+
+    # Remount rootfs rw so kernel-install / bootctl can write under /boot etc.
+    if ! mount -o remount,rw "$LAMBOOT_OFFLINE_ROOT" 2>/dev/null; then
+        die "offline_chroot_setup: could not remount $LAMBOOT_OFFLINE_ROOT rw"
+    fi
+    # Same for ESP — kernel-install writes BLS entries to /loader/entries/
+    # which lives on the ESP (when ESP is mounted at /efi or /boot/efi).
+    if ! mount -o remount,rw "$LAMBOOT_OFFLINE_ESP" 2>/dev/null; then
+        warn "offline_chroot_setup: could not remount $LAMBOOT_OFFLINE_ESP rw — kernel-install writes may fail"
+    fi
+
+    # Bind /dev /proc /sys /run into the chroot. /run is needed because
+    # systemd-tmpfiles + some kernel-install plugins probe /run/host or
+    # /run/systemd. /sys/firmware/efi is intentionally NOT bound — the
+    # chroot is a disk image, not the host's UEFI environment.
+    local mp
+    for mp in dev proc sys run; do
+        local target="${LAMBOOT_OFFLINE_ROOT}/${mp}"
+        mkdir -p "$target"
+        if mount --bind "/${mp}" "$target" 2>/dev/null; then
+            LAMBOOT_OFFLINE_CHROOT_BINDS+=("$target")
+        else
+            warn "offline_chroot_setup: bind /${mp} -> $target failed"
+        fi
+    done
+
+    # Bind the ESP into the rootfs at /efi or /boot/efi (whichever the
+    # rootfs's fstab references — we picked these from check_fstab_esp's
+    # offline-mode behavior). Try /efi first (systemd convention), then
+    # /boot/efi (older convention). If both exist in the rootfs we prefer
+    # /efi.
+    local esp_inside=""
+    if [[ -d "${LAMBOOT_OFFLINE_ROOT}/efi" ]]; then
+        esp_inside="${LAMBOOT_OFFLINE_ROOT}/efi"
+    elif [[ -d "${LAMBOOT_OFFLINE_ROOT}/boot/efi" ]]; then
+        esp_inside="${LAMBOOT_OFFLINE_ROOT}/boot/efi"
+    fi
+    if [[ -n "$esp_inside" ]]; then
+        if mount --bind "$LAMBOOT_OFFLINE_ESP" "$esp_inside" 2>/dev/null; then
+            LAMBOOT_OFFLINE_CHROOT_BINDS+=("$esp_inside")
+        else
+            warn "offline_chroot_setup: bind ESP -> $esp_inside failed"
+        fi
+    else
+        warn "offline_chroot_setup: rootfs has neither /efi nor /boot/efi — kernel-install may not find the ESP"
+    fi
+
+    LAMBOOT_OFFLINE_CHROOT_ACTIVE=1
+}
+
+offline_chroot_teardown() {
+    [[ $LAMBOOT_OFFLINE_CHROOT_ACTIVE -eq 1 ]] || return 0
+
+    # Unmount in reverse order. Use lazy unmount as a fallback for binds
+    # that something inside the chroot may have re-bind-mounted.
+    local i
+    for ((i=${#LAMBOOT_OFFLINE_CHROOT_BINDS[@]}-1; i>=0; i--)); do
+        local target="${LAMBOOT_OFFLINE_CHROOT_BINDS[$i]}"
+        umount "$target" 2>/dev/null || umount -l "$target" 2>/dev/null || true
+    done
+    LAMBOOT_OFFLINE_CHROOT_BINDS=()
+
+    # Remount rootfs+ESP back to ro so the rest of the offline session
+    # behaves as if the chroot never happened.
+    [[ -n "$LAMBOOT_OFFLINE_ROOT" ]] && mount -o remount,ro "$LAMBOOT_OFFLINE_ROOT" 2>/dev/null || true
+    [[ -n "$LAMBOOT_OFFLINE_ESP" ]]  && mount -o remount,ro "$LAMBOOT_OFFLINE_ESP" 2>/dev/null || true
+
+    LAMBOOT_OFFLINE_CHROOT_ACTIVE=0
+}
+
+# Run a command inside the offline chroot. Setup is idempotent so this can
+# be called multiple times in a session; teardown happens at offline_teardown
+# time (i.e., process exit via the existing trap).
+offline_chroot_run() {
+    [[ -n "$1" ]] || die "offline_chroot_run: command required"
+    offline_chroot_setup
+    chroot "$LAMBOOT_OFFLINE_ROOT" /bin/sh -c "$*"
+}
+
+# Inspect chroot for a binary on its PATH. Returns 0 if found, 1 otherwise.
+offline_chroot_has_command() {
+    [[ $LAMBOOT_OFFLINE_ACTIVE -eq 1 ]] || return 1
+    [[ -n "$LAMBOOT_OFFLINE_ROOT" ]] || return 1
+    local cmd="$1"
+    local p
+    for p in usr/bin usr/sbin bin sbin usr/local/bin usr/local/sbin; do
+        [[ -x "${LAMBOOT_OFFLINE_ROOT}/${p}/${cmd}" ]] && return 0
+    done
+    return 1
 }
 
 # ────────────────────────────────────────────────────────────────────────────

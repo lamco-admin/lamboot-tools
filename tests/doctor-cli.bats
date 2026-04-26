@@ -24,9 +24,9 @@ require_jq() {
     [[ "$output" == *"lamboot-tools"* ]]
 }
 
-@test "doctor --version shows v0.2.0-dev" {
+@test "doctor --version shows v0.3.0" {
     run "$TOOL" --version
-    [[ "$output" == *"0.2.0"* ]]
+    [[ "$output" == *"0.3.0"* ]]
 }
 
 @test "doctor help shows the check entry with beta maturity" {

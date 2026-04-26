@@ -17,7 +17,7 @@
 source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
 
 LAMBOOT_TOOL_NAME="lamboot-toolkit"
-LAMBOOT_TOOL_VERSION="0.2.0"
+LAMBOOT_TOOL_VERSION="0.3.0"
 
 readonly KNOWN_CORE_TOOLS=(
     "lamboot-diagnose"

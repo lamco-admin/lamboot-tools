@@ -1216,6 +1216,7 @@ Keeps the claims appendix honest as the code evolves.
 |---|---|---|---|
 | `lamboot-inspect` (Python) | `~/lamboot-dev/tools/lamboot-inspect` | toolkit `/tools/lamboot-inspect` | `publish/mirror-from-lamboot-dev.sh` |
 | `lamboot-inspect` man page | `~/lamboot-dev/tools/lamboot-inspect.1` | toolkit `/man/lamboot-inspect.1` | same |
+| `esp-deploy.sh` (shared shell lib) | `~/lamboot-dev/lib/esp-deploy.sh` | toolkit `/lib/esp-deploy.sh` | same. Encodes the canonical ESP file-layout (paths, `-signed.efi`→bare rename rule, manifest format) consumed by `lamboot-install` (online) and `lamboot-esp deploy` (offline). |
 | `lamboot-monitor.py` | `~/lamboot-dev/tools/lamboot-monitor.py` | toolkit `/pve/tools/lamboot-pve-monitor` (renamed) | `publish/mirror-pve-from-lamboot-dev.sh` |
 | `build-ovmf-vars.sh` | `~/lamboot-dev/tools/build-ovmf-vars.sh` | toolkit `/pve/tools/lamboot-pve-ovmf-vars` (renamed) | same |
 | `lamboot-hookscript.pl` | `~/lamboot-dev/tools/lamboot-hookscript.pl` | Not mirrored. Documented in toolkit spec; users install from lamboot-dev side. | N/A |

@@ -14,7 +14,7 @@ source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
 source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
 
 LAMBOOT_TOOL_NAME="lamboot-repair"
-LAMBOOT_TOOL_VERSION="0.2.0"
+LAMBOOT_TOOL_VERSION="0.3.0"
 
 readonly DOC_BASE="https://lamboot.dev/tools/findings"
 
@@ -22,6 +22,7 @@ readonly DOC_BASE="https://lamboot.dev/tools/findings"
 OPT_FIX_FSTAB_ONLY=0
 OPT_PLAN_ONLY=0
 OPT_RISK_LIMIT="moderate"  # safe | moderate | destructive
+OPT_NVRAM_FILE=""          # path to OVMF VARS file for offline NVRAM ops
 
 # Repair plan — three parallel arrays (v1.0 — could become JSON in v0.3+)
 PLAN_IDS=()
@@ -100,6 +101,137 @@ risk_tier_ok() {
     esac
 }
 
+# ── NVRAM helpers (virt-fw-vars wrapper) ────────────────────────────────
+
+# Inspect an OVMF VARS file via virt-fw-vars and return the formatted Boot
+# variable section (BootOrder + Boot####). Returns empty string if no Boot
+# entries are present. virt-fw-vars output isn't structured JSON in older
+# versions, so we parse the text directly.
+_nvram_dump_boot() {
+    local vars_file="$1"
+    [[ -f "$vars_file" ]] || [[ -b "$vars_file" ]] || return 1
+    virt-fw-vars -i "$vars_file" 2>/dev/null | awk '
+        /^  - name=Boot[0-9A-Fa-f]{4}$/ { in_boot=1; print; next }
+        /^  - name=BootOrder$/          { in_boot=1; print; next }
+        /^  - name=/                    { in_boot=0 }
+        in_boot                         { print }
+    '
+}
+
+# Check if any Boot#### entry references a given EFI path (case-insensitive
+# match against the printable ASCII of the FilePath). Returns 0 if found,
+# 1 otherwise.
+_nvram_has_boot_for() {
+    local vars_file="$1" efi_path="$2"
+    local dump
+    dump=$(_nvram_dump_boot "$vars_file") || return 1
+    [[ -n "$dump" ]] || return 1
+    # virt-fw-vars formats DevicePath FilePath segments like
+    #   FilePath(/EFI/LamBoot/lambootx64.efi)
+    # Be lenient about backslash vs forward-slash, and case.
+    local needle_fwd needle_bwd
+    needle_fwd=$(printf '%s' "$efi_path" | tr 'A-Z\\\\' 'a-z/')
+    needle_bwd=$(printf '%s' "$efi_path" | tr 'A-Z/' 'a-z\\\\')
+    printf '%s' "$dump" | tr 'A-Z' 'a-z' | grep -qE \
+        "filepath\\(${needle_fwd//\//\\/}\\)|filepath\\(${needle_bwd}\\)"
+}
+
+# ── Repair actions (callable by execute_plan via eval) ─────────────────
+
+# Append a Boot#### entry pointing at a given EFI path to the configured
+# OVMF VARS file. Uses virt-fw-vars --inplace --append-boot-filepath.
+# Tier: moderate. Mutates VARS file. Caller is responsible for ensuring
+# the EFI binary at PATH actually exists on the matching ESP — this
+# function does not verify presence (that's a separate diagnose finding).
+_offline_nvram_add_boot_entry() {
+    [[ -n "$OPT_NVRAM_FILE" ]] || { warn "_offline_nvram_add_boot_entry: --nvram not set"; return 1; }
+    [[ -f "$OPT_NVRAM_FILE" ]] || [[ -b "$OPT_NVRAM_FILE" ]] || { warn "_offline_nvram_add_boot_entry: $OPT_NVRAM_FILE not readable"; return 1; }
+    local efi_path="${1:-\\EFI\\LamBoot\\lambootx64.efi}"
+    local label="${2:-LamBoot}"
+    info "  appending Boot entry: $label -> $efi_path"
+    if ! virt-fw-vars --inplace "$OPT_NVRAM_FILE" \
+            --append-boot-filepath "$efi_path" 2>&1; then
+        warn "_offline_nvram_add_boot_entry: virt-fw-vars failed"
+        return 1
+    fi
+}
+
+# Move a Boot#### entry to the head of BootOrder. The virt-fw-vars CLI does
+# not expose this operation; we bridge to virt.firmware's Python API via
+# lib/_nvram_set_first_boot.py. Used by repair.nvram.set_first when a
+# LamBoot Boot entry exists in NVRAM but isn't first in BootOrder (firmware
+# would auto-boot the wrong entry, e.g., the QEMU HARDDISK fallback that
+# fails Access-Denied on unsigned BOOTX64.EFI).
+_offline_nvram_set_first_boot() {
+    [[ -n "$OPT_NVRAM_FILE" ]] || { warn "_offline_nvram_set_first_boot: --nvram not set"; return 1; }
+    [[ -f "$OPT_NVRAM_FILE" ]] || [[ -b "$OPT_NVRAM_FILE" ]] || { warn "_offline_nvram_set_first_boot: $OPT_NVRAM_FILE not readable"; return 1; }
+    local head_hex="${1:?head Boot#### hex required}"
+    local helper="${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/_nvram_set_first_boot.py"
+    if [[ ! -f "$helper" ]]; then
+        warn "_offline_nvram_set_first_boot: helper not present at $helper"
+        return 1
+    fi
+    info "  reordering BootOrder: head -> Boot${head_hex^^}"
+    if ! python3 "$helper" "$OPT_NVRAM_FILE" "$head_hex" 2>&1; then
+        warn "_offline_nvram_set_first_boot: helper failed"
+        return 1
+    fi
+}
+
+# Find the Boot#### number whose loader path matches an EFI path. Echoes
+# the 4-char hex on success (e.g. "0007"), empty string if not found.
+_nvram_find_boot_for() {
+    local vars="$1"
+    local efi_path="$2"
+    virt-fw-vars --input "$vars" --print 2>/dev/null \
+        | awk -v p="$efi_path" '
+            /^Boot[0-9A-Fa-f]{4}/ {
+                # Line shape: "Boot0007            : boot entry: title=\"...\" devpath=FilePath(\\EFI\\LamBoot\\lambootx64.efi)"
+                if (index($0, p) > 0) {
+                    sub(/^Boot/, "", $1); print $1; exit
+                }
+            }'
+}
+
+# Regenerate BLS entries by chrooting into the offline rootfs and running
+# kernel-install for every kernel under /usr/lib/modules/. Used when
+# diagnose_offline finds zero /loader/entries/ + zero UKIs but kernels
+# are installed in the rootfs. Tier: moderate. Writes to ESP /loader/entries/
+# and copies kernel/initrd into the ESP per kernel-install layout=bls.
+_offline_regen_bls() {
+    if ! offline_chroot_has_command kernel-install; then
+        warn "_offline_regen_bls: kernel-install not present in offline rootfs"
+        return 1
+    fi
+    local kernels=()
+    if [[ -d "${LAMBOOT_OFFLINE_ROOT}/usr/lib/modules" ]]; then
+        local d
+        for d in "${LAMBOOT_OFFLINE_ROOT}/usr/lib/modules/"*/; do
+            [[ -d "$d" ]] || continue
+            [[ -f "${d}vmlinuz" ]] || continue
+            kernels+=("$(basename "${d%/}")")
+        done
+    fi
+    if [[ ${#kernels[@]} -eq 0 ]]; then
+        warn "_offline_regen_bls: no kernels with vmlinuz found under usr/lib/modules/"
+        return 1
+    fi
+    info "  found ${#kernels[@]} kernel(s): ${kernels[*]}"
+
+    # offline_chroot_run handles: remount rw, bind /dev /proc /sys, bind ESP
+    # to /efi or /boot/efi, chroot in, run command. Teardown happens at
+    # offline_teardown via the EXIT trap installed by offline_setup.
+    local k rc=0
+    for k in "${kernels[@]}"; do
+        info "  kernel-install add $k"
+        if ! offline_chroot_run "kernel-install add '$k' '/usr/lib/modules/$k/vmlinuz'"; then
+            warn "_offline_regen_bls: kernel-install failed for $k"
+            rc=1
+        fi
+    done
+    return $rc
+}
+
 # ── Phase 1: Diagnose (online) ───────────────────────────────────────────
 
 diagnose_online() {
@@ -175,10 +307,11 @@ diagnose_online() {
     fi
 
     # Fallback bootloader
+    local lamboot_canonical="${ESP_MOUNT}/EFI/LamBoot/lambootx64.efi"
     if [[ ! -f "${ESP_MOUNT}/EFI/BOOT/BOOTX64.EFI" ]] && [[ ! -f "${ESP_MOUNT}/EFI/BOOT/bootx64.efi" ]]; then
         local fb_src=""
         for candidate in \
-            "${ESP_MOUNT}/EFI/LamBoot/lambootx64.efi" \
+            "$lamboot_canonical" \
             "${ESP_MOUNT}"/EFI/*/shimx64.efi \
             "${ESP_MOUNT}"/EFI/*/grubx64.efi \
             "${ESP_MOUNT}/EFI/systemd/systemd-bootx64.efi"; do
@@ -205,6 +338,31 @@ diagnose_online() {
             emit_finding "repair.fallback.no_source" "repair_fallback" "warning" "skip" \
                 "Fallback loader missing; no existing bootloader to copy from" \
                 "Install a bootloader (LamBoot / GRUB / sd-boot / rEFInd) first." "{}" '{}'
+        fi
+    elif [[ -f "${ESP_MOUNT}/EFI/BOOT/BOOTX64.EFI" ]] && [[ -f "$lamboot_canonical" ]]; then
+        # BOOTX64.EFI exists AND LamBoot is installed. Check whether they're
+        # the same binary — if not, the firmware HARDDISK fallback path will
+        # try BOOTX64.EFI which might be unsigned (BOOTX64=systemd-boot,
+        # grub, etc.) and Access-Denied under SB. The fix that worked on
+        # VM 123: replace BOOTX64.EFI with the signed LamBoot binary so the
+        # firmware fallback always succeeds even when no Boot#### entry
+        # explicitly points at LamBoot. See VM-123-RECOVERY-HANDOVER §4.
+        local bootx_hash lamboot_hash
+        bootx_hash=$(sha256sum "${ESP_MOUNT}/EFI/BOOT/BOOTX64.EFI" 2>/dev/null | cut -d' ' -f1 || true)
+        lamboot_hash=$(sha256sum "$lamboot_canonical" 2>/dev/null | cut -d' ' -f1 || true)
+        if [[ -n "$bootx_hash" ]] && [[ -n "$lamboot_hash" ]] && [[ "$bootx_hash" != "$lamboot_hash" ]]; then
+            emit_finding "repair.fallback.foreign" "repair_fallback" "warning" "warn" \
+                "EFI/BOOT/BOOTX64.EFI is not LamBoot" \
+                "Firmware HARDDISK fallback will try this binary; under Secure Boot it may be Access-Denied if not signed by a cert in db. Replace with LamBoot's signed binary for belt-and-suspenders boot." \
+                "{\"bootx64_sha256\":\"$(json_escape "$bootx_hash")\",\"lamboot_sha256\":\"$(json_escape "$lamboot_hash")\"}" \
+                "$(_remediation_json "repair.fallback.foreign" \
+                    "Replace BOOTX64.EFI with LamBoot's signed binary" \
+                    "sudo lamboot-repair --auto")"
+
+            plan_add "repair.fallback.replace_with_lamboot" \
+                "Replace EFI/BOOT/BOOTX64.EFI with LamBoot's signed binary (orig saved as .pre-lamboot)" \
+                "mv -f '${ESP_MOUNT}/EFI/BOOT/BOOTX64.EFI' '${ESP_MOUNT}/EFI/BOOT/BOOTX64.EFI.pre-lamboot' && cp '$lamboot_canonical' '${ESP_MOUNT}/EFI/BOOT/BOOTX64.EFI'" \
+                "moderate"
         fi
     fi
 
@@ -351,16 +509,207 @@ diagnose_offline() {
     if [[ ! -f "${ESP_MOUNT}/EFI/BOOT/BOOTX64.EFI" ]] && [[ ! -f "${ESP_MOUNT}/EFI/BOOT/bootx64.efi" ]]; then
         emit_finding "repair.offline.fallback_missing" "repair_fallback" "warning" "fail" \
             "Offline ESP missing fallback loader" \
-            "Offline ESP mount is read-only in v0.2 — cannot autofix; remount rw manually." "{}" \
+            "No \\EFI\\BOOT\\BOOTX64.EFI present. Firmware will not boot from removable media without an explicit NVRAM entry." "{}" \
             "$(_remediation_json "repair.offline.fallback_missing" \
-                "Remount rw and copy bootloader manually" \
-                "sudo mount -o remount,rw $ESP_MOUNT && cp <source> $ESP_MOUNT/EFI/BOOT/BOOTX64.EFI")"
+                "Reinstall bootloader (LamBoot or distro)" \
+                "sudo lamboot-install --signed (after booting recovery media)")"
     fi
 
-    # NVRAM operations all skipped offline — virt-fw-vars integration is v0.3+
-    emit_finding "repair.offline.nvram_skipped" "repair_nvram" "info" "skip" \
-        "NVRAM repairs skipped in offline mode" \
-        "Offline NVRAM editing requires virt-fw-vars integration (v0.3+)." "{}" '{}'
+    # Detect partial-uninstall residue: /EFI/LamBoot/ subtree exists (drivers/
+    # or reports/ dir) but no lambootx64.efi. Caused by old lamboot-install
+    # --remove paths whose final rmdir loop silently failed on non-empty dirs
+    # (leftover LICENSE-GPL-2.0.txt + runtime logs from reports/). Fixed in
+    # lamboot-install commit 75abd06; this finding flags ESPs that still carry
+    # the residue from a pre-fix --remove.
+    local lb_dir="${ESP_MOUNT}/EFI/LamBoot"
+    if [[ -d "$lb_dir" ]] && [[ ! -f "${lb_dir}/lambootx64.efi" ]] && [[ ! -f "${lb_dir}/lambootx64-signed.efi" ]]; then
+        local has_residue=0
+        local residue_items=()
+        [[ -d "${lb_dir}/drivers" ]]  && { has_residue=1; residue_items+=("drivers/"); }
+        [[ -d "${lb_dir}/reports" ]]  && { has_residue=1; residue_items+=("reports/"); }
+        [[ -d "${lb_dir}/modules" ]]  && { has_residue=1; residue_items+=("modules/"); }
+        if (( has_residue )); then
+            emit_finding "repair.offline.lamboot_residue" "repair_lamboot" "warning" "fail" \
+                "LamBoot install tree present but binary missing" \
+                "Found ${residue_items[*]} under \\EFI\\LamBoot\\ with no lambootx64.efi. Indicates a partial --remove from before lamboot-install commit 75abd06, or an interrupted install." \
+                "{\"residue\":[$(printf '"%s",' "${residue_items[@]}" | sed 's/,$//')]}" \
+                "$(_remediation_json "repair.offline.lamboot_residue" \
+                    "Reinstall or fully clean up" \
+                    "sudo lamboot-install --signed   (or)   sudo lamboot-install --remove --force")"
+        fi
+    fi
+
+    # Detect "BLS bootloader advertised but no entries available". A systemd-
+    # boot install (or LamBoot itself) reads /loader/entries/*.conf to present
+    # boot options. If the directory exists but is empty, AND there are no UKIs
+    # under /EFI/Linux/, the bootloader will display "No boot entries found"
+    # and the user has no way forward.
+    local entries_dir="${ESP_MOUNT}/loader/entries"
+    local linux_dir="${ESP_MOUNT}/EFI/Linux"
+    local has_systemd_boot=0
+    local has_lamboot=0
+    [[ -f "${ESP_MOUNT}/EFI/systemd/systemd-bootx64.efi" ]] && has_systemd_boot=1
+    [[ -f "${ESP_MOUNT}/EFI/LamBoot/lambootx64.efi" ]] || [[ -f "${ESP_MOUNT}/EFI/LamBoot/lambootx64-signed.efi" ]] && has_lamboot=1
+
+    if (( has_systemd_boot )) || (( has_lamboot )); then
+        local entry_count=0 uki_count=0
+        if [[ -d "$entries_dir" ]]; then
+            entry_count=$(find "$entries_dir" -maxdepth 1 -name '*.conf' 2>/dev/null | wc -l | tr -d ' ')
+        fi
+        if [[ -d "$linux_dir" ]]; then
+            uki_count=$(find "$linux_dir" -maxdepth 1 -name '*.efi' 2>/dev/null | wc -l | tr -d ' ')
+        fi
+
+        if [[ "$entry_count" -eq 0 ]] && [[ "$uki_count" -eq 0 ]]; then
+            local bootloaders=""
+            (( has_systemd_boot )) && bootloaders="systemd-boot"
+            (( has_lamboot ))      && bootloaders="${bootloaders:+$bootloaders, }LamBoot"
+
+            # If the offline rootfs has kernel-install, we can auto-fix this:
+            # remount rw, bind /dev /proc /sys, chroot in, run kernel-install
+            # add-all. Plan this as a moderate-risk step. Without a rootfs or
+            # without kernel-install, fall back to advice-only.
+            local can_autofix=0
+            if [[ -n "$LAMBOOT_OFFLINE_ROOT" ]] && offline_chroot_has_command kernel-install; then
+                can_autofix=1
+            fi
+
+            if (( can_autofix )); then
+                emit_finding "repair.offline.no_boot_entries" "repair_entries" "critical" "fail" \
+                    "Bootloader installed but no boot entries present" \
+                    "$bootloaders is on the ESP, but /loader/entries/ has zero .conf files and /EFI/Linux/ has zero UKIs. Will be auto-repaired via kernel-install in offline chroot." \
+                    "{\"bootloaders\":\"$(json_escape "$bootloaders")\",\"entries\":${entry_count},\"ukis\":${uki_count},\"autofix\":\"chroot_kernel_install\"}" \
+                    "$(_remediation_json "repair.offline.no_boot_entries" \
+                        "Regenerate BLS entries via kernel-install in chroot" \
+                        "sudo lamboot-repair --offline <disk> --apply")"
+
+                plan_add "repair.offline.regen_bls" \
+                    "Regenerate BLS entries via kernel-install in offline chroot" \
+                    "_offline_regen_bls" \
+                    "moderate"
+            else
+                local why="no rootfs detected on disk"
+                [[ -n "$LAMBOOT_OFFLINE_ROOT" ]] && why="kernel-install not present in offline rootfs"
+                emit_finding "repair.offline.no_boot_entries" "repair_entries" "critical" "fail" \
+                    "Bootloader installed but no boot entries present" \
+                    "$bootloaders is on the ESP, but /loader/entries/ has zero .conf files and /EFI/Linux/ has zero UKIs. Auto-repair unavailable: $why. Boot the OS via rescue media and run kernel-install or reinstall the kernels." \
+                    "{\"bootloaders\":\"$(json_escape "$bootloaders")\",\"entries\":${entry_count},\"ukis\":${uki_count},\"autofix\":null,\"reason\":\"$(json_escape "$why")\"}" \
+                    "$(_remediation_json "repair.offline.no_boot_entries" \
+                        "Boot rescue media and regenerate" \
+                        "sudo kernel-install add-all   (run from inside the OS)")"
+            fi
+        fi
+    fi
+
+    diagnose_offline_nvram
+}
+
+# Inspect an OVMF VARS file (when --nvram FILE was provided) and emit findings
+# about Boot#### entries. Auto-fix: append a Boot entry pointing at LamBoot
+# when one is missing AND lambootx64.efi is actually present on the ESP.
+diagnose_offline_nvram() {
+    if [[ -z "$OPT_NVRAM_FILE" ]]; then
+        emit_finding "repair.offline.nvram_skipped" "repair_nvram" "info" "skip" \
+            "NVRAM not inspected (no --nvram FILE provided)" \
+            "Pass --nvram /path/to/OVMF_VARS.fd to inspect or repair Boot entries." \
+            "{}" '{}'
+        return 0
+    fi
+    # Accept regular files (raw VARS dumps) AND block devices (Proxmox stores
+    # OVMF VARS as small ZFS zvols accessed via /dev/zvol/POOL/vm-NN-disk-X).
+    if [[ ! -f "$OPT_NVRAM_FILE" ]] && [[ ! -b "$OPT_NVRAM_FILE" ]]; then
+        emit_finding "repair.offline.nvram_missing" "repair_nvram" "error" "fail" \
+            "NVRAM path not readable" \
+            "$OPT_NVRAM_FILE is neither a regular file nor a block device." \
+            "{\"path\":\"$(json_escape "$OPT_NVRAM_FILE")\"}" '{}'
+        return 1
+    fi
+    if ! command -v virt-fw-vars >/dev/null 2>&1; then
+        emit_finding "repair.offline.nvram_no_tool" "repair_nvram" "error" "fail" \
+            "virt-fw-vars not available" \
+            "Install python3-virt-firmware (Debian/Ubuntu) or pip install virt-firmware." \
+            "{}" \
+            "$(_remediation_json "repair.offline.nvram_no_tool" \
+                "Install virt-firmware" \
+                "sudo apt install python3-virt-firmware")"
+        return 1
+    fi
+
+    local boot_dump
+    boot_dump=$(_nvram_dump_boot "$OPT_NVRAM_FILE")
+    local entry_count
+    entry_count=$(printf '%s\n' "$boot_dump" | grep -c '^  - name=Boot[0-9A-Fa-f]\{4\}$' || true)
+    emit_finding "repair.nvram.entry_count" "repair_nvram" "info" "pass" \
+        "$entry_count Boot#### entries in NVRAM" "" \
+        "{\"count\":${entry_count},\"file\":\"$(json_escape "$OPT_NVRAM_FILE")\"}" '{}'
+
+    # Decide whether to plan a LamBoot Boot#### append: either NVRAM has zero
+    # entries (efidisk regenerated) or no entry references the LamBoot path.
+    local lamboot_efi="\\EFI\\LamBoot\\lambootx64.efi"
+    local has_lamboot_entry=0
+    if _nvram_has_boot_for "$OPT_NVRAM_FILE" "$lamboot_efi"; then
+        has_lamboot_entry=1
+    fi
+
+    # Only auto-fix when the binary actually exists on the offline ESP — adding
+    # a Boot entry that points at a missing file creates a dead entry that
+    # firmware will skip and could mask other problems.
+    local binary_present=0
+    if [[ -f "${ESP_MOUNT}/EFI/LamBoot/lambootx64.efi" ]] || \
+       [[ -f "${ESP_MOUNT}/EFI/LamBoot/lambootx64-signed.efi" ]]; then
+        binary_present=1
+    fi
+
+    if (( has_lamboot_entry )); then
+        emit_finding "repair.nvram.lamboot_entry" "repair_nvram" "info" "pass" \
+            "NVRAM has a Boot entry referencing LamBoot" "" \
+            "{\"path\":\"$(json_escape "$lamboot_efi")\"}" '{}'
+
+        # LamBoot Boot#### exists; check whether it's at the head of BootOrder.
+        # If not, firmware auto-boot will pick another entry (typically a
+        # generic HARDDISK that falls back to \EFI\BOOT\BOOTX64.EFI which
+        # may be unsigned and Access-Denied under SB) — visible at the
+        # firmware Boot Manager prompt rather than booting the OS.
+        local lamboot_idx bootorder_first
+        lamboot_idx=$(_nvram_find_boot_for "$OPT_NVRAM_FILE" "$lamboot_efi" || true)
+        bootorder_first=$(virt-fw-vars --input "$OPT_NVRAM_FILE" --print 2>/dev/null \
+            | awk -F': boot order: ' '/^BootOrder/ {print $2; exit}' \
+            | awk -F',' '{gsub(/[[:space:]]/,"",$1); print $1}')
+        if [[ -n "$lamboot_idx" ]] && [[ -n "$bootorder_first" ]] \
+           && [[ "${bootorder_first^^}" != "${lamboot_idx^^}" ]]; then
+            emit_finding "repair.nvram.lamboot_not_first" "repair_nvram" "warning" "fail" \
+                "LamBoot Boot entry exists but isn't first in BootOrder" \
+                "BootOrder head is Boot${bootorder_first^^}; LamBoot is Boot${lamboot_idx^^}. Firmware auto-boot will pick the head, not LamBoot. Reorder needed." \
+                "{\"head\":\"${bootorder_first^^}\",\"lamboot\":\"${lamboot_idx^^}\",\"autofix\":\"set_first\"}" \
+                "$(_remediation_json "repair.nvram.lamboot_not_first" \
+                    "Move LamBoot to head of BootOrder" \
+                    "sudo lamboot-repair --offline DISK --nvram VARS --apply")"
+            plan_add "repair.nvram.set_first" \
+                "Move Boot${lamboot_idx^^} (LamBoot) to head of BootOrder" \
+                "_offline_nvram_set_first_boot '$lamboot_idx'" \
+                "moderate"
+        fi
+    elif (( binary_present )); then
+        emit_finding "repair.nvram.lamboot_entry" "repair_nvram" "warning" "fail" \
+            "NVRAM has no Boot entry for LamBoot" \
+            "lambootx64.efi exists on the ESP but no Boot#### entry references it; firmware will fall back to \\EFI\\BOOT\\BOOTX64.EFI or fail to boot." \
+            "{\"path\":\"$(json_escape "$lamboot_efi")\",\"binary_present\":true,\"autofix\":\"append_boot_filepath\"}" \
+            "$(_remediation_json "repair.nvram.lamboot_entry" \
+                "Append a LamBoot Boot entry to NVRAM" \
+                "sudo lamboot-repair --offline DISK --nvram VARS --apply")"
+        plan_add "repair.nvram.add_lamboot_entry" \
+            "Append Boot#### entry pointing at \\EFI\\LamBoot\\lambootx64.efi" \
+            "_offline_nvram_add_boot_entry '\\EFI\\LamBoot\\lambootx64.efi' 'LamBoot'" \
+            "moderate"
+    else
+        emit_finding "repair.nvram.lamboot_entry" "repair_nvram" "info" "skip" \
+            "NVRAM has no LamBoot entry, but binary is also missing" \
+            "Reinstall LamBoot to the ESP first, then re-run with --nvram to add the Boot entry." \
+            "{\"path\":\"$(json_escape "$lamboot_efi")\",\"binary_present\":false}" \
+            "$(_remediation_json "repair.nvram.lamboot_entry" \
+                "Reinstall LamBoot first" \
+                "sudo lamboot-install --signed   (then re-run lamboot-repair --nvram)")"
+    fi
 }
 
 # ── Phase 2: Show plan ───────────────────────────────────────────────────
@@ -603,6 +952,8 @@ parse_args() {
             --fix-fstab)    OPT_FIX_FSTAB_ONLY=1; shift ;;
             --plan-only)    OPT_PLAN_ONLY=1; LAMBOOT_DRY_RUN=1; shift ;;
             --risk-limit)   OPT_RISK_LIMIT="${2:-moderate}"; shift 2 ;;
+            --nvram)        [[ -n "${2:-}" ]] || die "--nvram requires a path"
+                            OPT_NVRAM_FILE="$2"; shift 2 ;;
             help)           _register_subcommands
                             if [[ -n "${2:-}" ]]; then
                                 dispatch_help "$2"

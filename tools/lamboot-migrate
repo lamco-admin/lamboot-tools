@@ -185,10 +185,16 @@ guard_root_not_on_lvm_or_crypt() {
 
 guard_no_hybrid_mbr() {
     local disk="$1"
+    # Canonical sgdisk flag is --print-mbr (short -O). Output is a header
+    # plus a "Number Boot Start ... Code" table; MBR partition rows start
+    # with optional-whitespace digits. A hybrid is GPT + >1 MBR entry,
+    # because entry 1 is the GPT protective partition (0xEE) and any
+    # additional entry is a non-protective overlay — exactly what Rod
+    # Smith calls "flaky and dangerous" in hybrid.html.
     local mbr_output
-    mbr_output=$(sgdisk --print-mbr-only "$disk" 2>/dev/null || true)
+    mbr_output=$(sgdisk --print-mbr "$disk" 2>/dev/null || true)
     local mbr_partitions
-    mbr_partitions=$(printf '%s' "$mbr_output" | grep -cE '^\s+[0-9]+\s+' || true)
+    mbr_partitions=$(printf '%s' "$mbr_output" | grep -cE '^\s*[0-9]+\s' || true)
     mbr_partitions="${mbr_partitions:-0}"
 
     local pttype
@@ -206,10 +212,31 @@ guard_no_hybrid_mbr() {
 
 guard_no_windows() {
     local disk="$1"
+
+    # Two-tier detection. blkid/lsblk catches a functioning NTFS via BPB
+    # inspection (primary path). A partition-type-code check via sfdisk
+    # catches the case where blkid can't parse the NTFS (corrupted, fake,
+    # or very small install) — Windows MBR uses 0x07 (HPFS/NTFS/exFAT) or
+    # 0x27 (hidden). Per SDS-7 §5.7 we refuse on either signal to keep
+    # the safety-first posture.
     local parts
     parts=$(lsblk -nr -o NAME,FSTYPE "$disk" 2>/dev/null || true)
-
+    local ntfs_via_lsblk=0
     if printf '%s' "$parts" | awk '{print $2}' | grep -qi 'ntfs'; then
+        ntfs_via_lsblk=1
+    fi
+
+    local ntfs_via_type=0
+    if command -v sfdisk >/dev/null 2>&1; then
+        # sfdisk renders the MBR type code without leading zeros or 0x
+        # prefix (e.g. "type=7" for 0x07, "type=27" for 0x27). Match all
+        # plausible forms so we're robust across sfdisk versions.
+        if sfdisk -d "$disk" 2>/dev/null | grep -qE 'type=(0x)?0?(7|27)\b'; then
+            ntfs_via_type=1
+        fi
+    fi
+
+    if [[ $ntfs_via_lsblk -eq 1 ]] || [[ $ntfs_via_type -eq 1 ]]; then
         local ntfs_part
         ntfs_part=$(printf '%s' "$parts" | awk '$2 ~ /ntfs|NTFS/ {print $1; exit}')
         local bmgr=""
@@ -223,11 +250,18 @@ guard_no_windows() {
             rmdir "$mp" 2>/dev/null || true
         fi
 
-        if [[ "$bmgr" == "detected" ]]; then
+        # Confidence levels:
+        #   bmgr="detected"   → /Windows/Boot dir found, definitive Windows install
+        #   ntfs_via_type=1   → MBR type 0x07/0x27, strong signal of Windows intent
+        #                       even if the NTFS is damaged or uninitialized
+        # Either fires die_unsafe per SDS-7 §5.7 safety-first posture.
+        if [[ "$bmgr" == "detected" ]] || [[ $ntfs_via_type -eq 1 ]]; then
+            local detail="Windows install detected on target disk"
+            [[ "$bmgr" != "detected" ]] && detail="Windows-typed partition detected on target disk (MBR type 0x07/0x27)"
             emit_finding "migrate.preflight.windows_present" "preflight" "critical" "fail" \
-                "Windows install detected on target disk" \
+                "$detail" \
                 "Windows dual-boot with MBR→GPT conversion requires BCD rewriting, not automated in v1.0." \
-                "{\"disk\":\"$(json_escape "$disk")\",\"ntfs_partition\":\"$(json_escape "$ntfs_part")\"}" \
+                "{\"disk\":\"$(json_escape "$disk")\",\"ntfs_partition\":\"$(json_escape "${ntfs_part:-unknown}")\",\"detection\":\"${bmgr:-partition-type}\"}" \
                 '{"summary":"Manual dual-boot migration","doc_url":"https://lamboot.dev/tools/migrate/dual-boot"}'
             die_unsafe "Windows present on $disk — refusing automated conversion"
         fi
@@ -314,7 +348,60 @@ detect_target_disk() {
     printf '/dev/%s' "$parent"
 }
 
-# ── Proxmox method detection (SDS-7 §4) ──────────────────────────────────
+# ── Proxmox method detection + pre-checks (SDS-7 §4) ────────────────────
+#
+# Three methods for BIOS→UEFI conversion of a Proxmox VM:
+#
+#   A = pre-convert (preferred): running inside the VM, convert in place.
+#       Requires ≥ ESP_SIZE_MB free on the root disk OR adjacent unallocated.
+#   B = post-convert live chroot: booted from a live ISO, converting the
+#       target disk that's mounted at /mnt/sysroot (or similar). Phase 7
+#       bind-mounts /dev /proc /sys /sys/firmware/efi into the chroot.
+#   C = add-disk: attach a small second disk as the ESP-carrier; leave the
+#       root disk MBR. Cosmetically unusual but zero-risk to root. Requires
+#       a second block device to be already attached and empty.
+#
+# On physical hosts, only Method A applies. B/C are VM-specific.
+
+_detect_running_in_proxmox_vm() {
+    # DMI strings that QEMU/KVM VMs under Proxmox carry in their firmware.
+    # /sys/class/dmi/id/sys_vendor is "QEMU"; product_name is often
+    # "Standard PC" or similar. A real Proxmox VM has both + virtio devs.
+    local vendor="" product=""
+    [[ -r /sys/class/dmi/id/sys_vendor ]] && vendor=$(tr -d '\n' < /sys/class/dmi/id/sys_vendor 2>/dev/null)
+    [[ -r /sys/class/dmi/id/product_name ]] && product=$(tr -d '\n' < /sys/class/dmi/id/product_name 2>/dev/null)
+    [[ "$vendor" == "QEMU" ]] || [[ "$product" == *QEMU* ]]
+}
+
+_detect_running_from_live_media() {
+    # Common live-media markers: overlay rootfs, /run/initramfs populated,
+    # or kernel cmdline mentioning boot=live / live media identifiers.
+    local rootfs
+    rootfs=$(findmnt -n -o FSTYPE / 2>/dev/null || true)
+    [[ "$rootfs" == "overlay" ]] && return 0
+    [[ -d /run/initramfs/live ]] && return 0
+    grep -qE 'boot=live|rd\.live\.image|live-media' /proc/cmdline 2>/dev/null && return 0
+    return 1
+}
+
+_count_extra_block_disks() {
+    # Count block devices that are not the target disk and not removable.
+    # Used by Method C auto-detection — we want to see if a second disk
+    # is available to become the ESP-carrier.
+    local target="${OPT_DISK:-}"
+    local count=0
+    local dev
+    while read -r dev; do
+        [[ -z "$dev" ]] && continue
+        [[ "/dev/$dev" == "$target" ]] && continue
+        # Skip removable + read-only + zero-size
+        local rm rossz
+        rm=$(cat "/sys/block/$dev/removable" 2>/dev/null || echo 0)
+        rossz=$(cat "/sys/block/$dev/size" 2>/dev/null || echo 0)
+        [[ "$rm" == "0" ]] && [[ "$rossz" != "0" ]] && count=$((count + 1))
+    done < <(lsblk -dn -o NAME 2>/dev/null | grep -E '^(sd|vd|nvme|xvd)' || true)
+    printf '%d' "$count"
+}
 
 detect_proxmox_method() {
     case "$OPT_METHOD" in
@@ -325,18 +412,75 @@ detect_proxmox_method() {
         *) die "invalid --method: $OPT_METHOD (use auto, A, B, or C)" ;;
     esac
 
-    # Auto-select heuristic per SDS-7 §4.4
-    if [[ -n "${PROXMOX_VM_ID:-}" ]] && command -v qm >/dev/null 2>&1; then
-        printf 'A'
-        return 0
-    fi
+    # Auto-select per SDS-7 §4.4:
+    #   1. Live-media present → B (user has clearly booted rescue/installer)
+    #   2. Physical host or no Proxmox DMI → A (only method that applies)
+    #   3. On a Proxmox VM: prefer A; if no free space, prefer C if a
+    #      second disk is visible, else fall back to B.
 
-    if [[ -d /run/initramfs ]] && grep -q 'live' /proc/cmdline 2>/dev/null; then
+    if _detect_running_from_live_media; then
         printf 'B'
         return 0
     fi
 
+    if ! _detect_running_in_proxmox_vm; then
+        printf 'A'
+        return 0
+    fi
+
+    # We're in a Proxmox VM. Defer the free-space decision to Phase 1
+    # (guard_disk_free_space has the authoritative math). If a second disk
+    # is present, record that Method C is viable as a fallback; default
+    # pick stays A and the guardrail will downgrade if needed.
     printf 'A'
+}
+
+# Method-specific pre-flight checks beyond the common guards. Called at
+# the start of Phase 1 after the method is known, so we can diagnose
+# "wrong method for this environment" before any mutation.
+guard_method_prerequisites() {
+    local method
+    method=$(detect_proxmox_method)
+
+    case "$method" in
+        A)
+            # Method A: in-place conversion. Already in the VM; no extra
+            # pre-check beyond what Phase 1 runs (free-space, etc.).
+            :
+            ;;
+        B)
+            # Method B: we're in a live chroot. /sys/firmware/efi may or
+            # may not be present (live USB may itself be UEFI or legacy).
+            # We NEED a target root specified via --disk explicitly — we
+            # can't auto-detect because findmnt / points at the live media,
+            # not the target root.
+            if [[ -z "$OPT_DISK" ]] || [[ "$OPT_DISK" == "/dev/null" ]]; then
+                emit_finding "migrate.method_b.no_target_disk" "preflight" "critical" "fail" \
+                    "Method B requires --disk targeting the VM's root disk" \
+                    "When running from live media, findmnt / sees the live USB, not the install target. Specify --disk /dev/sdX explicitly." \
+                    "{\"method\":\"B\"}" \
+                    '{"summary":"Specify the target disk","command":"lamboot-migrate to-uefi --method B --disk /dev/sdX"}'
+                die_unsafe "Method B requires explicit --disk"
+            fi
+            ;;
+        C)
+            # Method C: second disk as ESP-carrier. Root disk stays MBR.
+            # Need a second block device visible + empty (no partition table).
+            local extra
+            extra=$(_count_extra_block_disks)
+            if [[ "$extra" -lt 1 ]]; then
+                emit_finding "migrate.method_c.no_second_disk" "preflight" "critical" "fail" \
+                    "Method C requires a second block device as the ESP-carrier" \
+                    "Attach a small (≥ 1 GB) second disk to the VM before running. From Proxmox: qm set <VMID> --scsi1 <storage>:1" \
+                    "{\"method\":\"C\",\"target_disk\":\"$(json_escape "${OPT_DISK:-auto}")\",\"extra_disks_visible\":${extra}}" \
+                    '{"summary":"Attach a second disk to the VM","command":"qm set <VMID> --scsi1 <storage>:1"}'
+                die_prerequisite "Method C requires a second disk (found 0 additional block devices)"
+            fi
+            ;;
+        *)
+            die "internal: unknown method after detect: $method"
+            ;;
+    esac
 }
 
 # ── Distro-specific bootloader install (SDS-7 §3 Phase 8) ─────────────────
@@ -442,10 +586,20 @@ to_uefi_phase_1_preflight() {
     guard_boot_mode_is_bios
     guard_required_tools
 
-    local disk
-    disk=$(detect_target_disk) || die "cannot auto-detect target disk; use --disk"
-    OPT_DISK="$disk"
-    verbose "target disk: $OPT_DISK"
+    # Disk detection differs by method: Method B (live chroot) REQUIRES
+    # --disk because findmnt / points at the live media, not the target;
+    # Methods A/C auto-detect from root mount. Resolve before the method-
+    # specific pre-check so we can diagnose precisely.
+    local method
+    method=$(detect_proxmox_method)
+    if [[ "$method" != "B" ]] && [[ -z "$OPT_DISK" || "$OPT_DISK" == "/dev/null" ]]; then
+        local disk
+        disk=$(detect_target_disk) || die "cannot auto-detect target disk; use --disk"
+        OPT_DISK="$disk"
+    fi
+    verbose "target disk: $OPT_DISK; method: $method"
+
+    guard_method_prerequisites
 
     [[ -b "$OPT_DISK" ]] || die "not a block device: $OPT_DISK"
 
@@ -1561,4 +1715,9 @@ main() {
     esac
 }
 
-main "$@"
+# Run main only when this file is executed directly, not when sourced
+# (which bats integration tests do to call guard_* / detect_* functions
+# against loopback-mounted fixtures).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

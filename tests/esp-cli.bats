@@ -27,12 +27,13 @@ require_esp() {
     [[ "$output" == *"lamboot-tools"* ]]
 }
 
-@test "esp help lists three subcommands" {
+@test "esp help lists four subcommands" {
     run "$TOOL" help
     [ "$status" -eq 0 ]
     [[ "$output" == *"check"* ]]
     [[ "$output" == *"inventory"* ]]
     [[ "$output" == *"clean"* ]]
+    [[ "$output" == *"deploy"* ]]
 }
 
 @test "esp help check shows detail" {
@@ -51,6 +52,38 @@ require_esp() {
     run "$TOOL" help clean
     [ "$status" -eq 0 ]
     [[ "$output" == *"--apply"* ]]
+}
+
+@test "esp help deploy shows --src + --signed + --driver" {
+    run "$TOOL" help deploy
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--src"* ]]
+    [[ "$output" == *"--signed"* ]]
+    [[ "$output" == *"--driver"* ]]
+}
+
+@test "esp deploy end-to-end on a fake ESP renames -signed -> bare and writes manifest" {
+    [[ $EUID -eq 0 ]] || skip "deploy requires root"
+    src=$(mktemp -d)
+    esp=$(mktemp -d)
+    mkdir -p "$src/EFI/LamBoot/modules"
+    echo "FAKE_BIN_SIGNED" > "$src/EFI/LamBoot/lambootx64-signed.efi"
+    echo "FAKE_DS"         > "$src/EFI/LamBoot/modules/diag-shell.efi"
+    echo "FAKE_DS_SIGNED"  > "$src/EFI/LamBoot/modules/diag-shell-signed.efi"
+    echo "[modules.diag-shell]" > "$src/EFI/LamBoot/modules/manifest.toml"
+    echo "[lamboot]"       > "$src/EFI/LamBoot/policy.toml"
+
+    run "$TOOL" deploy --esp "$esp" --src "$src" --signed \
+                       --manifest-version "test" --manifest-distro "bats"
+    [ "$status" -eq 0 ]
+    [ -f "$esp/EFI/LamBoot/lambootx64.efi" ]
+    [ ! -f "$esp/EFI/LamBoot/lambootx64-signed.efi" ]
+    [ -f "$esp/EFI/LamBoot/modules/diag-shell.efi" ]
+    [ ! -f "$esp/EFI/LamBoot/modules/diag-shell-signed.efi" ]
+    [ -f "$esp/EFI/LamBoot/.install-manifest" ]
+    grep -q "EFI/LamBoot/lambootx64.efi" "$esp/EFI/LamBoot/.install-manifest"
+    ! grep -q "lambootx64-signed.efi" "$esp/EFI/LamBoot/.install-manifest"
+    rm -rf "$src" "$esp"
 }
 
 @test "esp --json-schema returns schema declaration" {
