@@ -1,7 +1,7 @@
 Name:           lamboot-migrate
-Version:        1.0.0
+Version:        0.7.3
 Release:        1%{?dist}
-Summary:        Automated Linux BIOS→UEFI migration and cross-bootloader migration tool
+Summary:        Automated Linux BIOS to UEFI and cross-bootloader migration tool
 License:        MIT OR Apache-2.0
 URL:            https://lamboot.dev/migrate/
 Source0:        https://github.com/lamco-admin/%{name}/archive/v%{version}/%{name}-%{version}.tar.gz
@@ -95,7 +95,11 @@ fi
 %{_mandir}/man1/lamboot-migrate.1*
 
 %changelog
-* Wed Apr 22 2026 Lamco Development <office@lamco.io> - 1.0.0-1
+* Wed Jun 03 2026 Lamco Development LLC <office@lamco.io> - 0.7.3-1
+- Version aligned to the lamboot-migrate tool version (shipped alongside the
+  lamboot-tools 0.8.0 umbrella release)
+- Copyright holder set to Lamco Development LLC
+* Wed Apr 22 2026 Lamco Development LLC <office@lamco.io> - 1.0.0-1
 - Initial standalone release of lamboot-migrate
 - Also available as subpackage of lamboot-tools
 - 10-phase pipeline with 7 safety guardrails

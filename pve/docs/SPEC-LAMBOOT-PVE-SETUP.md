@@ -4,7 +4,7 @@
 **Date:** 2026-04-22
 **Status:** Ready for implementation review
 **Parent spec:** `SPEC-LAMBOOT-TOOLKIT-V1.md` §3.2 entry for `lamboot-pve-setup`
-**Related:** `~/lamboot-tools-dev/docs/PROXMOX-INTEGRATION-ROADMAP.md` (Phase 1)
+**Related:** `~/lamboot-tools-dev/PROXMOX-INTEGRATION-ROADMAP.md` (Phase 1)
 **Package:** `lamboot-toolkit-pve` (companion, separate from core `lamboot-tools`)
 
 ---

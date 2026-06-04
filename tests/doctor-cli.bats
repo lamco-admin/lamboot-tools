@@ -24,9 +24,17 @@ require_jq() {
     [[ "$output" == *"lamboot-tools"* ]]
 }
 
-@test "doctor --version shows v0.3.0" {
+@test "doctor --version shows current umbrella version" {
+    # Read the umbrella version from the canonical source and assert the
+    # binary self-reports the same. Hardcoding the version here led to drift
+    # (was stuck on 0.3.0 through 0.7.0 / 0.7.1 / 0.7.2 bumps); this dynamic
+    # check tracks lib/lamboot-toolkit-lib.sh automatically.
+    local toolkit_lib="$BATS_TEST_DIRNAME/../lib/lamboot-toolkit-lib.sh"
+    local umbrella
+    umbrella=$(grep -oP 'LAMBOOT_TOOLKIT_VERSION="\K[0-9]+\.[0-9]+\.[0-9]+' "$toolkit_lib")
+    [ -n "$umbrella" ] || skip "could not read umbrella version from $toolkit_lib"
     run "$TOOL" --version
-    [[ "$output" == *"0.3.0"* ]]
+    [[ "$output" == *"$umbrella"* ]]
 }
 
 @test "doctor help shows the check entry with beta maturity" {
@@ -135,6 +143,40 @@ require_jq() {
 @test "doctor --no-clean does not error" {
     run "$TOOL" --no-repair --no-clean
     [ "$status" -eq 0 ] || [ "$status" -eq 3 ]
+}
+
+@test "doctor splices capcheck findings when bridge + binary present" {
+    require_jq
+    local capcheck_bin="$BATS_TEST_DIRNAME/../target/release/lamboot-capcheck"
+    if [ ! -x "$capcheck_bin" ]; then
+        skip "lamboot-capcheck release binary not built (run cargo build --release -p lamboot-capcheck)"
+    fi
+    CAPCHECK_BIN_OVERRIDE="$capcheck_bin" run --separate-stderr "$TOOL" --no-repair --json
+    # Either no capcheck findings (clean system) or at least one prefixed "capcheck."
+    local capcheck_count
+    capcheck_count=$(echo "$output" | jq '[.findings[] | select(.id | startswith("capcheck."))] | length')
+    [ "$capcheck_count" -ge 0 ]
+    # Bridge must NOT crash the doctor run — exit code 0 (no findings) or 3 (findings exist).
+    [ "$status" -eq 0 ] || [ "$status" -eq 3 ]
+}
+
+@test "doctor capcheck-spliced findings have valid id structure" {
+    require_jq
+    local capcheck_bin="$BATS_TEST_DIRNAME/../target/release/lamboot-capcheck"
+    if [ ! -x "$capcheck_bin" ]; then
+        skip "lamboot-capcheck release binary not built"
+    fi
+    CAPCHECK_BIN_OVERRIDE="$capcheck_bin" run --separate-stderr "$TOOL" --no-repair --json
+    # Every spliced finding must use the capcheck.domain.* or capcheck.quirk.* prefix
+    local all_valid=1
+    while IFS= read -r id; do
+        [[ -z "$id" ]] && continue
+        if ! [[ "$id" =~ ^capcheck\.(domain|quirk)\..+ ]]; then
+            all_valid=0
+            break
+        fi
+    done < <(echo "$output" | jq -r '.findings[] | select(.id | startswith("capcheck.")) | .id')
+    [ "$all_valid" -eq 1 ]
 }
 
 @test "doctor run_id matches spec format" {

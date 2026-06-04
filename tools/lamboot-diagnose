@@ -13,7 +13,7 @@ source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
 source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
 
 LAMBOOT_TOOL_NAME="lamboot-diagnose"
-LAMBOOT_TOOL_VERSION="0.3.0"
+LAMBOOT_TOOL_VERSION="0.7.3"
 
 # ── ESP partition type GUID constant ─────────────────────────────────────
 readonly ESP_PARTTYPE_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
@@ -113,6 +113,17 @@ resolve_root_disk() {
     parent=$(lsblk -nro PKNAME "$src" 2>/dev/null | head -1 || true)
     if [[ -n "$parent" ]]; then
         printf '/dev/%s' "$parent"
+        return 0
+    fi
+
+    # No immediate parent: the root source is a device-mapper target with no
+    # single PKNAME (LVM logical volume, dm-crypt, multipath). Walk the inverse
+    # dependency tree to the underlying physical disk — that disk, not the
+    # mapper target, is what holds the partition table blkid must read.
+    local disk
+    disk=$(lsblk -s -nro NAME,TYPE "$src" 2>/dev/null | awk '$2=="disk"{print $1; exit}' || true)
+    if [[ -n "$disk" ]]; then
+        printf '/dev/%s' "$disk"
         return 0
     fi
 
@@ -306,7 +317,20 @@ check_category_esp() {
 
     # Integrity (non-destructive fsck)
     if _id_active "esp.integrity" && [[ -n "$esp_dev" ]] && command -v fsck.fat >/dev/null 2>&1; then
-        if fsck.fat -n "$esp_dev" >/dev/null 2>&1; then
+        # fsck.fat is only meaningful on an UNMOUNTED FAT. On a running system
+        # the ESP is mounted read-write, so the kernel keeps the volume-dirty
+        # flag set for the whole mount (clearing it only on clean unmount) and
+        # the FS can change under a read-only scan — fsck.fat -n then reports
+        # the dirty flag (and possibly a spurious free-cluster-summary delta)
+        # with no real corruption. Treating that as a problem produced a
+        # permanent false-positive warning on every booted host. So only render
+        # a strict verdict when offline (ESP unmounted); online, report info.
+        if [[ $LAMBOOT_OFFLINE_ACTIVE -ne 1 ]]; then
+            emit_finding "esp.integrity" "esp" "info" "pass" \
+                "ESP integrity not checked online (ESP is mounted)" \
+                "fsck.fat is unreliable on a mounted read-write FAT (the volume-dirty flag is expected). For a definitive check, run 'lamboot-diagnose --offline <disk>' or fsck.fat -a after unmounting the ESP." \
+                "{\"device\":\"$(json_escape "$esp_dev")\"}" '{}'
+        elif fsck.fat -n "$esp_dev" >/dev/null 2>&1; then
             emit_finding "esp.integrity" "esp" "info" "pass" \
                 "ESP filesystem is clean" \
                 "fsck.fat -n reports no issues." \
@@ -741,10 +765,19 @@ check_category_fstab() {
             if printf '%s' "$root_line" | grep -qE 'UUID=|PARTUUID=|LABEL='; then
                 emit_finding "fstab.root_uuid_form" "fstab" "info" "pass" \
                     "Root filesystem uses UUID/LABEL/PARTUUID" "" "{}" '{}'
+            elif printf '%s' "$root_line" | grep -qE '^/dev/(mapper/|dm-)'; then
+                # Device-mapper names (LVM logical volumes, dm-crypt) are
+                # deterministic and stable across disk/partition reordering —
+                # they are the Debian default for LVM roots and do not exhibit
+                # the /dev/sdXN reorder hazard. Treat as a stable identifier.
+                emit_finding "fstab.root_uuid_form" "fstab" "info" "pass" \
+                    "Root uses a stable device-mapper path (LVM/dm)" \
+                    "Device-mapper names are deterministic and stable across disk/partition reordering — equivalent to UUID for boot stability." \
+                    "{}" '{}'
             elif printf '%s' "$root_line" | grep -q '^/dev/'; then
                 emit_finding "fstab.root_uuid_form" "fstab" "warning" "warn" \
-                    "Root uses device path" \
-                    "Dangerous when partitions change; convert to UUID=." "{}" \
+                    "Root uses a raw device path" \
+                    "Raw kernel device names (e.g. /dev/sda2) can shift when disks/partitions are reordered; prefer UUID=." "{}" \
                     "$(_remediation_json "fstab.root_uuid_form" \
                         "Convert root entry to UUID" \
                         "sudo lamboot-repair --fix-fstab")"

@@ -28,7 +28,7 @@ Consumed by three tools across two repos:
 `lamboot-pve-setup` requires `lamboot-dev >= 0.8.4` for the rewritten
 fw_cfg file-reference-pattern hookscript. Installation checks for the
 hookscript's presence and version; refuses to proceed if missing.
-See `docs/CROSS-REPO-STATUS.md` for coordination status.
+See `CROSS-REPO-STATUS.md` for coordination status.
 
 ## Tools inherit
 

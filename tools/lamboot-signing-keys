@@ -17,7 +17,7 @@ source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
 source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
 
 LAMBOOT_TOOL_NAME="lamboot-signing-keys"
-LAMBOOT_TOOL_VERSION="0.3.0"
+LAMBOOT_TOOL_VERSION="0.7.2"
 
 readonly DOC_BASE="https://lamboot.dev/tools/findings"
 
@@ -907,28 +907,76 @@ _resolve_sbat_content() {
     # binaries (component ID "lamboot") and from shim (component ID "shim").
     local version="${LAMBOOT_TOOLKIT_VERSION:-unknown}"
     printf 'sbat,1,SBAT Version,sbat,1,https://github.com/rhboot/shim/blob/main/SBAT.md\n'
-    printf 'lamboot-tools.signed,1,Lamco Development,lamboot-tools,%s,https://lamboot.dev/tools/sbat\n' "$version"
+    printf 'lamboot-tools.signed,1,Lamco Development LLC,lamboot-tools,%s,https://lamboot.dev/tools/sbat\n' "$version"
     return 0
 }
 
 _inject_sbat_section() {
     # Injects .sbat PE section into an EFI binary in-place.
-    # Uses objcopy --add-section with CONTENTS,ALLOC,LOAD,READONLY,DATA flags
-    # (standard PE section attributes for data sections — same set used by
-    # shim's own build system when it injects its .sbat).
+    #
+    # PE section placement matters: shim 16+ enforces that every section's
+    # VMA lies within [ImageBase, ImageBase + SizeOfImage). Without
+    # --change-section-address, GNU objcopy picks an arbitrary VMA for a
+    # newly-added section (typically rounded up to the next power-of-two
+    # boundary above the highest existing section's end). For a UEFI PE
+    # with ImageBase=0x140000000 and SizeOfImage on the order of 1 MiB,
+    # objcopy may pick e.g. 0x200000000 — 8 GiB above ImageBase, far
+    # outside the valid range, causing shim to reject the binary with
+    # EFI_UNSUPPORTED ("unsupported" blue screen). Bug 15 — surfaced
+    # by VM 133 Fedora 44 SB+MOK boot test 2026-05-25.
+    #
+    # Fix: query the binary's existing section layout, compute the next
+    # SectionAlignment-aligned VMA past the highest section end, and
+    # pass --change-section-address so .sbat lands at a valid PE address.
+    # objcopy will adjust the PE header's SizeOfImage to cover the new
+    # section automatically.
     local binary="$1" sbat_content="$2"
     local tmp_sbat
     tmp_sbat=$(mktemp -t lamboot-signing-sbat.XXXXXX)
-    # Track for cleanup in case of early exit
     printf '%s' "$sbat_content" > "$tmp_sbat"
 
     # Ensure the CSV ends with a newline so objcopy doesn't truncate the last entry
     [[ "$(tail -c 1 "$tmp_sbat")" == $'\n' ]] || printf '\n' >> "$tmp_sbat"
 
     require_tool objcopy "install binutils"
+    require_tool objdump "install binutils"
+
+    # Compute the VMA for .sbat: highest existing section's (VMA + virtual
+    # size), rounded up to SectionAlignment. objdump -h prints, per
+    # section: Idx Name Size VMA LMA File-off Algn. We sum VMA+Size and
+    # take the max. SectionAlignment comes from `objdump -p` "SectionAlignment".
+    # Highest section's (VMA + virtual size). objdump -h lines for sections
+    # look like:  "  0 .text  00010000  0000000140001000  ..."
+    local max_end
+    max_end=$(objdump -h "$binary" | awk '
+        /^ *[0-9]+ +\./ {
+            size = strtonum("0x"$3)
+            vma  = strtonum("0x"$4)
+            end  = vma + size
+            if (end > max) max = end
+        }
+        END { printf "0x%x\n", max + 0 }
+    ')
+
+    # SectionAlignment from PE optional header
+    local sa
+    sa=$(objdump -p "$binary" | awk '/^SectionAlignment/ {print "0x"$2; exit}')
+    sa="${sa:-0x1000}"  # default 4 KiB if objdump didn't report it
+
+    # Round max_end up to SectionAlignment
+    local sbat_vma
+    sbat_vma=$(printf '0x%x\n' "$(( ( max_end + sa - 1 ) & ~( sa - 1 ) ))")
+
+    if [[ -z "$sbat_vma" || "$sbat_vma" == "0x0" ]]; then
+        rm -f "$tmp_sbat"
+        die "could not compute .sbat VMA from $binary (objdump output empty?)"
+    fi
+
+    verbose "computed .sbat VMA: $sbat_vma (from highest section end + SectionAlignment)"
 
     lamboot_run objcopy \
         --add-section ".sbat=$tmp_sbat" \
+        --change-section-address ".sbat=$sbat_vma" \
         --set-section-flags ".sbat=contents,alloc,load,readonly,data" \
         "$binary" "$binary"
     local rc=$?

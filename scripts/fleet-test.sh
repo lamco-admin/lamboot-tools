@@ -1,7 +1,7 @@
 #!/bin/bash
 # fleet-test.sh — Tier 1 fleet-test driver
 #
-# Orchestrates the Tier 1 matrix documented in docs/FLEET-TEST-PLAN.md §2.
+# Orchestrates the Tier 1 matrix documented in FLEET-TEST-PLAN.md §2.
 # Runs on a Proxmox VE host (self-hosted GitHub Actions runner).
 #
 # Flow per VMID:
@@ -33,7 +33,7 @@ fail() { printf '%s[fail]%s %s\n' "$RED" "$RESET" "$1" >&2; exit 1; }
 warn() { printf '%s[warn]%s %s\n' "$YELLOW" "$RESET" "$1" >&2; }
 ok()   { printf '%s[ok]%s %s\n' "$GREEN" "$RESET" "$1"; }
 
-# ── VMID matrix (from docs/FLEET-TEST-PLAN.md §2) ───────────────────────
+# ── VMID matrix (from FLEET-TEST-PLAN.md §2) ───────────────────────
 
 TIER1_VMIDS_POSITIVE=(
     # Distro × UEFI+GRUB
@@ -73,14 +73,14 @@ TIER1_VMIDS_LAMBOOT=(
 
 require_proxmox() {
     # Graceful skip when the runner isn't a Proxmox host. The Tier 1 matrix
-    # infrastructure is explicitly known-pending in docs/CROSS-REPO-STATUS.md
+    # infrastructure is explicitly known-pending in CROSS-REPO-STATUS.md
     # (handed off to lamco-admin). Hard-failing the scheduled workflow every
     # night while that's being provisioned generates false-positive noise.
     # When qm appears on the runner, this script proceeds normally without
     # any further code change.
     if ! command -v qm >/dev/null 2>&1; then
         warn "qm not found — fleet-test skipped (runner is not a Proxmox host)"
-        warn "Tier 1 infrastructure is ops-pending per docs/CROSS-REPO-STATUS.md"
+        warn "Tier 1 infrastructure is ops-pending per CROSS-REPO-STATUS.md"
         warn "This exit code of 0 is deliberate; see scripts/fleet-test.sh:require_proxmox"
         mkdir -p "$RESULTS_DIR"
         printf '{"status":"skipped","reason":"qm-not-found","date":"%s"}\n' \

@@ -11,9 +11,15 @@
 source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
 # shellcheck source=../lib/lamboot-toolkit-help.sh
 source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
+# shellcheck source=../lib/lamboot-capcheck-bridge.sh
+# Soft-include the capcheck bridge — degrades gracefully if missing.
+if [[ -f "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-capcheck-bridge.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-capcheck-bridge.sh"
+fi
 
 LAMBOOT_TOOL_NAME="lamboot-doctor"
-LAMBOOT_TOOL_VERSION="0.3.0"
+LAMBOOT_TOOL_VERSION="0.7.5"
 
 readonly DOC_BASE="https://lamboot.dev/tools/findings"
 readonly STATE_DIR="/var/lib/lamboot-doctor"
@@ -147,6 +153,13 @@ _remediation_command_of() {
         | grep -oE '"command":"[^"]*"' | head -1 | cut -d'"' -f4
 }
 
+# Pulled from capcheck-bridge-spliced findings. Values: "safe", "moderate",
+# "destructive", "none", or "" when absent.
+_remediation_risk_of() {
+    printf '%s' "$1" | grep -oE '"remediation":\{[^}]*\}' | head -1 \
+        | grep -oE '"risk":"[^"]*"' | head -1 | cut -d'"' -f4
+}
+
 build_plan_from_findings() {
     local findings_blob="$1"
 
@@ -157,16 +170,35 @@ build_plan_from_findings() {
     while IFS= read -r finding; do
         [[ -z "$finding" ]] && continue
 
-        local id sev title cmd
+        local id sev title cmd risk
         id=$(_id_of "$finding")
         sev=$(_severity_of "$finding")
         title=$(_title_of "$finding")
         cmd=$(_remediation_command_of "$finding")
+        risk=$(_remediation_risk_of "$finding")
 
         [[ -z "$id" ]] && continue
 
         # Info severity: not surfaced
         [[ "$sev" == "info" ]] && continue
+
+        # --risk-limit gate (capcheck-spliced findings carry an explicit risk).
+        # safe       → only safe actions auto/confirm; moderate/destructive → manual
+        # moderate   → safe + moderate auto/confirm; destructive → manual
+        # destructive → all allowed
+        local risk_gated=0
+        case "$OPT_RISK_LIMIT" in
+            safe)
+                if [[ "$risk" == "moderate" || "$risk" == "destructive" ]]; then
+                    risk_gated=1
+                fi
+                ;;
+            moderate)
+                if [[ "$risk" == "destructive" ]]; then
+                    risk_gated=1
+                fi
+                ;;
+        esac
 
         # Default policy per matrix (§3)
         local policy="skip" action=""
@@ -208,6 +240,12 @@ build_plan_from_findings() {
         # If we can't map it, downgrade to manual (print only)
         if [[ -z "$action" ]]; then
             policy="manual"
+        fi
+
+        # Risk-limit downgrade — manual-print the gated action.
+        if [[ $risk_gated -eq 1 ]]; then
+            policy="manual"
+            verbose "risk-gated: $id (risk=$risk, limit=$OPT_RISK_LIMIT)"
         fi
 
         # --no-repair: downgrade every would-be-executed step to manual
@@ -269,6 +307,14 @@ _map_action_from_command() {
             ;;
         "lamboot-esp repair"*)
             printf 'lamboot-repair --auto --yes%s' "$offline_suffix"
+            ;;
+        "apt-get "*|"dnf "*|"pacman "*|"proxmox-boot-tool "*|"update-grub"|"grub2-mkconfig "*)
+            # capcheck-emitted distro commands. Risk-limit gating happens at
+            # the policy layer (build_plan_from_findings) via the finding's
+            # remediation.risk field — not here. Pass through verbatim; the
+            # policy will downgrade to manual if --risk-limit safe is set
+            # and the action's risk is moderate/destructive.
+            printf '%s' "$cmd"
             ;;
         *)
             printf ''
@@ -550,6 +596,52 @@ do_check() {
     # Extract findings array from the diagnose output
     local findings_blob
     findings_blob=$(printf '%s' "$diag_output" | grep -oE '"findings":\[.*\],"actions_taken"' | sed 's/"findings":\[//;s/\],"actions_taken"//')
+
+    # Splice in capcheck findings if the bridge is loaded AND capcheck is
+    # available. The bridge emits a JSON array; we strip its [ ] wrap and
+    # comma-join with the diagnose findings_blob so the existing parser
+    # (build_plan_from_findings) treats them uniformly. We also call
+    # emit_finding for each capcheck record so it lands in doctor's --json
+    # output alongside doctor.* findings.
+    if declare -F capcheck_emit_diagnose_findings >/dev/null 2>&1 \
+       && capcheck_available \
+       && command -v jq >/dev/null 2>&1; then
+        info "Phase: Capability audit (lamboot-capcheck)"
+        local capcheck_findings
+        capcheck_findings=$(capcheck_emit_diagnose_findings)
+        local capcheck_count
+        capcheck_count=$(printf '%s' "$capcheck_findings" | jq 'length' 2>/dev/null)
+        if [[ -n "$capcheck_count" && "$capcheck_count" -gt 0 ]]; then
+            # 1) Splice raw into findings_blob for plan-building
+            local capcheck_csv
+            capcheck_csv=$(printf '%s' "$capcheck_findings" | jq -c '.[]' 2>/dev/null | paste -sd, -)
+            if [[ -n "$findings_blob" ]]; then
+                findings_blob="${findings_blob},${capcheck_csv}"
+            else
+                findings_blob="$capcheck_csv"
+            fi
+            verbose "spliced ${capcheck_count} capcheck finding(s) into plan"
+
+            # 2) Emit each as a doctor-style finding so it appears in
+            #    `lamboot-doctor --json` output. Preserve the bridge's
+            #    structured remediation (command + risk + summary + doc_url).
+            while IFS= read -r row; do
+                [[ -z "$row" ]] && continue
+                local f_id f_category f_severity f_status f_title f_message
+                f_id=$(printf '%s' "$row" | jq -r '.id')
+                f_category=$(printf '%s' "$row" | jq -r '.category')
+                f_severity=$(printf '%s' "$row" | jq -r '.severity')
+                f_status=$(printf '%s' "$row" | jq -r '.status')
+                f_title=$(printf '%s' "$row" | jq -r '.title')
+                f_message=$(printf '%s' "$row" | jq -r '.description')
+                local remediation
+                remediation=$(printf '%s' "$row" | jq -c '.remediation')
+                local context='{}'
+                emit_finding "$f_id" "$f_category" "$f_severity" "$f_status" \
+                    "$f_title" "$f_message" "$context" "$remediation"
+            done < <(printf '%s' "$capcheck_findings" | jq -c '.[]')
+        fi
+    fi
 
     build_plan_from_findings "$findings_blob"
 

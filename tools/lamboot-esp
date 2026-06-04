@@ -18,7 +18,7 @@ source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
 source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/esp-deploy.sh"
 
 LAMBOOT_TOOL_NAME="lamboot-esp"
-LAMBOOT_TOOL_VERSION="0.3.0"
+LAMBOOT_TOOL_VERSION="0.7.2"
 
 readonly ESP_PARTTYPE_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
 readonly DOC_BASE="https://lamboot.dev/tools/findings"

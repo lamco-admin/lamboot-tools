@@ -2,7 +2,7 @@
 # release-rehearsal.sh — 10-point release-readiness check
 #
 # Runs every release-moment precondition check. Invoked by
-# docs/RELEASE.md §1 preflight. Safe to run anytime; doesn't modify state.
+# RELEASE.md §1 preflight. Safe to run anytime; doesn't modify state.
 #
 # Exit 0 = ready to release; non-zero = blockers present.
 
@@ -110,7 +110,7 @@ done
 
 # ── [9/10] publish scripts + executables ────────────────────────────────
 section "9/10" "Publish scripts ready"
-for script in publish/build-tarball.sh publish/build-standalone-migrate.sh publish/bump-version.sh publish/mirror-from-lamboot-dev.sh publish/mirror-pve-from-lamboot-dev.sh publish/export-to-public.sh; do
+for script in publish/build-tarball.sh publish/build-standalone-migrate.sh publish/bump-version.sh publish/mirror-from-lamboot-dev.sh publish/mirror-pve-from-lamboot-dev.sh publish/vendor-binaries.sh; do
     if [[ -x "$script" ]] && bash -n "$script" 2>/dev/null; then
         check_pass "$(basename "$script")"
     else
@@ -118,12 +118,29 @@ for script in publish/build-tarball.sh publish/build-standalone-migrate.sh publi
     fi
 done
 
-# ── [10/10] governance gate active ──────────────────────────────────────
-section "10/10" "Governance gate active"
-if publish/export-to-public.sh v0.2.0 >/dev/null 2>&1; then
-    check_fail "export-to-public.sh did NOT refuse without LAMBOOT_EXPORT_CONFIRMED — governance broken"
+# ── [10/10] bundled component binaries vendored ─────────────────────────
+# Publishing governance now lives in the lamco-admin pipeline
+# (publish/sync-to-public.sh, gated by a per-release approval). The dev-side
+# readiness gate here is that the bundled component binaries are present,
+# statically linked, and recorded in the provenance manifest, so a tarball
+# built from this tree is the complete product.
+section "10/10" "Bundled component binaries vendored"
+fw_fail=0
+if [[ -f vendor/BINARY-PROVENANCE.txt ]]; then
+    for arch in x86_64 aarch64; do
+        for bin in lamboot-capcheck lamboot-reader; do
+            f="vendor/bin/${arch}/${bin}"
+            if [[ -f "$f" ]] && ! file "$f" 2>/dev/null | grep -qiE 'dynamically linked'; then
+                :
+            else
+                check_fail "missing or non-static vendored binary: ${f}"
+                fw_fail=$((fw_fail+1))
+            fi
+        done
+    done
+    [[ $fw_fail -eq 0 ]] && check_pass "4 static binaries (capcheck + reader, x86_64 + aarch64) vendored with provenance"
 else
-    check_pass "export-to-public.sh correctly refuses without explicit confirmation"
+    check_fail "vendor/BINARY-PROVENANCE.txt missing — run publish/vendor-binaries.sh"
 fi
 
 # ── [11/11] no stubs or placeholders in shipped code ────────────────────
@@ -179,5 +196,5 @@ if [[ $fail -gt 0 ]]; then
     exit 1
 fi
 
-printf '\n%sREADY TO RELEASE%s — continue with docs/RELEASE.md §2\n' "$GREEN" "$RESET"
+printf '\n%sREADY TO RELEASE%s — continue with RELEASE.md §2\n' "$GREEN" "$RESET"
 exit 0

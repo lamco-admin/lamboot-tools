@@ -5,7 +5,7 @@
 **Status:** Ready for implementation review
 **Parent spec:** `SPEC-LAMBOOT-TOOLKIT-V1.md` §3.1 entry for `lamboot-signing-keys`
 **Existing implementation:** NEW — introduced in Session J
-**Related source-of-truth:** `~/lamboot-dev/docs/KEY-GENERATION.md`, `~/lamboot-dev/docs/SECURE-BOOT-AND-SIGNING-STRATEGY.md`, `~/lamboot-dev/docs/MOK-ENROLLMENT-GUIDE.md`, `~/lamboot-dev/docs/OVMF-VARS-PROXMOX.md`
+**Related source-of-truth:** `~/lamboot-dev/KEY-GENERATION.md`, `~/lamboot-dev/SECURE-BOOT-AND-SIGNING-STRATEGY.md`, `~/lamboot-dev/MOK-ENROLLMENT-GUIDE.md`, `~/lamboot-dev/OVMF-VARS-PROXMOX.md`
 
 ---
 
@@ -121,7 +121,7 @@ hint: use --size 2048 (default); RSA 4096 is safe for --type pk and --type kek
 Works on `.key`, `.crt`, `.der`, or `.pem` files. Emits findings:
 
 ```
-keys.inspect.subject: CN=LamBoot Release Signing Key 2026, O=Lamco Development
+keys.inspect.subject: CN=LamBoot Release Signing Key 2026, O=Lamco Development LLC
 keys.inspect.issuer: (same as subject for self-signed)
 keys.inspect.algorithm: sha256WithRSAEncryption
 keys.inspect.key_size: 2048

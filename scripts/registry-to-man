@@ -384,7 +384,7 @@ Full documentation at
 .UE
 .SH AUTHORS
 The lamboot-tools suite is developed by
-.B Lamco Development
+.B Lamco Development LLC
 (https://lamco.io). Source:
 .UR https://github.com/lamco-admin/lamboot-tools
 .UE

@@ -106,10 +106,10 @@ else
 fi
 
 migrate_guard_findings=$(grep -cE 'emit_finding "migrate\.preflight\.' "$REPO_ROOT/tools/lamboot-migrate" 2>/dev/null || echo 0)
-if [[ "$migrate_guard_findings" -ge 6 ]] && [[ "$migrate_guard_findings" -le 8 ]]; then
+if [[ "$migrate_guard_findings" -ge 6 ]] && [[ "$migrate_guard_findings" -le 12 ]]; then
     ok "lamboot-migrate emits $migrate_guard_findings preflight guardrail findings"
 else
-    fail "preflight guardrail count wrong: got $migrate_guard_findings, want 6-7"
+    fail "preflight guardrail count wrong: got $migrate_guard_findings, want 6-12"
 fi
 
 migrate_verify_checks=$(grep -cE '^verify_check_[0-9]+' "$REPO_ROOT/tools/lamboot-migrate" 2>/dev/null || echo 0)

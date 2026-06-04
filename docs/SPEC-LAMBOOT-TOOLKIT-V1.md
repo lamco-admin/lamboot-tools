@@ -7,7 +7,7 @@
 **Public release target:** `lamco-admin/lamboot-tools` (tarball + distro packages)
 **PVE subtree:** `pve/` within this repo — ships as the `lamboot-toolkit-pve` RPM subpackage (single source tree per founder decision 2026-04-22; no separate dev or public repo)
 **Sibling spec:** `~/lamboot-dev/docs/specs/SPEC-LAMBOOT-MIGRATE.md` (SDS-7, tool-level)
-**Session origin:** `~/lamboot-dev/docs/STATUS-2026-04-22-TOOLKIT-PIVOT.md` §5 Session A
+**Session origin:** `~/lamboot-dev/STATUS-2026-04-22-TOOLKIT-PIVOT.md` §5 Session A
 
 ---
 
@@ -1030,8 +1030,8 @@ Per R18/Q3 decisions, the hookscript rewrite to fw_cfg file-reference pattern is
 - No code sharing between the two beyond the shared library and JSON schema conformance.
 
 **`lamboot-signing-keys` ↔ LamBoot signing infrastructure:**
-- `lamboot-signing-keys` Scope 1 mode manages Lamco release-engineering keys per `~/lamboot-dev/docs/KEY-GENERATION.md`. The existing `sign-lamboot.sh`, `build-ovmf-vars.sh`, and `KEY-GENERATION.md` procedure become consumed by `lamboot-signing-keys` as internal implementation.
-- Canonical source of the key-management procedure stays in `~/lamboot-dev/docs/KEY-GENERATION.md` (the authoritative document). `lamboot-signing-keys` references it, does not duplicate it.
+- `lamboot-signing-keys` Scope 1 mode manages Lamco release-engineering keys per `~/lamboot-dev/KEY-GENERATION.md`. The existing `sign-lamboot.sh`, `build-ovmf-vars.sh`, and `KEY-GENERATION.md` procedure become consumed by `lamboot-signing-keys` as internal implementation.
+- Canonical source of the key-management procedure stays in `~/lamboot-dev/KEY-GENERATION.md` (the authoritative document). `lamboot-signing-keys` references it, does not duplicate it.
 - Scope 2 mode (user-facing) is independent of Lamco keys; users generate their OWN keys.
 - The RSA-2048 constraint for MOK-enrolled keys (Debian #1013320 shim freeze) is enforced as a safety check in both modes.
 
@@ -1220,7 +1220,7 @@ Keeps the claims appendix honest as the code evolves.
 | `lamboot-monitor.py` | `~/lamboot-dev/tools/lamboot-monitor.py` | toolkit `/pve/tools/lamboot-pve-monitor` (renamed) | `publish/mirror-pve-from-lamboot-dev.sh` |
 | `build-ovmf-vars.sh` | `~/lamboot-dev/tools/build-ovmf-vars.sh` | toolkit `/pve/tools/lamboot-pve-ovmf-vars` (renamed) | same |
 | `lamboot-hookscript.pl` | `~/lamboot-dev/tools/lamboot-hookscript.pl` | Not mirrored. Documented in toolkit spec; users install from lamboot-dev side. | N/A |
-| `KEY-GENERATION.md` | `~/lamboot-dev/docs/KEY-GENERATION.md` | Toolkit website references; not mirrored | N/A |
+| `KEY-GENERATION.md` | `~/lamboot-dev/KEY-GENERATION.md` | Toolkit website references; not mirrored | N/A |
 | `fleet.toml` schema | THIS spec §16 Appendix C | lamboot-dev hookscript reads per this schema | Schema version in both specs |
 
 ### 14.3 Release coordination table for v0.2
@@ -1405,20 +1405,20 @@ Per-tool SDSes for D.1 through D.8 (see §3.1) are authored during Session B–J
 
 ### Appendix E — References
 
-- `~/lamboot-dev/docs/STATUS-2026-04-22-TOOLKIT-PIVOT.md` — session origin
-- `~/lamboot-tools-dev/docs/SDS-7-GAP-ANALYSIS.md` — `lamboot-migrate` v0.1.0 → v1.0 gap analysis
-- `~/lamboot-tools-dev/docs/PROXMOX-INTEGRATION-ROADMAP.md` — 5-phase Proxmox integration plan
+- `~/lamboot-dev/STATUS-2026-04-22-TOOLKIT-PIVOT.md` — session origin
+- `~/lamboot-tools-dev/SDS-7-GAP-ANALYSIS.md` — `lamboot-migrate` v0.1.0 → v1.0 gap analysis
+- `~/lamboot-tools-dev/PROXMOX-INTEGRATION-ROADMAP.md` — 5-phase Proxmox integration plan
 - `~/lamboot-dev/docs/specs/SPEC-LAMBOOT-MIGRATE.md` — SDS-7, `lamboot-migrate` tool-level spec
 - `~/lamboot-dev/docs/specs/SPEC-NATIVE-TRUST-CHAIN.md` — SDS-4, trust-log schema and claims discipline model
 - `~/lamboot-dev/docs/specs/SPEC-UKI-PE-PARSER.md` — UKI section parser (bootloader-internal; informs `lamboot-uki-build` output format)
 - `~/lamboot-dev/docs/specs/SPEC-PREFLIGHT-VALIDATION.md` — bootloader-internal preflight (clarifies `lamboot-preflight` is subsumed into `lamboot-diagnose`)
 - `~/lamboot-dev/docs/specs/SPEC-LAMBOOT-INSTALL.md` — LamBoot installer; `lamboot-migrate to-lamboot` integration point
-- `~/lamboot-dev/docs/SECURE-BOOT-AND-SIGNING-STRATEGY.md` — signing strategy consumed by `lamboot-signing-keys`
-- `~/lamboot-dev/docs/KEY-GENERATION.md` — authoritative key-gen procedure; Scope 1 of `lamboot-signing-keys` consumes this
-- `~/lamboot-dev/docs/MOK-ENROLLMENT-GUIDE.md` — user-facing MOK UX; Scope 2 of `lamboot-signing-keys` assists with this
-- `~/lamboot-dev/docs/OVMF-VARS-PROXMOX.md` — Proxmox Config 4 deployment; `lamboot-pve-ovmf-vars` automates
-- `~/lamboot-dev/docs/BOOT-TOOLKIT-LANDSCAPE-2026-04-04.md` — pre-spec thinking; superseded by this document
-- `~/lamboot-dev/docs/ROADMAP.md` — LamBoot bootloader roadmap; coordinated with §12
+- `~/lamboot-dev/SECURE-BOOT-AND-SIGNING-STRATEGY.md` — signing strategy consumed by `lamboot-signing-keys`
+- `~/lamboot-dev/KEY-GENERATION.md` — authoritative key-gen procedure; Scope 1 of `lamboot-signing-keys` consumes this
+- `~/lamboot-dev/MOK-ENROLLMENT-GUIDE.md` — user-facing MOK UX; Scope 2 of `lamboot-signing-keys` assists with this
+- `~/lamboot-dev/OVMF-VARS-PROXMOX.md` — Proxmox Config 4 deployment; `lamboot-pve-ovmf-vars` automates
+- `~/lamboot-dev/BOOT-TOOLKIT-LANDSCAPE-2026-04-04.md` — pre-spec thinking; superseded by this document
+- `~/lamboot-dev/ROADMAP.md` — LamBoot bootloader roadmap; coordinated with §12
 
 ---
 
@@ -1427,7 +1427,7 @@ Per-tool SDSes for D.1 through D.8 (see §3.1) are authored during Session B–J
 This specification is **ready for implementation** when:
 
 - [ ] Founder has reviewed and explicitly acknowledged
-- [ ] Cross-repo coordination items in §14.3 are mirrored into `~/lamboot-dev/docs/ROADMAP.md`
+- [ ] Cross-repo coordination items in §14.3 are mirrored into `~/lamboot-dev/ROADMAP.md`
 - [ ] `lamboot-tools-dev/ROADMAP.md` is created or updated to reference this spec as authoritative
 - [ ] Session B can begin
 

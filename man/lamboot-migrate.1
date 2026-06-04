@@ -1,8 +1,8 @@
 .\" lamboot-migrate(1) — auto-generated from help registry
 .\" Source: tools/lamboot-migrate
-.\" Generated: 2026-04-23T18:57:28Z
+.\" Generated: 2026-06-03T23:49:38Z
 .\" DO NOT EDIT — regenerate via `make man` or `scripts/registry-to-man`.
-.TH "LAMBOOT-MIGRATE" "1" "2026-04-23" "lamboot-migrate 1.0.0" "lamboot-tools"
+.TH "LAMBOOT-MIGRATE" "1" "2026-06-03" "lamboot-migrate 0.7.3" "lamboot-tools"
 .SH NAME
 lamboot-migrate \- part of the lamboot-tools suite
 .SH SYNOPSIS
@@ -124,7 +124,7 @@ stable
 .PP
 .RS 4
 .nf
-lamboot\-migrate to\-lamboot [\-\-esp PATH] [\-\-preserve\-grub|\-\-remove\-grub] [\-\-force]
+lamboot\-migrate to\-lamboot [\-\-esp PATH] [\-\-preserve\-grub|\-\-remove\-grub] [\-\-unsigned] [\-\-force]
 .fi
 .RE
 .PP
@@ -141,6 +141,9 @@ Keep existing bootloader as fallback (default)
 .B \-\-remove\-grub
 Remove GRUB packages + ESP files + NVRAM entries after verify passes (DANGEROUS)
 .TP
+.B \-\-unsigned
+Install the unsigned LamBoot binary (Secure Boot OFF systems). Default is \-\-signed for SB compatibility.
+.TP
 .B \-\-force
 Skip typed\-yes confirmation when \-\-remove\-grub is used
 .RE
@@ -151,6 +154,7 @@ Skip typed\-yes confirmation when \-\-remove\-grub is used
 .nf
 sudo lamboot\-migrate to\-lamboot
 sudo lamboot\-migrate to\-lamboot \-\-preserve\-grub
+sudo lamboot\-migrate to\-lamboot \-\-unsigned    # SB\-off systems
 sudo lamboot\-migrate to\-lamboot \-\-remove\-grub    # asks for confirmation
 sudo lamboot\-migrate to\-lamboot \-\-remove\-grub \-\-force
 .fi
@@ -159,7 +163,7 @@ sudo lamboot\-migrate to\-lamboot \-\-remove\-grub \-\-force
 .B NOTES
 .PP
 .RS 4
-Invokes lamboot\-install. With \-\-preserve\-grub (default) the prior bootloader stays as a UEFI fallback. With \-\-remove\-grub the tool runs verify first; if all 11 checks pass, it uninstalls the distro\'s GRUB packages, removes GRUB files from the ESP, and deletes GRUB Boot#### entries from NVRAM. Refuses to remove if verify fails. Requires typed\-yes confirmation unless \-\-force.
+Invokes lamboot\-install. Default is \-\-signed (Secure Boot path: lambootx64\-signed.efi shipped from /usr/share/lamboot/). Pass \-\-unsigned to install the unsigned binary on SB\-off systems (must still be installed from /usr/share/lamboot/ but lamboot\-install will use lambootx64.efi instead). With \-\-preserve\-grub (default) the prior bootloader stays as a UEFI fallback. With \-\-remove\-grub the tool runs verify first; if all 11 checks pass, it uninstalls the distro\'s GRUB packages, removes GRUB files from the ESP, and deletes GRUB Boot#### entries from NVRAM. Refuses to remove if verify fails. Requires typed\-yes confirmation unless \-\-force.
 .RE
 .PP
 .B OFFLINE:
@@ -461,7 +465,7 @@ Full documentation at
 .UE
 .SH AUTHORS
 The lamboot-tools suite is developed by
-.B Lamco Development
+.B Lamco Development LLC
 (https://lamco.io). Source:
 .UR https://github.com/lamco-admin/lamboot-tools
 .UE

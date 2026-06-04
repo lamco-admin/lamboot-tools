@@ -1,6 +1,6 @@
 .\" lamboot-tools(7) — suite overview
 .\" Hand-authored; companion to registry-generated (1) pages.
-.TH "LAMBOOT-TOOLS" "7" "2026-04-22" "lamboot-tools 0.2.0" "lamboot-tools"
+.TH "LAMBOOT-TOOLS" "7" "2026-04-22" "lamboot-tools 0.7.12" "lamboot-tools"
 .SH NAME
 lamboot-tools \- The Linux UEFI boot toolkit
 .SH DESCRIPTION
@@ -97,8 +97,8 @@ Every tool emits a consistent envelope when \fB\-\-json\fR is passed:
 {
   "schema_version": "v1",
   "tool": "lamboot-diagnose",
-  "version": "0.2.0",
-  "toolkit_version": "0.2.0",
+  "version": "0.7.12",
+  "toolkit_version": "0.7.12",
   "timestamp": "...",
   "host": "...",
   "run_id": "...",
@@ -182,7 +182,7 @@ hosts diagnosing or repairing unmounted VM disks.
 .SH RELATED PROJECTS
 .TP
 .B LamBoot
-UEFI bootloader by Lamco Development. Available at
+UEFI bootloader by Lamco Development LLC. Available at
 .UR https://lamboot.dev
 .UE
 and
@@ -213,7 +213,7 @@ Per-finding deep-dives at
 .BR lamboot-toolkit (1),
 .BR lamboot-tools-schema (5)
 .SH AUTHORS
-.B Lamco Development
+.B Lamco Development LLC
 .UR https://lamco.io
 .UE
 .SH LICENSE

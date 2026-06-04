@@ -91,4 +91,4 @@ When a regen produces a different output (distro updates, new kernel), the SHA c
 1. Run the regen script
 2. Commit the new `fixtures.sha256` line
 3. Upload the new `.raw` to hosting
-4. Update `docs/CROSS-REPO-STATUS.md` if the change affects testing baselines
+4. Update `CROSS-REPO-STATUS.md` if the change affects testing baselines

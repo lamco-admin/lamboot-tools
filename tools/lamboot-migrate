@@ -21,7 +21,7 @@ source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
 source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
 
 LAMBOOT_TOOL_NAME="lamboot-migrate"
-LAMBOOT_TOOL_VERSION="1.0.0"
+LAMBOOT_TOOL_VERSION="0.7.3"
 
 # ── Tool-specific options ────────────────────────────────────────────────
 OPT_SUBCOMMAND=""
@@ -35,8 +35,40 @@ OPT_SKIP_VERIFY=0
 OPT_KEEP_LEGACY_MBR=1
 OPT_PRESERVE_GRUB=1
 OPT_REMOVE_GRUB=0
+OPT_UNSIGNED=0                # to-lamboot: skip --signed (Secure Boot OFF testing)
 OPT_VERIFY_ALL=0
+OPT_CAPCHECK_GATE=0           # opt-in capcheck readiness audit in preflight
 OPT_VERIFY_PATH=""
+
+# ── Phase 1 → Phase 5 shrink handoff (SDS-7 §3 Phase 5 shrink-to-make-room) ──
+# Phase 1's guard_disk_free_space sets these when it determines the last
+# partition must be shrunk to free space for the ESP. Phase 5 reads them to
+# perform the actual resize2fs + sgdisk delete/recreate. Empty = no shrink.
+LAMBOOT_NEEDS_SHRINK=0
+LAMBOOT_SHRINK_LAST_PART_NUM=""
+LAMBOOT_SHRINK_LAST_PART_DEV=""
+LAMBOOT_SHRINK_NEW_PART_MB=""
+LAMBOOT_SHRINK_DONE=0           # set to 1 by Phase 3b after shrink completes
+
+# ── Method B chroot orchestration (SDS-7 §4.2 — runs under live ISO) ──
+# Method B converts a target disk while booted from live media. Phase 5b mounts
+# the target's (shrunken) root + the new ESP under LAMBOOT_TARGET_ROOT so that
+# Phases 6-10 operate on the *target's* /etc/fstab, /boot, /boot/efi rather
+# than the live ISO's. Method A leaves LAMBOOT_TARGET_ROOT empty so the
+# helpers degrade to identity / no-op.
+LAMBOOT_TARGET_ROOT=""
+LAMBOOT_TARGET_BINDS=()
+# Separate target filesystems (a dedicated /boot, /usr, … declared in the
+# target's fstab) mounted under LAMBOOT_TARGET_ROOT in Phase 5b, shallow→deep.
+# Without these the chroot's /boot is an empty mountpoint and grub-mkconfig
+# emits a kernel-less grub.cfg (SDS-7 separate-/boot defect — see archie).
+LAMBOOT_TARGET_FS_MOUNTS=()
+
+# ── Inter-phase return-value globals ─────────────────────────────────────
+# Bash function "returns" via stdout (`$(...)` capture) get corrupted when
+# the function also invokes external commands that write to stdout. Use
+# named globals instead for inter-phase data passing.
+LAMBOOT_PHASE5_ESP_DEV=""
 
 # ── Help registry (§10, three-surface rendering) ─────────────────────────
 _register_subcommands() {
@@ -67,16 +99,18 @@ _register_subcommands() {
         --name "to-lamboot" \
         --category "Migration" \
         --summary "Migrate UEFI system from another bootloader to LamBoot" \
-        --syntax "lamboot-migrate to-lamboot [--esp PATH] [--preserve-grub|--remove-grub] [--force]" \
+        --syntax "lamboot-migrate to-lamboot [--esp PATH] [--preserve-grub|--remove-grub] [--unsigned] [--force]" \
         --arg "--esp PATH:ESP mount point (default: auto-detect)" \
         --arg "--preserve-grub:Keep existing bootloader as fallback (default)" \
         --arg "--remove-grub:Remove GRUB packages + ESP files + NVRAM entries after verify passes (DANGEROUS)" \
+        --arg "--unsigned:Install the unsigned LamBoot binary (Secure Boot OFF systems). Default is --signed for SB compatibility." \
         --arg "--force:Skip typed-yes confirmation when --remove-grub is used" \
         --example "sudo lamboot-migrate to-lamboot" \
         --example "sudo lamboot-migrate to-lamboot --preserve-grub" \
+        --example "sudo lamboot-migrate to-lamboot --unsigned    # SB-off systems" \
         --example "sudo lamboot-migrate to-lamboot --remove-grub    # asks for confirmation" \
         --example "sudo lamboot-migrate to-lamboot --remove-grub --force" \
-        --notes "Invokes lamboot-install. With --preserve-grub (default) the prior bootloader stays as a UEFI fallback. With --remove-grub the tool runs verify first; if all 11 checks pass, it uninstalls the distro's GRUB packages, removes GRUB files from the ESP, and deletes GRUB Boot#### entries from NVRAM. Refuses to remove if verify fails. Requires typed-yes confirmation unless --force." \
+        --notes "Invokes lamboot-install. Default is --signed (Secure Boot path: lambootx64-signed.efi shipped from /usr/share/lamboot/). Pass --unsigned to install the unsigned binary on SB-off systems (must still be installed from /usr/share/lamboot/ but lamboot-install will use lambootx64.efi instead). With --preserve-grub (default) the prior bootloader stays as a UEFI fallback. With --remove-grub the tool runs verify first; if all 11 checks pass, it uninstalls the distro's GRUB packages, removes GRUB files from the ESP, and deletes GRUB Boot#### entries from NVRAM. Refuses to remove if verify fails. Requires typed-yes confirmation unless --force." \
         --offline-capable "false" \
         --requires-root "true" \
         --see-also "to-uefi, rollback" \
@@ -145,7 +179,7 @@ guard_boot_mode_is_bios() {
 
 guard_required_tools() {
     local missing=()
-    for tool in sgdisk mkfs.vfat efibootmgr blkid lsblk findmnt rsync; do
+    for tool in sgdisk sfdisk mkfs.vfat efibootmgr blkid lsblk findmnt rsync dumpe2fs resize2fs e2fsck; do
         command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
@@ -282,6 +316,31 @@ guard_fstab_uuid_form() {
     fi
 }
 
+# Returns: MB the ext4 on $1 can be safely shrunk by (printed to stdout),
+# or 0 if not ext4 / unreadable. Reads superblock via dumpe2fs -h (read-only,
+# works on mounted FS); applies a 10% headroom margin so we never push the FS
+# to its absolute minimum. Used by guard_disk_free_space + Phase 5 shrink.
+ext4_shrinkable_mb() {
+    local dev="$1"
+    [[ -b "$dev" ]] || { printf '0'; return 0; }
+
+    local fstype
+    fstype=$(blkid -o value -s TYPE "$dev" 2>/dev/null || true)
+    [[ "$fstype" == "ext4" ]] || { printf '0'; return 0; }
+
+    local sb block_size block_count free_blocks
+    sb=$(dumpe2fs -h "$dev" 2>/dev/null) || { printf '0'; return 0; }
+    block_size=$(awk -F: '/^Block size:/ {gsub(/ /,"",$2); print $2}' <<<"$sb")
+    block_count=$(awk -F: '/^Block count:/ {gsub(/ /,"",$2); print $2}' <<<"$sb")
+    free_blocks=$(awk -F: '/^Free blocks:/ {gsub(/ /,"",$2); print $2}' <<<"$sb")
+
+    [[ "$block_size" =~ ^[0-9]+$ && "$free_blocks" =~ ^[0-9]+$ && "$block_count" =~ ^[0-9]+$ ]] \
+        || { printf '0'; return 0; }
+
+    # 90% of free space, converted to MB (integer math).
+    printf '%s' $(( free_blocks * block_size * 9 / 10 / 1024 / 1024 ))
+}
+
 guard_disk_free_space() {
     local disk="$1"
     local need_mb="$2"
@@ -289,6 +348,12 @@ guard_disk_free_space() {
     size_sectors=$(blockdev --getsz "$disk" 2>/dev/null || printf '0')
     last_sector=$(sgdisk -p "$disk" 2>/dev/null | tail -1 | awk '{print $3}' || printf '0')
     last_sector="${last_sector:-0}"
+    # On a partition-table-less or empty disk, `sgdisk -p` ends with the
+    # column-header line `Number Start (sector) End (sector)...`, so
+    # `tail -1 | awk '{print $3}'` yields the literal "(sector)" rather
+    # than a number. Sanitize to 0 (treat-as-empty) so the size check
+    # below doesn't trip `set -u` on a non-numeric arithmetic operand.
+    [[ "$last_sector" =~ ^[0-9]+$ ]] || last_sector=0
 
     if [[ "$size_sectors" == "0" ]] || [[ "$last_sector" == "0" ]]; then
         verbose "disk space check inconclusive — will attempt creation anyway"
@@ -298,18 +363,63 @@ guard_disk_free_space() {
     local free_sectors=$((size_sectors - last_sector))
     local free_mb=$((free_sectors * 512 / 1024 / 1024))
 
-    if [[ "$free_mb" -lt "$need_mb" ]]; then
-        emit_finding "migrate.preflight.insufficient_free_space" "preflight" "error" "fail" \
-            "Insufficient free space at end of disk" \
-            "Need ${need_mb} MB for ESP; only ${free_mb} MB available at end of $disk." \
-            "{\"disk\":\"$(json_escape "$disk")\",\"free_mb\":${free_mb},\"need_mb\":${need_mb}}" \
-            '{"summary":"Shrink the last partition or use a smaller --esp-size","doc_url":"https://lamboot.dev/tools/migrate/disk-space"}'
-
-        if [[ $LAMBOOT_FORCE -eq 0 ]]; then
-            die "insufficient free space for ESP ($free_mb MB free, need $need_mb MB)"
-        fi
-        warn "continuing despite insufficient space (--force)"
+    # Path A: there is already enough unallocated space at the end. Done.
+    if [[ "$free_mb" -ge "$need_mb" ]]; then
+        return 0
     fi
+
+    # Path B: not enough unallocated. Can we make room by shrinking the
+    # last partition (per SDS-7 §3 Phase 5)? Identify the last partition
+    # by start sector, check if its filesystem is shrinkable ext4.
+    local last_part_num last_part_dev last_part_fstype start_sector
+    last_part_num=$(sgdisk -p "$disk" 2>/dev/null \
+        | awk '$1 ~ /^[0-9]+$/ {print $1, $2}' \
+        | sort -k2 -n | tail -1 | awk '{print $1}')
+    if [[ -n "$last_part_num" ]]; then
+        last_part_dev=$(partition_device_for "$disk" "$last_part_num")
+        last_part_fstype=$(blkid -o value -s TYPE "$last_part_dev" 2>/dev/null || true)
+        start_sector=$(sgdisk -p "$disk" 2>/dev/null \
+            | awk -v n="$last_part_num" '$1 == n {print $2}')
+    fi
+
+    local shrinkable_mb=0
+    if [[ "$last_part_fstype" == "ext4" ]]; then
+        shrinkable_mb=$(ext4_shrinkable_mb "$last_part_dev")
+    fi
+
+    # Need ESP size + 64 MB margin for alignment/GPT-end-backup
+    local need_buffer=$((need_mb + 64))
+    if [[ "$shrinkable_mb" -ge "$need_buffer" ]] && [[ -n "$start_sector" ]]; then
+        # Compute target partition size: current_size_mb - need_mb - 32 MB safety
+        local part_size_mb new_part_mb
+        part_size_mb=$(( (last_sector - start_sector + 1) * 512 / 1024 / 1024 ))
+        new_part_mb=$(( part_size_mb - need_mb - 32 ))
+
+        LAMBOOT_NEEDS_SHRINK=1
+        LAMBOOT_SHRINK_LAST_PART_NUM="$last_part_num"
+        LAMBOOT_SHRINK_LAST_PART_DEV="$last_part_dev"
+        LAMBOOT_SHRINK_NEW_PART_MB="$new_part_mb"
+
+        emit_finding "migrate.preflight.shrink_required" "preflight" "warning" "warn" \
+            "Will shrink last partition to make room for ESP" \
+            "No unallocated space at end of $disk; Phase 3b will shrink ${last_part_dev} (ext4, ~${shrinkable_mb} MB shrinkable) from ${part_size_mb} MB to ${new_part_mb} MB to free ${need_mb} MB for the ESP." \
+            "{\"disk\":\"$(json_escape "$disk")\",\"shrink_part\":\"$(json_escape "$last_part_dev")\",\"shrinkable_mb\":${shrinkable_mb},\"need_mb\":${need_mb},\"current_mb\":${part_size_mb},\"new_part_mb\":${new_part_mb}}" \
+            '{"summary":"Phase 3b will resize2fs + sfdisk shrink before MBR→GPT","doc_url":"https://lamboot.dev/tools/migrate/disk-space"}'
+        warn "no unallocated space; Phase 3b will shrink $last_part_dev to ${new_part_mb} MB (was ${part_size_mb} MB)"
+        return 0
+    fi
+
+    # Path C: neither unallocated nor shrinkable. Fail.
+    emit_finding "migrate.preflight.insufficient_free_space" "preflight" "error" "fail" \
+        "Insufficient free space at end of disk" \
+        "Need ${need_mb} MB for ESP; ${free_mb} MB unallocated, ${shrinkable_mb} MB shrinkable from last partition (${last_part_dev:-none}, ${last_part_fstype:-unknown})." \
+        "{\"disk\":\"$(json_escape "$disk")\",\"free_mb\":${free_mb},\"shrinkable_mb\":${shrinkable_mb},\"need_mb\":${need_mb}}" \
+        '{"summary":"Use a smaller --esp-size or attach a second disk","doc_url":"https://lamboot.dev/tools/migrate/disk-space"}'
+
+    if [[ $LAMBOOT_FORCE -eq 0 ]]; then
+        die "insufficient free space for ESP ($free_mb MB free, $shrinkable_mb MB shrinkable, need $need_mb MB)"
+    fi
+    warn "continuing despite insufficient space (--force)"
 }
 
 guard_existing_esp_collision() {
@@ -332,6 +442,123 @@ partition_device_for() {
     else
         printf '%s%s' "$disk" "$partnum"
     fi
+}
+
+# target_path PATH — prepend LAMBOOT_TARGET_ROOT to PATH when running under
+# Method B; return PATH unchanged when Method A (LAMBOOT_TARGET_ROOT empty).
+# Used by phases that read/write files which MUST belong to the target system
+# (e.g. /etc/fstab, /etc/default/grub), not the live ISO's copies.
+target_path() {
+    if [[ -n "$LAMBOOT_TARGET_ROOT" ]]; then
+        printf '%s%s' "$LAMBOOT_TARGET_ROOT" "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# target_run CMD... — run CMD inside the target chroot under Method B,
+# or directly in the live env under Method A. Wraps lamboot_run so --dry-run
+# still prints the planned command. Used by phases that invoke the target's
+# package manager / bootloader installer (grub-install must run under the
+# target's rootfs to find the right packages + kernel images).
+target_run() {
+    if [[ -n "$LAMBOOT_TARGET_ROOT" ]]; then
+        lamboot_run chroot "$LAMBOOT_TARGET_ROOT" "$@"
+    else
+        lamboot_run "$@"
+    fi
+}
+
+# cleanup_target_mounts — unmount everything Phase 5b + Phase 7 mounted into
+# LAMBOOT_TARGET_ROOT. Wired to EXIT trap by do_to_uefi so the live ISO is
+# left clean even on Phase 6-10 failure. Idempotent + survives partial setup.
+cleanup_target_mounts() {
+    [[ -z "$LAMBOOT_TARGET_ROOT" ]] && return 0
+    local bind
+    # Unmount binds in reverse order (LIFO)
+    local i
+    for (( i=${#LAMBOOT_TARGET_BINDS[@]}-1; i>=0; i-- )); do
+        bind="${LAMBOOT_TARGET_BINDS[$i]}"
+        umount "$bind" 2>/dev/null || umount -l "$bind" 2>/dev/null || true
+    done
+    LAMBOOT_TARGET_BINDS=()
+    umount "$LAMBOOT_TARGET_ROOT/boot/efi" 2>/dev/null || true
+    # Separate target filesystems (e.g. a dedicated /boot), deepest-first so a
+    # parent isn't unmounted while a child is still mounted on it.
+    local j
+    for (( j=${#LAMBOOT_TARGET_FS_MOUNTS[@]}-1; j>=0; j-- )); do
+        umount "${LAMBOOT_TARGET_FS_MOUNTS[$j]}" 2>/dev/null \
+            || umount -l "${LAMBOOT_TARGET_FS_MOUNTS[$j]}" 2>/dev/null || true
+    done
+    LAMBOOT_TARGET_FS_MOUNTS=()
+    umount "$LAMBOOT_TARGET_ROOT" 2>/dev/null || true
+}
+
+# resolve_fstab_spec_for_mountpoint FSTAB MOUNTPOINT — map a target fstab entry
+# to a current block device. UUID/PARTUUID/LABEL are filesystem-stable across
+# MBR→GPT (partitions are not reformatted), so blkid resolves them; a /dev/sdaN
+# spec keeps its partition NUMBER under `sgdisk --mbrtogpt`, so it is remapped
+# onto OPT_DISK. Prints the device on success; non-zero + no output otherwise.
+resolve_fstab_spec_for_mountpoint() {
+    local fstab="$1" want="$2" spec mp rest dev=""
+    while read -r spec mp rest; do
+        [[ "$mp" == "$want" ]] || continue
+        case "$spec" in
+            UUID=*)     dev=$(blkid -U "${spec#UUID=}" 2>/dev/null || true) ;;
+            PARTUUID=*) dev=$(blkid -t "PARTUUID=${spec#PARTUUID=}" -o device 2>/dev/null | head -1 || true) ;;
+            LABEL=*)    dev=$(blkid -L "${spec#LABEL=}" 2>/dev/null || true) ;;
+            /dev/*)
+                local n="${spec##*[!0-9]}"
+                if [[ -n "$n" ]]; then dev=$(partition_device_for "$OPT_DISK" "$n"); else dev="$spec"; fi
+                ;;
+        esac
+        [[ -n "$dev" && -b "$dev" ]] && { printf '%s' "$dev"; return 0; }
+        return 1
+    done < "$fstab"
+    return 1
+}
+
+# mount_target_separate_filesystems — mount every separate block filesystem the
+# target declares in its fstab (most importantly a dedicated /boot, but also a
+# split /usr or /var) under LAMBOOT_TARGET_ROOT before Phase 8 runs grub-install
+# / grub-mkconfig. Skips root and /boot/efi (mounted explicitly elsewhere) and
+# non-block pseudo filesystems. Mounts shallow→deep so parents precede children.
+# This is the SDS-7 separate-/boot fix: without it the chroot's /boot is empty,
+# grub-mkconfig finds no kernel, and the migrated disk is unbootable.
+mount_target_separate_filesystems() {
+    local fstab="$LAMBOOT_TARGET_ROOT/etc/fstab"
+    [[ -f "$fstab" ]] || return 0
+
+    local -a candidates=()
+    local spec mp fstype rest
+    while read -r spec mp fstype rest; do
+        [[ -z "$spec" || "$spec" == \#* ]] && continue
+        case "$mp" in /|/boot/efi|none|swap|"") continue ;; esac
+        case "$fstype" in swap|proc|sysfs|tmpfs|devpts|devtmpfs|none|"") continue ;; esac
+        case "$spec" in UUID=*|PARTUUID=*|LABEL=*|/dev/*) ;; *) continue ;; esac
+        candidates+=("$mp")
+    done < "$fstab"
+    [[ ${#candidates[@]} -eq 0 ]] && return 0
+
+    # Sort by path depth (number of slashes) so /boot mounts before /boot/foo.
+    local sorted m dev
+    sorted=$(printf '%s\n' "${candidates[@]}" | awk '{print gsub(/\//,"/"), $0}' | sort -n | cut -d' ' -f2-)
+    while IFS= read -r m; do
+        [[ -z "$m" ]] && continue
+        if ! dev=$(resolve_fstab_spec_for_mountpoint "$fstab" "$m"); then
+            warn "could not resolve target device for $m; skipping (chroot may be incomplete)"
+            continue
+        fi
+        lamboot_run mkdir -p "${LAMBOOT_TARGET_ROOT}${m}"
+        if lamboot_run mount "$dev" "${LAMBOOT_TARGET_ROOT}${m}"; then
+            LAMBOOT_TARGET_FS_MOUNTS+=("${LAMBOOT_TARGET_ROOT}${m}")
+            record_action "method_b.mount.separate_fs" "$dev" "ok" "false" \
+                "{\"mountpoint\":\"$(json_escape "${LAMBOOT_TARGET_ROOT}${m}")\"}" "null"
+            verbose "mounted separate target filesystem $m ($dev)"
+        else
+            warn "failed to mount separate target filesystem $m ($dev)"
+        fi
+    done <<< "$sorted"
 }
 
 detect_target_disk() {
@@ -485,10 +712,33 @@ guard_method_prerequisites() {
 
 # ── Distro-specific bootloader install (SDS-7 §3 Phase 8) ─────────────────
 
+# Emit `--no-nvram` when running on a BIOS host (efivarfs absent), empty
+# otherwise. grub*-install invokes efibootmgr internally to register the
+# Boot#### entry; on BIOS that fails with "EFI variables are not supported
+# on this system" and aborts the install. --no-nvram skips the registration
+# step; phase 9 (`to_uefi_phase_9_uefi_entry`) handles entry creation post-
+# UEFI-flip via populate_fallback_path, so nothing is lost.
+# Populates GRUB_INSTALL_EXTRA_ARGS with --no-nvram when invoked under
+# BIOS (/sys/firmware/efi/efivars absent), empty array otherwise. The
+# array pattern is what callers want — string interpolation of a
+# function whose output may be "" is what shellcheck SC2046 rightly
+# flags, since an unquoted empty $(…) produces zero args while a
+# quoted one produces a single empty-string arg. Both are wrong for
+# pass-through to grub-install. Use the array at every call site.
+GRUB_INSTALL_EXTRA_ARGS=()
+set_grub_install_extra_args() {
+    GRUB_INSTALL_EXTRA_ARGS=()
+    [[ -d /sys/firmware/efi/efivars ]] || GRUB_INSTALL_EXTRA_ARGS=(--no-nvram)
+}
+
 install_grub_by_distro() {
     local esp_mount="$1"
     local distro
     distro=$(detect_distro)
+
+    # Populate GRUB_INSTALL_EXTRA_ARGS once for whichever per-distro
+    # callee runs below — each callee uses the array directly.
+    set_grub_install_extra_args
 
     case "$distro" in
         ubuntu|debian|linuxmint|pop|elementary|kali)
@@ -516,55 +766,67 @@ install_grub_by_distro() {
 
 install_grub_apt() {
     local esp_mount="$1"
-    lamboot_run apt-get install -y grub-efi-amd64 shim-signed \
+    target_run apt-get install -y grub-efi-amd64 shim-signed \
         || die "apt install grub-efi-amd64 failed"
-    lamboot_run grub-install --target=x86_64-efi \
+    target_run grub-install --target=x86_64-efi \
         --efi-directory="$esp_mount" \
         --bootloader-id=ubuntu \
+        "${GRUB_INSTALL_EXTRA_ARGS[@]}" \
         || die "grub-install failed"
-    if command -v update-grub >/dev/null 2>&1; then
-        lamboot_run update-grub
+    # update-grub presence test must check inside chroot under Method B
+    if [[ -n "$LAMBOOT_TARGET_ROOT" ]]; then
+        [[ -x "$LAMBOOT_TARGET_ROOT/usr/sbin/update-grub" ]] && target_run update-grub
+    else
+        command -v update-grub >/dev/null 2>&1 && target_run update-grub
     fi
     record_action "bootloader.grub_efi.install" "apt" "ok" "false" '{"target":"x86_64-efi"}' "null"
 }
 
 install_grub_dnf() {
     local esp_mount="$1"
-    lamboot_run dnf install -y grub2-efi-x64 grub2-efi-x64-modules shim-x64 \
+    target_run dnf install -y grub2-efi-x64 grub2-efi-x64-modules shim-x64 \
         || die "dnf install grub2-efi-x64 failed"
-    lamboot_run grub2-install --target=x86_64-efi \
+    target_run grub2-install --target=x86_64-efi \
         --efi-directory="$esp_mount" \
         --bootloader-id=fedora \
+        "${GRUB_INSTALL_EXTRA_ARGS[@]}" \
         || die "grub2-install failed"
 
     local distro
     distro=$(detect_distro)
-    lamboot_run grub2-mkconfig -o "${esp_mount}/EFI/${distro}/grub.cfg"
+    target_run grub2-mkconfig -o "${esp_mount}/EFI/${distro}/grub.cfg"
     record_action "bootloader.grub_efi.install" "dnf" "ok" "false" '{"target":"x86_64-efi"}' "null"
 }
 
 install_grub_pacman() {
     local esp_mount="$1"
-    lamboot_run pacman -S --noconfirm grub efibootmgr \
+    # --needed: skip if already installed and current per local db. Without it,
+    # pacman re-downloads "up to date" packages, which fails when mirrors no
+    # longer carry the exact installed version (mirror has 19-1, local has 18-3).
+    target_run pacman -S --needed --noconfirm grub efibootmgr \
         || die "pacman install grub failed"
-    lamboot_run grub-install --target=x86_64-efi \
+    target_run grub-install --target=x86_64-efi \
         --efi-directory="$esp_mount" \
         --bootloader-id=arch \
+        "${GRUB_INSTALL_EXTRA_ARGS[@]}" \
         || die "grub-install failed"
-    lamboot_run grub-mkconfig -o /boot/grub/grub.cfg
+    target_run grub-mkconfig -o /boot/grub/grub.cfg
     record_action "bootloader.grub_efi.install" "pacman" "ok" "false" '{"target":"x86_64-efi"}' "null"
 }
 
 install_grub_zypper() {
     local esp_mount="$1"
-    lamboot_run zypper install -y grub2-x86_64-efi shim \
+    target_run zypper install -y grub2-x86_64-efi shim \
         || die "zypper install grub2-x86_64-efi failed"
-    lamboot_run grub2-install --target=x86_64-efi \
+    target_run grub2-install --target=x86_64-efi \
         --efi-directory="$esp_mount" \
         --bootloader-id=opensuse \
+        "${GRUB_INSTALL_EXTRA_ARGS[@]}" \
         || die "grub2-install failed"
-    if command -v update-bootloader >/dev/null 2>&1; then
-        lamboot_run update-bootloader
+    if [[ -n "$LAMBOOT_TARGET_ROOT" ]]; then
+        [[ -x "$LAMBOOT_TARGET_ROOT/usr/sbin/update-bootloader" ]] && target_run update-bootloader
+    else
+        command -v update-bootloader >/dev/null 2>&1 && target_run update-bootloader
     fi
     record_action "bootloader.grub_efi.install" "zypper" "ok" "false" '{"target":"x86_64-efi"}' "null"
 }
@@ -574,6 +836,7 @@ install_grub_generic() {
     require_tool grub-install "install GRUB via your distro's package manager"
     lamboot_run grub-install --target=x86_64-efi \
         --efi-directory="$esp_mount" \
+        "${GRUB_INSTALL_EXTRA_ARGS[@]}" \
         || die "generic grub-install failed"
     record_action "bootloader.grub_efi.install" "generic" "ok" "false" '{"target":"x86_64-efi"}' "null"
 }
@@ -607,8 +870,31 @@ to_uefi_phase_1_preflight() {
     guard_no_hybrid_mbr "$OPT_DISK"
     guard_no_windows "$OPT_DISK"
     guard_fstab_uuid_form
-    guard_disk_free_space "$OPT_DISK" "$OPT_ESP_SIZE_MB"
+
+    # When an ESP already exists on the target disk (e.g. a previous run got as
+    # far as Phase 5 before failing in Phase 8), Phase 5 will reuse it — so the
+    # free-space check that determines "do we need to shrink to make room?"
+    # would be wrong (ESP already takes the slack). Skip free-space + shrink
+    # detection in that case.
+    local existing_esp_chk
+    existing_esp_chk=$(sgdisk -p "$OPT_DISK" 2>/dev/null | awk '$6 == "EF00" {print $1}' | head -1 || true)
+    if [[ -n "$existing_esp_chk" ]]; then
+        verbose "existing ESP on $OPT_DISK at partition $existing_esp_chk — skipping free-space check"
+        emit_finding "migrate.preflight.existing_esp" "preflight" "info" "pass" \
+            "Existing ESP detected — Phase 5 will reuse it" \
+            "Partition $existing_esp_chk on $OPT_DISK is already an ESP. No shrink/create needed." \
+            "{\"disk\":\"$(json_escape "$OPT_DISK")\",\"esp_part\":\"$existing_esp_chk\"}" '{}'
+    else
+        guard_disk_free_space "$OPT_DISK" "$OPT_ESP_SIZE_MB"
+    fi
     guard_existing_esp_collision "$OPT_DISK" >/dev/null
+
+    # Optional capcheck-driven readiness audit. Off by default;
+    # opt-in via --capcheck-gate (or env LAMBOOT_MIGRATE_CAPCHECK=1).
+    # Only critical-severity quirks abort; warnings are surfaced via findings.
+    if [[ "${LAMBOOT_MIGRATE_CAPCHECK:-0}" == "1" ]] || [[ ${OPT_CAPCHECK_GATE:-0} -eq 1 ]]; then
+        _capcheck_readiness_gate
+    fi
 
     emit_finding "migrate.phase1.complete" "preflight" "info" "pass" \
         "Preflight checks passed" \
@@ -616,6 +902,63 @@ to_uefi_phase_1_preflight() {
         "{\"disk\":\"$(json_escape "$OPT_DISK")\",\"esp_size_mb\":${OPT_ESP_SIZE_MB}}" \
         '{}'
     success "Phase 1 passed"
+}
+
+_capcheck_readiness_gate() {
+    if ! command -v lamboot-capcheck >/dev/null 2>&1; then
+        emit_finding "migrate.capcheck.unavailable" "preflight" "info" "pass" \
+            "lamboot-capcheck not installed; skipping readiness audit" \
+            "Install lamboot-capcheck for a full firmware capability audit before migration." \
+            '{}' '{}'
+        return 0
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        emit_finding "migrate.capcheck.no_jq" "preflight" "info" "pass" \
+            "jq not installed; capcheck readiness audit skipped" \
+            "Install jq to enable capcheck-driven preflight gating." \
+            '{}' '{}'
+        return 0
+    fi
+
+    info "Capability audit (lamboot-capcheck)"
+    local audit
+    audit=$(lamboot-capcheck --json audit 2>/dev/null || true)
+    if [[ -z "$audit" ]]; then
+        emit_finding "migrate.capcheck.no_output" "preflight" "warning" "warn" \
+            "lamboot-capcheck produced no output" \
+            "Could not run capcheck (permissions? offline mode?). Proceeding without capability audit." \
+            '{}' '{}'
+        return 0
+    fi
+
+    local critical_quirks
+    critical_quirks=$(printf '%s' "$audit" | jq -r '.quirks_matched[] | select(.severity == "critical") | .id')
+    if [[ -n "$critical_quirks" ]]; then
+        local id_list
+        id_list=$(printf '%s' "$critical_quirks" | tr '\n' ',' | sed 's/,$//')
+        emit_finding "migrate.capcheck.critical_quirks" "preflight" "critical" "fail" \
+            "Capability audit found critical firmware quirks: $id_list" \
+            "lamboot-capcheck matched one or more quirks marked 'critical' against this hardware. Migration is unsafe until these are addressed. Run \`lamboot-capcheck quirks --list\` for details." \
+            "{\"quirk_ids\":\"$(json_escape "$id_list")\"}" \
+            '{"summary":"Resolve quirks before retrying","command":"lamboot-capcheck quirks --list","doc_url":"https://lamboot.dev/migrate/preflight#critical-quirks"}'
+        die_prerequisite "capcheck preflight: critical quirks block migration ($id_list)"
+    fi
+
+    # Non-critical warnings → surfaced as info-level findings, do not abort.
+    local warn_count
+    warn_count=$(printf '%s' "$audit" | jq '.summary.checks_warn + .summary.checks_fail')
+    if [[ "${warn_count:-0}" -gt 0 ]]; then
+        local sample
+        sample=$(printf '%s' "$audit" | jq -r '[.domains[] | .checks[] | select(.status == "fail" or .status == "warn") | .name] | join(", ")')
+        emit_finding "migrate.capcheck.warnings" "preflight" "warning" "warn" \
+            "Capability audit surfaced $warn_count non-critical issue(s)" \
+            "These will not block migration but should be reviewed: $sample. Run \`lamboot-doctor\` after migration." \
+            "{\"sample\":\"$(json_escape "$sample")\"}" '{}'
+    else
+        emit_finding "migrate.capcheck.clean" "preflight" "info" "pass" \
+            "Capability audit clean" "lamboot-capcheck reports no critical findings." \
+            '{}' '{}'
+    fi
 }
 
 to_uefi_phase_2_confirm() {
@@ -659,8 +1002,12 @@ to_uefi_phase_3_backup() {
     backup_file_to "$backup_dir" /etc/default/grub "default-grub"
     backup_file_to "$backup_dir" /boot/grub/grub.cfg "grub.cfg"
 
-    # Capture efivarfs state (may be empty on BIOS)
-    if command -v efibootmgr >/dev/null 2>&1; then
+    # Capture efivarfs state (may be empty on BIOS). The backup directory only
+    # exists in non-dry-run mode (backup_dir_new prints the planned path but
+    # doesn't mkdir it under --dry-run), so guard the file write accordingly.
+    if [[ $LAMBOOT_DRY_RUN -eq 1 ]]; then
+        printf 'DRY-RUN: would capture efibootmgr -v to %s/efi-vars.txt\n' "$backup_dir" >&2
+    elif command -v efibootmgr >/dev/null 2>&1; then
         efibootmgr -v > "${backup_dir}/efi-vars.txt" 2>/dev/null || true
     fi
 
@@ -669,6 +1016,59 @@ to_uefi_phase_3_backup() {
         "$backup_dir"
 
     success "Phase 3 — backup saved: $backup_dir"
+}
+
+to_uefi_phase_3b_pre_mbr_to_gpt_shrink() {
+    # Runs only when Phase 1 marked shrink needed. The shrink MUST happen
+    # before Phase 4 (mbrtogpt), not after, because sgdisk --mbrtogpt silently
+    # aborts (prints "Aborting write" but exits 0!) when the last MBR partition
+    # extends into what would be the secondary GPT header at the end of the
+    # disk. lamboot-migrate v1.0 had the shrink in Phase 5; this re-orders.
+    [[ "${LAMBOOT_NEEDS_SHRINK:-0}" -eq 1 ]] || return 0
+
+    info "Phase 3b — Pre-conversion shrink (avoid sgdisk --mbrtogpt overlap abort)"
+
+    local shrink_dev="$LAMBOOT_SHRINK_LAST_PART_DEV"
+    local shrink_num="$LAMBOOT_SHRINK_LAST_PART_NUM"
+    local new_size_mb="$LAMBOOT_SHRINK_NEW_PART_MB"
+
+    local mountpoint
+    mountpoint=$(findmnt -n -o TARGET "$shrink_dev" 2>/dev/null | head -1 || true)
+    if [[ -n "$mountpoint" ]]; then
+        emit_finding "migrate.phase3b.cannot_shrink_mounted" "phase3b" "critical" "fail" \
+            "Cannot shrink mounted filesystem $shrink_dev (at $mountpoint)" \
+            "ext4 online resize supports growing only, never shrinking. Boot from a live ISO and re-run with --method=B." \
+            "{\"device\":\"$(json_escape "$shrink_dev")\",\"mountpoint\":\"$(json_escape "$mountpoint")\"}" \
+            '{"summary":"Boot live media + retry","doc_url":"https://lamboot.dev/tools/migrate/method-b"}'
+        die "cannot shrink mounted $shrink_dev; reboot into live ISO and re-run with --method=B"
+    fi
+
+    # Step 1: shrink the ext4 filesystem inside the partition
+    info "Phase 3b — resize2fs $shrink_dev to ${new_size_mb}M"
+    lamboot_run e2fsck -fy "$shrink_dev" || die "e2fsck failed on $shrink_dev before shrink"
+    lamboot_run resize2fs "$shrink_dev" "${new_size_mb}M" || die "resize2fs failed shrinking $shrink_dev"
+    record_action "filesystem.resize" "$shrink_dev" "ok" "true" \
+        "{\"new_size_mb\":${new_size_mb}}" "$OPT_BACKUP_DIR"
+
+    # Step 2: shrink the MBR partition entry. sgdisk only writes GPT; this disk
+    # is still MBR at Phase 3b, so use sfdisk in single-partition (-N) mode.
+    local new_sectors
+    new_sectors=$((new_size_mb * 1024 * 1024 / 512))
+    if [[ $LAMBOOT_DRY_RUN -eq 1 ]]; then
+        printf 'DRY-RUN: would exec: echo "size=%s" | sfdisk -N%s --no-reread --no-tell-kernel %s\n' \
+            "$new_sectors" "$shrink_num" "$OPT_DISK" >&2
+    else
+        printf 'size=%s\n' "$new_sectors" \
+            | sfdisk -N"$shrink_num" --no-reread --no-tell-kernel "$OPT_DISK" \
+            || die "sfdisk MBR partition shrink failed for $OPT_DISK partition $shrink_num"
+    fi
+    lamboot_run partprobe "$OPT_DISK" 2>/dev/null || true
+    record_action "partition.shrink_mbr" "$OPT_DISK" "ok" "true" \
+        "{\"partition\":${shrink_num},\"new_sectors\":${new_sectors},\"new_size_mb\":${new_size_mb}}" \
+        "$OPT_BACKUP_DIR"
+
+    LAMBOOT_SHRINK_DONE=1
+    success "Phase 3b — partition + ext4 shrunk to ${new_size_mb} MB (Phase 4 has end-of-disk slack now)"
 }
 
 to_uefi_phase_4_mbr_to_gpt() {
@@ -683,8 +1083,27 @@ to_uefi_phase_4_mbr_to_gpt() {
         return 0
     fi
 
-    lamboot_run sgdisk --mbrtogpt "$OPT_DISK" \
-        || die "sgdisk --mbrtogpt failed for $OPT_DISK"
+    # sgdisk has a gotcha: it can print "Aborting write of new partition table"
+    # when the last MBR partition overlaps the secondary GPT header — and exit
+    # with status 0. So `|| die` is not enough; we must also parse stdout.
+    if [[ $LAMBOOT_DRY_RUN -eq 1 ]]; then
+        printf 'DRY-RUN: would exec: sgdisk --mbrtogpt %s\n' "$OPT_DISK" >&2
+    else
+        local sg_out sg_rc
+        sg_out=$(sgdisk --mbrtogpt "$OPT_DISK" 2>&1); sg_rc=$?
+        printf '%s\n' "$sg_out" >&2
+        if [[ "$sg_out" == *"Aborting write"* ]]; then
+            emit_finding "migrate.phase4.silent_abort" "phase4" "critical" "fail" \
+                "sgdisk --mbrtogpt aborted write" \
+                "sgdisk printed 'Aborting write' (overlap with secondary GPT header). Phase 3b should have pre-shrunk the last partition." \
+                "{\"disk\":\"$(json_escape "$OPT_DISK")\"}" \
+                '{"summary":"This is a bug — Phase 3b should run first","doc_url":"https://lamboot.dev/tools/migrate/overlap"}'
+            die "sgdisk --mbrtogpt aborted write (overlap with secondary GPT header)"
+        fi
+        if [[ $sg_rc -ne 0 ]]; then
+            die "sgdisk --mbrtogpt failed (exit $sg_rc)"
+        fi
+    fi
 
     record_action "partition.mbrtogpt" "$OPT_DISK" "ok" "true" '{}' "$OPT_BACKUP_DIR"
     success "Phase 4 — partition table converted to GPT"
@@ -692,6 +1111,15 @@ to_uefi_phase_4_mbr_to_gpt() {
 
 to_uefi_phase_5_create_esp() {
     info "Phase 5 — Create ESP"
+
+    # The shrink (when needed) was performed pre-conversion in Phase 3b. Phase
+    # 5 now just places the ESP in the freed end-of-disk space. If Phase 1
+    # marked shrink needed but Phase 3b somehow didn't run, that's a bug —
+    # fail loudly so the disk doesn't get a too-small ESP carved out of a
+    # still-full partition.
+    if [[ "${LAMBOOT_NEEDS_SHRINK:-0}" -eq 1 ]] && [[ "${LAMBOOT_SHRINK_DONE:-0}" -ne 1 ]]; then
+        die "internal: shrink was required but Phase 3b did not run (LAMBOOT_SHRINK_DONE=0)"
+    fi
 
     local existing_esp
     existing_esp=$(sgdisk -p "$OPT_DISK" 2>/dev/null | awk '$6 == "EF00" {print $1}' | head -1 || true)
@@ -707,8 +1135,19 @@ to_uefi_phase_5_create_esp() {
             "$OPT_DISK" \
             || die "sgdisk --new for ESP failed"
 
-        esp_partnum=$(sgdisk -p "$OPT_DISK" 2>/dev/null | awk '$6 == "EF00" {print $1}' | head -1 || true)
-        [[ -n "$esp_partnum" ]] || die "ESP partition created but not detectable"
+        if [[ $LAMBOOT_DRY_RUN -eq 1 ]]; then
+            # sgdisk didn't actually run; synthesize a plausible partnum so the
+            # rest of the phase can print its planned actions without aborting.
+            esp_partnum=$(sgdisk -p "$OPT_DISK" 2>/dev/null \
+                | awk '$1 ~ /^[0-9]+$/ {print $1}' \
+                | sort -n | tail -1 \
+                | awk '{print $1+1}')
+            esp_partnum="${esp_partnum:-99}"
+            printf 'DRY-RUN: would assign ESP partition number %s on %s\n' "$esp_partnum" "$OPT_DISK" >&2
+        else
+            esp_partnum=$(sgdisk -p "$OPT_DISK" 2>/dev/null | awk '$6 == "EF00" {print $1}' | head -1 || true)
+            [[ -n "$esp_partnum" ]] || die "ESP partition created but not detectable"
+        fi
 
         record_action "partition.create_esp" "$OPT_DISK" "ok" "true" \
             "{\"partition\":${esp_partnum},\"size_mb\":${OPT_ESP_SIZE_MB}}" "$OPT_BACKUP_DIR"
@@ -733,7 +1172,61 @@ to_uefi_phase_5_create_esp() {
     fi
 
     success "Phase 5 — ESP at $esp_dev mounted on /boot/efi"
-    printf '%s' "$esp_dev"
+    # Return via global var, not stdout. This function calls external
+    # commands (sgdisk, mkfs.vfat, partprobe) that write to stdout, and
+    # any of their output would otherwise bleed into the caller's $(...)
+    # capture and corrupt esp_dev with command chatter like
+    # "Creating new GPT entries in memory." or "mkfs.fat 4.2 (2021-01-31)".
+    LAMBOOT_PHASE5_ESP_DEV="$esp_dev"
+}
+
+to_uefi_phase_5b_mount_target() {
+    # Only Method B (live-ISO conversion) needs to mount the target — for
+    # Method A we're already running on the system being converted and
+    # /boot, /etc, /boot/efi are the target itself.
+    local method
+    method=$(detect_proxmox_method)
+    [[ "$method" == "B" ]] || return 0
+
+    info "Phase 5b — Mounting target root + ESP (Method B)"
+
+    # Re-read partition table after Phase 5's resize/recreate
+    lamboot_run partprobe "$OPT_DISK" 2>/dev/null || true
+
+    # Target root is the partition we shrunk in Phase 5 (whose data is intact).
+    local target_root_part="${LAMBOOT_SHRINK_LAST_PART_DEV:-}"
+    if [[ -z "$target_root_part" ]]; then
+        # Fall back to the first non-ESP partition
+        target_root_part=$(sgdisk -p "$OPT_DISK" 2>/dev/null \
+            | awk '$1 ~ /^[0-9]+$/ && $6 != "EF00" {print $1}' \
+            | head -1)
+        [[ -n "$target_root_part" ]] || die "could not find target root partition on $OPT_DISK"
+        target_root_part=$(partition_device_for "$OPT_DISK" "$target_root_part")
+    fi
+
+    LAMBOOT_TARGET_ROOT="/mnt/lamboot-target"
+    lamboot_run mkdir -p "$LAMBOOT_TARGET_ROOT"
+    lamboot_run mount "$target_root_part" "$LAMBOOT_TARGET_ROOT" \
+        || die "failed to mount target root $target_root_part at $LAMBOOT_TARGET_ROOT"
+    record_action "method_b.mount.root" "$target_root_part" "ok" "false" \
+        "{\"mountpoint\":\"$(json_escape "$LAMBOOT_TARGET_ROOT")\"}" "null"
+
+    # Mount any separate /boot (or /usr, /var) the target declares in fstab,
+    # BEFORE the ESP, so grub-install/grub-mkconfig in Phase 8 see the real
+    # kernel images and embed a correct prefix (SDS-7 separate-/boot fix).
+    mount_target_separate_filesystems
+
+    # Mount the ESP we just created under target's /boot/efi so the bootloader
+    # installer in Phase 8 writes EFI/<distro>/grubx64.efi to the correct place.
+    local esp_dev="${LAMBOOT_PHASE5_ESP_DEV:-}"
+    [[ -n "$esp_dev" ]] || die "Phase 5 did not record ESP device (LAMBOOT_PHASE5_ESP_DEV unset)"
+    lamboot_run mkdir -p "$LAMBOOT_TARGET_ROOT/boot/efi"
+    lamboot_run mount "$esp_dev" "$LAMBOOT_TARGET_ROOT/boot/efi" \
+        || die "failed to mount ESP $esp_dev at $LAMBOOT_TARGET_ROOT/boot/efi"
+    record_action "method_b.mount.esp" "$esp_dev" "ok" "false" \
+        "{\"mountpoint\":\"$(json_escape "$LAMBOOT_TARGET_ROOT/boot/efi")\"}" "null"
+
+    success "Phase 5b — target accessible at $LAMBOOT_TARGET_ROOT (root + ESP)"
 }
 
 to_uefi_phase_6_fstab() {
@@ -742,9 +1235,26 @@ to_uefi_phase_6_fstab() {
     local esp_dev="$1"
     local esp_uuid
     esp_uuid=$(blkid -s UUID -o value "$esp_dev" 2>/dev/null || true)
-    [[ -n "$esp_uuid" ]] || die "could not read UUID for $esp_dev"
+    if [[ -z "$esp_uuid" ]]; then
+        if [[ $LAMBOOT_DRY_RUN -eq 1 ]]; then
+            # Dry-run: ESP was never actually created/formatted, so blkid has
+            # nothing to read. Use an all-zero UUID so the rest of the phase
+            # can print its plan without aborting; real runs always read live.
+            esp_uuid="00000000-0000-0000-0000-000000000000"
+            printf 'DRY-RUN: synthesized all-zero ESP UUID (real run reads from blkid)\n' >&2
+        else
+            die "could not read UUID for $esp_dev"
+        fi
+    fi
+
+    # Target's fstab: live ISO's /etc/fstab under Method A (in-place),
+    # /mnt/lamboot-target/etc/fstab under Method B.
+    local fstab_path
+    fstab_path=$(target_path /etc/fstab)
 
     if [[ $LAMBOOT_DRY_RUN -eq 0 ]]; then
+        [[ -f "$fstab_path" ]] || die "target fstab not found at $fstab_path"
+
         local new_fstab
         new_fstab=$(mktemp)
 
@@ -764,20 +1274,20 @@ to_uefi_phase_6_fstab() {
             else
                 printf '%s\n' "$line"
             fi
-        done < /etc/fstab > "$new_fstab"
+        done < "$fstab_path" > "$new_fstab"
 
         # Append ESP entry if not already present
         if ! grep -q "$esp_uuid" "$new_fstab"; then
             printf 'UUID=%s /boot/efi vfat umask=0077,shortname=winnt 0 1\n' "$esp_uuid" >> "$new_fstab"
         fi
 
-        mv "$new_fstab" /etc/fstab
-        chmod 0644 /etc/fstab
+        mv "$new_fstab" "$fstab_path"
+        chmod 0644 "$fstab_path"
     else
-        printf 'DRY-RUN: would rewrite /etc/fstab with UUID=%s mount at /boot/efi\n' "$esp_uuid" >&2
+        printf 'DRY-RUN: would rewrite %s with UUID=%s mount at /boot/efi\n' "$fstab_path" "$esp_uuid" >&2
     fi
 
-    record_action "fstab.rewrite" "/etc/fstab" "ok" "true" \
+    record_action "fstab.rewrite" "$fstab_path" "ok" "true" \
         "{\"esp_uuid\":\"$(json_escape "$esp_uuid")\"}" "$OPT_BACKUP_DIR"
 
     success "Phase 6 — fstab rewritten with UUID= entries"
@@ -786,23 +1296,49 @@ to_uefi_phase_6_fstab() {
 to_uefi_phase_7_chroot_prep() {
     info "Phase 7 — Chroot prep"
 
-    # When running on a live system, these are already mounted; only matters for method B.
-    if [[ -d /proc ]] && mountpoint -q /proc 2>/dev/null; then
-        verbose "/proc already mounted"
-    fi
-    if [[ -d /sys ]] && mountpoint -q /sys 2>/dev/null; then
-        verbose "/sys already mounted"
+    # Method A runs on the live target itself: /proc, /sys, /dev, /run are
+    # already mounted and the running kernel sees them — nothing to do.
+    if [[ -z "$LAMBOOT_TARGET_ROOT" ]]; then
+        verbose "Method A: skipping bind-mounts (already on running target)"
+        success "Phase 7 — chroot prep complete (Method A no-op)"
+        return 0
     fi
 
-    # efivarfs is BIOS-absent during a live-media chroot; method B should bind-mount.
-    # For method A (in-place), efivarfs won't exist until after reboot into UEFI.
+    # Method B: bind-mount kernel virtual filesystems + DNS into the target so
+    # Phase 8's package-manager + grub-install invocations work properly inside
+    # chroot. Tracked in LAMBOOT_TARGET_BINDS for cleanup on exit.
+    local bind src dst
+    for bind in /dev /proc /sys /run; do
+        dst="${LAMBOOT_TARGET_ROOT}${bind}"
+        if mountpoint -q "$dst" 2>/dev/null; then
+            verbose "already bound: $dst"
+            continue
+        fi
+        lamboot_run mkdir -p "$dst"
+        lamboot_run mount --bind "$bind" "$dst" || die "bind-mount $bind → $dst failed"
+        LAMBOOT_TARGET_BINDS+=("$dst")
+    done
+
+    # DNS for package downloads inside chroot
+    if [[ -f /etc/resolv.conf ]]; then
+        if [[ ! -e "${LAMBOOT_TARGET_ROOT}/etc/resolv.conf" || ! -s "${LAMBOOT_TARGET_ROOT}/etc/resolv.conf" ]]; then
+            lamboot_run cp -L /etc/resolv.conf "${LAMBOOT_TARGET_ROOT}/etc/resolv.conf" \
+                || verbose "could not copy resolv.conf into target (may break package install)"
+        fi
+    fi
+
+    # efivarfs — usually absent during Method B (live ISO is BIOS-booted).
+    # When absent, Phase 9 falls back to deferred boot-entry creation, which is
+    # the right behavior. When present (rare: UEFI live ISO), bind it in.
     if [[ -d /sys/firmware/efi/efivars ]]; then
-        verbose "efivarfs present (method A on post-UEFI host; unusual)"
-    else
-        verbose "efivarfs absent (expected on BIOS boot; will appear after UEFI reboot)"
+        dst="${LAMBOOT_TARGET_ROOT}/sys/firmware/efi/efivars"
+        lamboot_run mkdir -p "$dst"
+        lamboot_run mount --bind /sys/firmware/efi/efivars "$dst" 2>/dev/null \
+            && LAMBOOT_TARGET_BINDS+=("$dst") \
+            || verbose "efivarfs bind-mount failed (Phase 9 will defer boot-entry creation)"
     fi
 
-    success "Phase 7 — chroot prep complete"
+    success "Phase 7 — chroot prep complete (4 virtual FS bind-mounted to $LAMBOOT_TARGET_ROOT)"
 }
 
 to_uefi_phase_8_install_bootloader() {
@@ -814,18 +1350,39 @@ to_uefi_phase_8_install_bootloader() {
             ;;
         lamboot)
             install_grub_by_distro /boot/efi
-            if command -v lamboot-install >/dev/null 2>&1; then
-                lamboot_run lamboot-install --with-drivers --set-default \
+            # lamboot-install must run inside the target chroot under Method B
+            # so it edits the target's ESP + writes the target's manifest.
+            local lamboot_install_path
+            if [[ -n "$LAMBOOT_TARGET_ROOT" ]]; then
+                lamboot_install_path="$LAMBOOT_TARGET_ROOT/usr/bin/lamboot-install"
+                [[ -x "$lamboot_install_path" ]] || lamboot_install_path="$LAMBOOT_TARGET_ROOT/usr/local/bin/lamboot-install"
+            else
+                lamboot_install_path=$(command -v lamboot-install || true)
+            fi
+            if [[ -n "$lamboot_install_path" && -x "$lamboot_install_path" ]]; then
+                # Do NOT pass --with-drivers here. That legacy flag
+                # rewrites to OPT_WITH_DRIVERS_LEGACY="all" (the v0.8.3
+                # force-install-regardless mode), which fights native
+                # coverage (SDS-2 ext4, Path A btrfs) and produces
+                # bogus "missing driver" failures for filesystems that
+                # don't need a driver. Let lamboot-install's SDS-6 auto
+                # mode decide per-fstype.
+                target_run lamboot-install --set-default \
                     || die "lamboot-install failed"
                 record_action "bootloader.lamboot.install" "/boot/efi/EFI/LamBoot" "ok" "false" '{}' "null"
             else
-                warn "lamboot-install not found; GRUB installed as fallback"
+                warn "lamboot-install not found in target; GRUB installed as fallback"
                 warn "install LamBoot later: https://lamboot.dev/install"
             fi
             ;;
         systemd-boot)
-            require_tool bootctl "install systemd-boot via your distro's package manager"
-            lamboot_run bootctl install || die "bootctl install failed"
+            if [[ -n "$LAMBOOT_TARGET_ROOT" ]]; then
+                [[ -x "$LAMBOOT_TARGET_ROOT/usr/bin/bootctl" ]] \
+                    || die "bootctl not found in target ($LAMBOOT_TARGET_ROOT/usr/bin/bootctl)"
+            else
+                require_tool bootctl "install systemd-boot via your distro's package manager"
+            fi
+            target_run bootctl install || die "bootctl install failed"
             record_action "bootloader.systemd-boot.install" "/boot/efi" "ok" "false" '{}' "null"
             ;;
         *)
@@ -875,13 +1432,25 @@ to_uefi_phase_9_uefi_entry() {
 }
 
 populate_fallback_path() {
-    lamboot_run mkdir -p /boot/efi/EFI/BOOT
+    # Under Method B, /boot/efi here means the target's ESP (mounted at
+    # $LAMBOOT_TARGET_ROOT/boot/efi). target_path() resolves correctly for both
+    # methods; target_run() handles the chroot wrapping for cp/mkdir.
+    target_run mkdir -p /boot/efi/EFI/BOOT
 
+    # Source-loader search must inspect the ACTUAL filesystem (not the live
+    # ISO's), so we look on disk through target_path() rather than via glob
+    # inside chroot.
     local source_loader=""
     case "$OPT_BOOTLOADER" in
         grub-efi)
-            for candidate in /boot/efi/EFI/*/grubx64.efi /boot/efi/EFI/*/shimx64.efi; do
-                [[ -f "$candidate" ]] && { source_loader="$candidate"; break; }
+            local esp_root
+            esp_root=$(target_path /boot/efi)
+            for candidate in "$esp_root"/EFI/*/grubx64.efi "$esp_root"/EFI/*/shimx64.efi; do
+                [[ -f "$candidate" ]] && {
+                    # Strip the LAMBOOT_TARGET_ROOT prefix to get the path-as-seen-from-chroot
+                    source_loader="${candidate#${LAMBOOT_TARGET_ROOT}}"
+                    break
+                }
             done
             ;;
         lamboot)
@@ -892,8 +1461,8 @@ populate_fallback_path() {
             ;;
     esac
 
-    if [[ -n "$source_loader" ]] && [[ -f "$source_loader" ]]; then
-        lamboot_run cp "$source_loader" /boot/efi/EFI/BOOT/BOOTX64.EFI
+    if [[ -n "$source_loader" ]] && [[ -f "$(target_path "$source_loader")" ]]; then
+        target_run cp "$source_loader" /boot/efi/EFI/BOOT/BOOTX64.EFI
         record_action "uefi.fallback_path.populate" "/boot/efi/EFI/BOOT/BOOTX64.EFI" "ok" "false" \
             "{\"source\":\"$(json_escape "$source_loader")\"}" "null"
     else
@@ -901,11 +1470,83 @@ populate_fallback_path() {
     fi
 }
 
+# run_method_b_offline_checks — artifact validation that does NOT require a UEFI
+# boot, run on the still-mounted target after a Method B conversion. Catches the
+# separate-/boot / kernel-less-grub.cfg failure class BEFORE the migration is
+# declared a success (SDS-7: previously Method B deferred all checks and marked
+# success on an unbootable disk). Returns the count of failed checks (0 = good).
+run_method_b_offline_checks() {
+    [[ $LAMBOOT_DRY_RUN -eq 1 ]] && { verbose "offline-verify: skipped under --dry-run"; return 0; }
+    local troot="$LAMBOOT_TARGET_ROOT" fails=0
+
+    # 1. A kernel must be visible in the target's /boot — proves a separate
+    #    /boot partition (if any) is actually mounted into the chroot.
+    if [[ $(find "$troot/boot" -maxdepth 1 -name 'vmlinuz-*' 2>/dev/null | wc -l) -eq 0 ]]; then
+        warn "offline-verify: no vmlinuz-* under $troot/boot (separate /boot not mounted?)"
+        fails=$((fails+1))
+    fi
+
+    # 2. For grub-efi, grub.cfg must exist AND carry a real kernel menuentry —
+    #    a kernel-less config is exactly what an empty chroot /boot produces.
+    if [[ "$OPT_BOOTLOADER" == "grub-efi" ]]; then
+        local cfg="$troot/boot/grub/grub.cfg"
+        if [[ ! -s "$cfg" ]] || ! grep -qE '^[[:space:]]*menuentry[[:space:]]' "$cfg" 2>/dev/null; then
+            warn "offline-verify: $cfg missing or has no menuentry (grub-mkconfig found no kernel)"
+            fails=$((fails+1))
+        elif ! grep -qE '^[[:space:]]*linux[[:space:]]' "$cfg" 2>/dev/null; then
+            warn "offline-verify: $cfg has menuentries but no 'linux' kernel line"
+            fails=$((fails+1))
+        fi
+    fi
+
+    # 3. The ESP must carry the firmware fallback loader so OVMF can boot it
+    #    even before a UEFI NVRAM entry exists.
+    if [[ ! -e "$troot/boot/efi/EFI/BOOT/BOOTX64.EFI" ]]; then
+        warn "offline-verify: ESP fallback \\EFI\\BOOT\\BOOTX64.EFI is missing"
+        fails=$((fails+1))
+    fi
+
+    return "$fails"
+}
+
 to_uefi_phase_10_verify() {
     info "Phase 10 — Verify"
 
     if [[ $OPT_SKIP_VERIFY -eq 1 ]]; then
         verbose "skipping verification (--skip-verify)"
+        return 0
+    fi
+
+    # Method B runs from a BIOS-booted live ISO — verify checks like "boot
+    # mode is UEFI" + "efibootmgr lists target entry" can't pass yet; they
+    # become meaningful only after the user switches firmware and boots the
+    # converted system. Defer verify with a clear next-step instruction.
+    if [[ -n "$LAMBOOT_TARGET_ROOT" ]]; then
+        # The boot-mode / efibootmgr checks need a UEFI boot, but the artifact
+        # checks below run offline on the still-mounted target and catch the
+        # class of failure that previously shipped a "successful" yet unbootable
+        # disk. Refuse to mark the backup successful unless they pass.
+        local b_fail=0
+        run_method_b_offline_checks || b_fail=$?
+        if [[ $b_fail -ne 0 ]]; then
+            warn "Phase 10 — $b_fail offline artifact check(s) failed; NOT marking migration successful"
+            warn "the converted disk would not boot as-is; run 'lamboot-migrate rollback' to revert"
+            emit_finding "migrate.phase10.method_b_offline_fail" "phase10" "error" "fail" \
+                "Offline checks failed (Method B)" \
+                "$b_fail post-conversion artifact check(s) failed on the mounted target; the disk is not bootable." \
+                "{\"failures\":${b_fail}}" \
+                '{"summary":"Inspect warnings above, then rollback","command":"sudo lamboot-migrate rollback"}'
+            emit_json "$EXIT_PARTIAL"
+            exit "$EXIT_PARTIAL"
+        fi
+        warn "Phase 10 — offline artifact checks passed; UEFI-boot checks deferred"
+        warn "After switching firmware to UEFI and booting, run: sudo lamboot-migrate verify"
+        emit_finding "migrate.phase10.method_b_offline_ok" "phase10" "info" "pass" \
+            "Offline checks passed (Method B)" \
+            "Kernel, grub.cfg menuentry, and ESP fallback loader validated on the mounted target; boot-mode checks deferred to first UEFI boot." \
+            "{\"reason\":\"live_iso_is_bios\"}" \
+            '{"summary":"Run verify after UEFI boot","command":"sudo lamboot-migrate verify"}'
+        backup_success "$OPT_BACKUP_DIR"
         return 0
     fi
 
@@ -926,19 +1567,54 @@ to_uefi_phase_10_verify() {
 do_to_uefi() {
     require_root
 
+    # Ensure Method B mount + bind state is cleaned up on any exit path.
+    # Idempotent + no-op for Method A.
+    trap cleanup_target_mounts EXIT
+
     to_uefi_phase_1_preflight
     to_uefi_phase_2_confirm
     to_uefi_phase_3_backup
+    to_uefi_phase_3b_pre_mbr_to_gpt_shrink
     to_uefi_phase_4_mbr_to_gpt
     local esp_dev
-    esp_dev=$(to_uefi_phase_5_create_esp)
+    to_uefi_phase_5_create_esp
+    esp_dev="$LAMBOOT_PHASE5_ESP_DEV"
+    to_uefi_phase_5b_mount_target
     to_uefi_phase_6_fstab "$esp_dev"
     to_uefi_phase_7_chroot_prep
     to_uefi_phase_8_install_bootloader
     to_uefi_phase_9_uefi_entry
     to_uefi_phase_10_verify
 
-    cat <<EOF >&2
+    # Method-specific "what now?" guidance
+    local method
+    method=$(detect_proxmox_method)
+    if [[ "$method" == "B" ]]; then
+        cat <<EOF >&2
+
+Migration complete (Method B — live-ISO conversion).
+
+Next steps:
+  1. shutdown the live ISO: sudo poweroff
+  2. At Proxmox host: detach the ISO, switch to OVMF, add an EFI vars disk:
+       qm shutdown <VMID>
+       qm set <VMID> --delete ide2
+       qm set <VMID> --bios ovmf --efidisk0 <storage>:1,efitype=4m
+       qm set <VMID> --boot order=scsi0
+  3. Seed a UEFI boot entry into the fresh EFI vars. A new efidisk has an empty
+     BootOrder and OVMF does not reliably auto-launch the \\EFI\\BOOT\\ fallback,
+     so without this the VM comes up with "no bootable device":
+       VARS=\$(pvesm path <storage>:vm-<VMID>-disk-N)   # the efidisk0 volume
+       virt-fw-vars --inplace "\$VARS" --append-boot-filepath '/EFI/BOOT/BOOTX64.EFI'
+       qm start <VMID>
+  4. After UEFI boot, run: sudo lamboot-migrate verify
+
+Backup retained: $OPT_BACKUP_DIR
+Rollback available: sudo lamboot-migrate rollback
+
+EOF
+    else
+        cat <<EOF >&2
 
 Migration complete.
 
@@ -950,13 +1626,14 @@ Next steps:
 
 Proxmox VMs:
   qm shutdown <VMID>
-  qm set <VMID> --bios ovmf --efidisk0 <storage>:1,efitype=4m
+  qm set <VMID> --bios ovmf --efidisk0 <storage>:1,efitype=4m --machine q35
   qm start <VMID>
 
 Backup retained: $OPT_BACKUP_DIR
 Rollback available: sudo lamboot-migrate rollback
 
 EOF
+    fi
 
     emit_json "$EXIT_OK"
 }
@@ -988,7 +1665,21 @@ do_to_lamboot() {
         die_prerequisite "lamboot-install not found; install the LamBoot bootloader package first"
     fi
 
-    local install_args=("--signed" "--with-drivers")
+    # NOTE: --with-drivers was historically passed here, but as of
+    # lamboot-install v0.9.1+ (commit 50c7da0) it's obsolete: lamboot-install's
+    # SDS-6 native-coverage detection always wins in "auto" mode, and the
+    # legacy "all" mode that --with-drivers sets would force-install
+    # _x64.efi drivers that may not exist in release tarballs (because
+    # native ext4-view + native lambutter btrfs deprecated them). Dropping
+    # the flag makes to-lamboot behave correctly on systems with natively-
+    # covered /boot filesystems (ext4 on Proxmox/Debian/Ubuntu, btrfs on
+    # openSUSE/Garuda/CachyOS).
+    local install_args=()
+    if [[ $OPT_UNSIGNED -eq 1 ]]; then
+        verbose "to-lamboot: --unsigned set, omitting --signed from lamboot-install args"
+    else
+        install_args+=("--signed")
+    fi
     [[ $OPT_PRESERVE_GRUB -eq 1 ]] && install_args+=("--set-default")
 
     lamboot_run lamboot-install "${install_args[@]}" \
@@ -1233,21 +1924,33 @@ verify_check_2_disk_is_gpt() {
 }
 
 verify_check_3_esp_exists_ef00() {
+    # Method C (add-ESP-disk) places the ESP on a *separate* disk from
+    # the root disk, so the historical check that only scanned the root
+    # disk would false-fail for every Method C install. Scan all block
+    # devices for any EF00 partition; report the first one found.
+    local found_disk="" found_part=""
     local disk
-    disk=$(detect_target_disk) || disk="/dev/sda"
-    local esp
-    esp=$(sgdisk -p "$disk" 2>/dev/null | awk '$6 == "EF00" {print $1}' | head -1 || true)
-    if [[ -n "$esp" ]]; then
+    for disk in $(lsblk -ndo NAME,TYPE 2>/dev/null | awk '$2 == "disk" {print "/dev/" $1}'); do
+        local part
+        part=$(sgdisk -p "$disk" 2>/dev/null | awk '$6 == "EF00" {print $1}' | head -1 || true)
+        if [[ -n "$part" ]]; then
+            found_disk="$disk"
+            found_part="$part"
+            break
+        fi
+    done
+
+    if [[ -n "$found_disk" ]]; then
         emit_finding "migrate.verify.esp_partition" "verify" "info" "pass" \
             "Check 3: ESP partition present (type EF00)" \
-            "ESP is partition $esp on $disk." \
-            "{\"disk\":\"$(json_escape "$disk")\",\"partition\":$esp}" '{}'
+            "ESP is partition $found_part on $found_disk." \
+            "{\"disk\":\"$(json_escape "$found_disk")\",\"partition\":$found_part}" '{}'
         return 0
     fi
     emit_finding "migrate.verify.esp_partition" "verify" "critical" "fail" \
         "Check 3: No ESP partition found" \
-        "No partition on $disk has type EF00." \
-        "{\"disk\":\"$(json_escape "$disk")\"}" \
+        "No partition on any disk has type EF00." \
+        "{}" \
         '{"summary":"Create ESP via lamboot-migrate to-uefi","command":"sudo lamboot-migrate to-uefi","doc_url":"https://lamboot.dev/tools/migrate/esp"}'
     return 1
 }
@@ -1361,7 +2064,7 @@ verify_check_8_fstab_uses_uuids() {
 
 verify_check_9_boot_has_kernels() {
     local kernel_count
-    kernel_count=$(find /boot -maxdepth 1 -name 'vmlinuz-*' 2>/dev/null | wc -l)
+    kernel_count=$(find "$(target_path /boot)" -maxdepth 1 -name 'vmlinuz-*' 2>/dev/null | wc -l)
     if [[ "$kernel_count" -gt 0 ]]; then
         emit_finding "migrate.verify.kernels_present" "verify" "info" "pass" \
             "Check 9: Kernel(s) present in /boot" \
@@ -1573,6 +2276,7 @@ EOF
 do_status() {
     local boot_mode
     boot_mode=$(detect_boot_mode)
+    info "Boot mode: $boot_mode"
     emit_finding "migrate.status.boot_mode" "status" "info" "pass" \
         "Boot mode: $boot_mode" "System is in $boot_mode mode." \
         "{\"mode\":\"$boot_mode\"}" '{}'
@@ -1583,6 +2287,7 @@ do_status() {
     if [[ -n "$disk" ]]; then
         local pttype
         pttype=$(blkid -o value -s PTTYPE "$disk" 2>/dev/null || true)
+        info "Target disk: $disk (${pttype:-no-partition-table})"
         emit_finding "migrate.status.partition_table" "status" "info" "pass" \
             "Partition table: $pttype" "Disk $disk uses $pttype." \
             "{\"disk\":\"$(json_escape "$disk")\",\"pttype\":\"$pttype\"}" '{}'
@@ -1590,6 +2295,7 @@ do_status() {
 
     local bootloaders
     bootloaders=$(list_bootloaders 2>/dev/null | paste -sd, - || true)
+    info "Installed bootloaders: ${bootloaders:-none}"
     emit_finding "migrate.status.bootloaders" "status" "info" "pass" \
         "Installed bootloaders: ${bootloaders:-none}" \
         "" \
@@ -1598,6 +2304,7 @@ do_status() {
     local distro distro_ver
     distro=$(detect_distro)
     distro_ver=$(detect_distro_version)
+    info "Distribution: $distro $distro_ver"
     emit_finding "migrate.status.distro" "status" "info" "pass" \
         "Distribution: $distro $distro_ver" "" \
         "{\"id\":\"$distro\",\"version\":\"$distro_ver\"}" '{}'
@@ -1607,6 +2314,7 @@ do_status() {
         local pttype
         pttype=$(blkid -o value -s PTTYPE "$disk" 2>/dev/null || true)
         if [[ "$pttype" == "dos" ]]; then
+            warn "Ready for BIOS→UEFI migration — run: sudo lamboot-migrate to-uefi --disk $disk"
             emit_finding "migrate.status.readiness" "status" "warning" "warn" \
                 "Ready for BIOS→UEFI migration" \
                 "System is BIOS+MBR. Run 'sudo lamboot-migrate to-uefi --disk $disk' to convert." \
@@ -1683,6 +2391,12 @@ parse_args() {
             0) ;;
         esac
 
+        # Accept both --opt=value and --opt value forms. Split the equals form
+        # into two args so the case below stays simple.
+        if [[ "$1" == --*=* ]]; then
+            set -- "${1%%=*}" "${1#*=}" "${@:2}"
+        fi
+
         case "$1" in
             --disk)         OPT_DISK="${2:-}"; shift 2 ;;
             --esp-size)     OPT_ESP_SIZE_MB="${2:-550}"; shift 2 ;;
@@ -1694,6 +2408,8 @@ parse_args() {
             --keep-legacy-mbr) OPT_KEEP_LEGACY_MBR=1; shift ;;
             --preserve-grub) OPT_PRESERVE_GRUB=1; OPT_REMOVE_GRUB=0; shift ;;
             --remove-grub)   OPT_REMOVE_GRUB=1; OPT_PRESERVE_GRUB=0; shift ;;
+            --unsigned)     OPT_UNSIGNED=1; shift ;;
+            --capcheck-gate) OPT_CAPCHECK_GATE=1; shift ;;
             --all)          OPT_VERIFY_ALL=1; shift ;;
             --path)         OPT_VERIFY_PATH="${2:-}"; shift 2 ;;
             *)              die "unknown option: $1" ;;

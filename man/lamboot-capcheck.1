@@ -1,0 +1,109 @@
+.TH LAMBOOT\-CAPCHECK 1 "2026-06-03" "lamboot-tools" "lamboot-tools Manual"
+.SH NAME
+lamboot\-capcheck \- firmware and platform capability auditor
+.SH SYNOPSIS
+.B lamboot\-capcheck
+[\fIOPTIONS\fR] [\fITOKENS\fR]...
+.br
+.B lamboot\-capcheck
+.B audit
+[\fIOPTIONS\fR]
+.br
+.B lamboot\-capcheck
+.B \-\-json
+.B audit
+.SH DESCRIPTION
+.B lamboot\-capcheck
+is a vendor\-neutral firmware and platform capability auditor for Linux
+hosts. It discovers what a machine's firmware and platform
+.I claim
+to support, verifies which of those claims actually hold up, cross\-references
+a curated quirks database, and reports the result for humans or machines.
+It audits twelve firmware and platform domains, reading
+.IR /sys ,
+.IR /proc ,
+the ESP, and (with the invasive options) UEFI runtime variables.
+.PP
+This binary is a prebuilt, statically linked component of the lamboot\-tools
+suite. The shell tools
+.BR lamboot\-doctor (1)
+and
+.BR lamboot\-migrate (1)
+consume it automatically when it is present on
+.BR PATH :
+lamboot\-doctor splices its findings into the unified diagnostic report, and
+lamboot\-migrate's optional
+.B \-\-capcheck\-gate
+refuses an unsafe migration when a critical firmware quirk is detected. Both
+degrade gracefully when this binary is absent.
+.SH COMMANDS
+.TP
+.B audit
+Run the capability audit across all enabled domains.
+.TP
+.B help \fR[\fINAME\fR]
+Print the inline registry, or deep\-dive a subcommand, domain, or check.
+.SH OPTIONS
+.TP
+.BR \-\-format " " \fIFORMAT\fR
+Output format: \fBhuman\fR (default), \fBjson\fR, \fBjunit\-xml\fR,
+\fBmarkdown\fR, \fBcsv\fR, or \fBsarif\fR.
+.TP
+.B \-\-json
+Shorthand for \fB\-\-format json\fR.
+.TP
+.BR \-\-target\-root " " \fIPATH\fR
+Treat \fIPATH\fR as the filesystem root (offline analysis of a mounted target).
+.TP
+.BR \-\-offline\-bundle " " \fIPATH\fR
+Read inputs from a bundle directory or tarball instead of live
+.IR /sys .
+.TP
+.B \-\-lamboot
+Enable the optional LamBoot\-integration add\-on checks.
+.TP
+.BR \-\-redact ", " \-\-no\-redact
+Redact or force inclusion of PII (serials, MACs, UUIDs).
+.TP
+.B \-\-strict
+Treat WARN findings as FAIL.
+.TP
+.B \-\-exit\-on\-fail
+Exit nonzero if any check reports FAIL.
+.TP
+.BR \-v ", " \-\-verbose
+Verbose output (repeatable: \fB\-vv\fR for trace).
+.TP
+.BR \-V ", " \-\-version
+Print version.
+.SH EXIT STATUS
+.TP
+.B 0
+Audit completed (see findings for verdicts).
+.TP
+.B nonzero
+With \fB\-\-exit\-on\-fail\fR or \fB\-\-strict\fR, indicates a FAIL\-severity finding.
+.SH FILES
+.TP
+.I /sys, /proc
+Live firmware and platform state.
+.TP
+.I /usr/share/doc/lamboot-tools/lamboot-capcheck.THIRD_PARTY_NOTICES.md
+License notices for the bundled Rust dependencies.
+.SH SOURCE
+The source for this component lives in its own repository,
+.UR https://github.com/lamco-admin/lamboot-capcheck
+.UE .
+The binary shipped here is built static against musl for cross\-distribution
+portability and vendored into the lamboot\-tools release.
+.SH SEE ALSO
+.BR lamboot\-doctor (1),
+.BR lamboot\-migrate (1),
+.BR lamboot\-diagnose (1),
+.BR lamboot\-tools (7)
+.SH AUTHORS
+.B Lamco Development LLC
+.UR https://lamco.io
+.UE
+.SH LICENSE
+MIT OR Apache\-2.0

@@ -15,7 +15,7 @@
 # Versioning — single source of truth for the toolkit version
 # ────────────────────────────────────────────────────────────────────────────
 
-readonly LAMBOOT_TOOLKIT_VERSION="0.3.0"
+readonly LAMBOOT_TOOLKIT_VERSION="0.8.0"
 readonly LAMBOOT_TOOLKIT_SCHEMA_VERSION="v1"
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -184,7 +184,7 @@ confirm() {
     local question="$1"
     local expected_token="${2:-yes}"
 
-    if [[ $LAMBOOT_YES -eq 1 ]] || [[ $LAMBOOT_AUTO -eq 1 ]] || [[ $LAMBOOT_FORCE -eq 1 ]]; then
+    if [[ $LAMBOOT_YES -eq 1 ]] || [[ $LAMBOOT_AUTO -eq 1 ]] || [[ $LAMBOOT_FORCE -eq 1 ]] || [[ $LAMBOOT_DRY_RUN -eq 1 ]]; then
         verbose "auto-confirmed: $question"
         return 0
     fi

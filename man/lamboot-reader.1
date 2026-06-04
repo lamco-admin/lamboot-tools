@@ -1,0 +1,100 @@
+.TH LAMBOOT\-READER 1 "2026-06-03" "lamboot-tools" "lamboot-tools Manual"
+.SH NAME
+lamboot\-reader \- read and resolve GRUB boot configuration
+.SH SYNOPSIS
+.B lamboot\-reader
+[\fIOPTIONS\fR] \fICOMMAND\fR
+.SH DESCRIPTION
+.B lamboot\-reader
+parses and reasons about GRUB configuration on a Linux host:
+.IR grub.cfg ,
+.IR /etc/default/grub ,
+and
+.IR grubenv .
+It answers the question "which entry would GRUB boot, with what kernel command
+line?" and detects drift between the generated boot menu and the operator
+configuration. It is Proxmox\-focused today and best\-effort elsewhere.
+.PP
+This binary is a prebuilt, statically linked component of the lamboot\-tools
+suite, shipped as a standalone CLI. It is also consumed by LamBoot's host\-side
+install path and kernel postinst hook to detect command\-line drift and select
+the correct kernel for a Boot Loader Specification entry.
+.SH COMMANDS
+.TP
+.B list\-kernels
+List every menuentry in
+.IR grub.cfg .
+.TP
+.B default
+Print the menuentry GRUB would boot right now.
+.TP
+.B cmdline
+Print the effective kernel command line (the resolved default, or a named
+kernel version).
+.TP
+.B compare\-cmdline
+Compare the resolved entry's command line against
+.IR /etc/default/grub .
+Exits 0 on match, 2 on drift.
+.TP
+.B parse\-default\-grub
+Print
+.I /etc/default/grub
+key/value pairs.
+.TP
+.B grubenv
+Print
+.I grubenv
+as JSON.
+.SH OPTIONS
+.TP
+.BR \-\-grub\-cfg " " \fIPATH\fR
+Path to
+.IR grub.cfg
+(default:
+.IR /boot/grub/grub.cfg ).
+.TP
+.BR \-\-default\-grub " " \fIPATH\fR
+Path to
+.I /etc/default/grub
+(default:
+.IR /etc/default/grub ).
+.TP
+.BR \-\-grubenv " " \fIPATH\fR
+Path to
+.IR grubenv
+(default:
+.IR /boot/grub/grubenv ).
+.TP
+.B \-\-json
+Machine\-readable JSON output.
+.TP
+.BR \-V ", " \-\-version
+Print version.
+.SH EXIT STATUS
+.TP
+.B 0
+Success (for
+.BR compare\-cmdline ,
+the command line matches).
+.TP
+.B 2
+For
+.BR compare\-cmdline ,
+configuration drift was detected.
+.SH SOURCE
+The source for this component lives in its own repository,
+.UR https://github.com/lamco-admin/lamboot-reader
+.UE .
+The binary shipped here is built static against musl for cross\-distribution
+portability and vendored into the lamboot\-tools release.
+.SH SEE ALSO
+.BR lamboot\-migrate (1),
+.BR lamboot\-diagnose (1),
+.BR lamboot\-tools (7)
+.SH AUTHORS
+.B Lamco Development LLC
+.UR https://lamco.io
+.UE
+.SH LICENSE
+MIT OR Apache\-2.0

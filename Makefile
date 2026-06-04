@@ -50,10 +50,25 @@ PVE_TOOLS = \
 # lamboot-pve-monitor + lamboot-pve-ovmf-vars are mirrored from lamboot-dev
 # (see publish/mirror-pve-from-lamboot-dev.sh)
 
+# Vendored Rust component binaries (federation phase 1 — see ROADMAP.md).
+# Source lives in the sibling repos lamco-admin/lamboot-{capcheck,reader};
+# their prebuilt static-musl binaries are vendored under vendor/bin/<arch>/
+# by publish/vendor-binaries.sh and shipped inside the release. The shell
+# suite consumes lamboot-capcheck at runtime via lib/lamboot-capcheck-bridge.sh
+# (PATH lookup); lamboot-reader ships as a standalone CLI.
+FIRMWARE_BINS    = lamboot-capcheck lamboot-reader
+VENDOR_BIN_DIR   = vendor/bin
+VENDOR_NOTICES   = vendor/notices
+# Host arch → vendor/bin subdirectory. Override for cross-packaging.
+VENDOR_ARCH     ?= $(shell uname -m)
+# Set INSTALL_FIRMWARE=0 to install the shell suite without the binaries
+# (e.g. an RPM that packages them in a separate arch-specific subpackage).
+INSTALL_FIRMWARE ?= 1
+
 INSTALL ?= install
 
-.PHONY: all build build-sourced build-inlined install install-inlined uninstall \
-        clean test lint help
+.PHONY: all build build-sourced build-inlined install install-inlined \
+        install-firmware uninstall vendor clean test lint help
 
 all: build
 
@@ -81,6 +96,8 @@ help:
 	@echo "  test-all           Run all three test suites"
 	@echo "  fixtures           Download fixture disk images"
 	@echo "  fleet-test         Run Tier 1 fleet test (requires Proxmox host)"
+	@echo "  vendor             Build + vendor sibling Rust binaries into vendor/"
+	@echo "  install-firmware   Install vendored binaries for the host arch"
 
 build: build-sourced build-inlined
 
@@ -174,6 +191,7 @@ install: build-sourced
 	@if [ -f LICENSE-APACHE ]; then \
 	    $(INSTALL) -m 644 LICENSE-APACHE $(DESTDIR)$(DOCDIR)/; \
 	fi
+	@$(MAKE) --no-print-directory install-firmware
 
 install-inlined: build-inlined
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
@@ -210,11 +228,38 @@ install-inlined: build-inlined
 	    [ -f $$page ] || continue; \
 	    $(INSTALL) -m 644 $$page $(DESTDIR)$(MANDIR)/man7/; \
 	done
+	@$(MAKE) --no-print-directory install-firmware
+
+# Install the vendored static binaries for the host arch (or $(VENDOR_ARCH)).
+# Best-effort: silently skipped when INSTALL_FIRMWARE=0 or no binary is
+# vendored for the arch, so a source-only checkout still installs cleanly.
+install-firmware:
+	@if [ "$(INSTALL_FIRMWARE)" != "0" ] && [ -d "$(VENDOR_BIN_DIR)/$(VENDOR_ARCH)" ]; then \
+	    $(INSTALL) -d $(DESTDIR)$(BINDIR); \
+	    for b in $(FIRMWARE_BINS); do \
+	        if [ -f "$(VENDOR_BIN_DIR)/$(VENDOR_ARCH)/$$b" ]; then \
+	            $(INSTALL) -m 755 "$(VENDOR_BIN_DIR)/$(VENDOR_ARCH)/$$b" $(DESTDIR)$(BINDIR)/$$b; \
+	            echo "  installed (firmware/$(VENDOR_ARCH)) $(BINDIR)/$$b"; \
+	        fi; \
+	    done; \
+	    if [ -d "$(VENDOR_NOTICES)" ]; then \
+	        $(INSTALL) -d $(DESTDIR)$(DOCDIR); \
+	        for n in $(VENDOR_NOTICES)/*.md; do \
+	            [ -f "$$n" ] && $(INSTALL) -m 644 "$$n" $(DESTDIR)$(DOCDIR)/$$(basename $$n); \
+	        done; \
+	    fi; \
+	else \
+	    echo "  firmware install skipped (INSTALL_FIRMWARE=$(INSTALL_FIRMWARE), arch $(VENDOR_ARCH))"; \
+	fi
 
 uninstall:
 	@for tool in $(CORE_TOOLS); do \
 	    rm -f $(DESTDIR)$(BINDIR)/$$tool; \
 	    echo "  removed $(BINDIR)/$$tool"; \
+	done
+	@for b in $(FIRMWARE_BINS); do \
+	    rm -f $(DESTDIR)$(BINDIR)/$$b; \
+	    echo "  removed $(BINDIR)/$$b"; \
 	done
 	@rm -f $(DESTDIR)$(BINDIR)/lamboot-inspect
 	@rm -f $(DESTDIR)$(LIBDIR)/lamboot-inspect
@@ -346,3 +391,16 @@ build-website: website
 
 clean:
 	rm -rf $(BUILD_DIR)
+	@# Stale Rust target/ from the pre-extraction workspace era. Vendored
+	@# binaries live under vendor/ (committed) and are NOT removed by clean.
+	rm -rf target
+
+# ── Vendored Rust component binaries ──────────────────────────────────────
+# The lamboot-capcheck and lamboot-reader binaries are built from their own
+# sibling repositories (lamco-admin/lamboot-{capcheck,reader}) and vendored
+# here as prebuilt static-musl binaries. The toolkit does not compile Rust:
+#   publish/vendor-binaries.sh   (re)builds + refreshes vendor/bin/<arch>/
+# The shell suite consumes lamboot-capcheck from PATH at runtime via
+# lib/lamboot-capcheck-bridge.sh; lamboot-reader ships as a standalone CLI.
+vendor:
+	publish/vendor-binaries.sh

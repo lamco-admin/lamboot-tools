@@ -21,10 +21,28 @@ addFilter(r"non-executable-script /usr/lib/lamboot-tools/lamboot-toolkit-(lib|he
 addFilter(r"no-manual-page-for-binary lamboot-pve-monitor")
 addFilter(r"no-manual-page-for-binary lamboot-pve-ovmf-vars")
 
-# noarch package with only shell scripts in /usr/lib is the correct FHS layout
-# for a tool suite sharing runtime library files. See SPEC-LAMBOOT-TOOLKIT-V1
-# section 6.1 (shared library contract).
+# Shell scripts in /usr/lib is the correct FHS layout for a tool suite sharing
+# runtime library files. See SPEC-LAMBOOT-TOOLKIT-V1 section 6.1 (shared
+# library contract).
 addFilter(r"only-non-binary-in-usr-lib")
+
+# The lamboot-tools main package is arch-tagged only so the arch-specific
+# lamboot-tools-firmware subpackage can exist in the same SRPM (RPM forbids an
+# arch subpackage under a noarch main). Its own payload is pure shell, so it
+# legitimately contains no ELF binary. See the spec header for the rationale.
+addFilter(r"no-binary")
+
+# lamboot-tools-firmware ships prebuilt, statically linked (musl) binaries
+# built from the sibling Rust repos for cross-distribution portability. Static
+# linkage and the resulting hardening posture are intentional for a vendored
+# binary that must run on any glibc-version-skewed distro; debuginfo is
+# disabled (no usable source for it). Filter the expected static-binary findings.
+addFilter(r"lamboot-tools-firmware.*statically-linked-binary")
+addFilter(r"lamboot-tools-firmware.*hardening-no-relro")
+addFilter(r"lamboot-tools-firmware.*hardening-no-pie")
+addFilter(r"lamboot-tools-firmware.*position-independent-executable-suggested")
+addFilter(r"lamboot-tools-firmware.*missing-PT_GNU_STACK-section")
+addFilter(r"lamboot-tools-firmware.*unstripped-binary-or-object")
 
 # (Removed dangling/absolute symlink filter — the current symlink target
 # passes rpmlint as-is. Re-add if a future rpmlint version flags it.)
