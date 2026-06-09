@@ -5,7 +5,6 @@
 # unified JSON output. Produces UKIs per UAPI.5 that work with any
 # UKI-aware bootloader (systemd-boot, LamBoot, firmware-direct).
 #
-# Governed by docs/SPEC-LAMBOOT-UKI-BUILD.md.
 # Part of the lamboot-tools suite (SPEC-LAMBOOT-TOOLKIT-V1.md §3.1).
 
 # shellcheck source=../lib/lamboot-toolkit-lib.sh
@@ -16,7 +15,7 @@ source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
 LAMBOOT_TOOL_NAME="lamboot-uki-build"
 LAMBOOT_TOOL_VERSION="0.7.2"
 
-readonly DOC_BASE="https://lamboot.dev/tools/findings"
+readonly DOC_BASE="https://github.com/lamco-admin/lamboot-tools"
 
 OPT_SUBCOMMAND=""
 OPT_KERNEL=""
@@ -58,7 +57,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "inspect, sign, verify, lamboot-signing-keys" \
-        --doc-url "https://lamboot.dev/tools/uki-build/build" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "beta"
 
     register_subcommand \
@@ -73,7 +72,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "build, sign, verify" \
-        --doc-url "https://lamboot.dev/tools/uki-build/inspect" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "beta"
 
     register_subcommand \
@@ -90,7 +89,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "build, verify, lamboot-signing-keys" \
-        --doc-url "https://lamboot.dev/tools/uki-build/sign" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "beta"
 
     register_subcommand \
@@ -105,7 +104,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "build, sign" \
-        --doc-url "https://lamboot.dev/tools/uki-build/verify" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "beta"
 }
 
@@ -523,7 +522,7 @@ parse_args() {
             2) _register_subcommands; dispatch_help; exit 0 ;;
             3) printf 'lamboot-uki-build %s (lamboot-tools %s)\n' \
                 "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
-            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            4) printf '{"$schema":"https://github.com/lamco-admin/lamboot-tools"}\n'; exit 0 ;;
             5) shift; shift; continue ;;  # --offline accepted but not used
             0) ;;
         esac

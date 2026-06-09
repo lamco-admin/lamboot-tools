@@ -1,0 +1,333 @@
+.\" lamboot-nvram(1) — auto-generated from help registry
+.\" Source: tools/lamboot-nvram
+.\" Generated: 2026-06-09T07:04:58Z
+.\" DO NOT EDIT — regenerate via `make man` or `scripts/registry-to-man`.
+.TH "LAMBOOT-NVRAM" "1" "2026-06-09" "lamboot-nvram 0.1.0" "lamboot-tools"
+.SH NAME
+lamboot-nvram \- part of the lamboot-tools suite
+.SH SYNOPSIS
+.B lamboot-nvram
+[\fIGLOBAL FLAGS\fR] [\fISUBCOMMAND\fR] [\fIARGS\fR]
+.SH DESCRIPTION
+lamboot-nvram is part of
+.BR lamboot-tools (7),
+"The Linux UEFI boot toolkit." See that page for suite-level conventions
+and cross-tool composition.
+.PP
+This page documents every subcommand registered in lamboot-nvram's help
+registry. Every subcommand is also accessible via
+.BI "lamboot-nvram help " SUBCOMMAND
+at runtime.
+.SH SUBCOMMANDS
+.SS inventory
+.PP
+.I List UEFI boot entries and classify each (live, dangling, duplicate, dead\-OS)
+.PP
+.B Category:
+Diagnostics
+.br
+.B Maturity:
+draft
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-nvram inventory [\-\-efidisk FILE] [\-\-json]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B \-\-efidisk FILE
+Inspect an offline efidisk/OVMF_VARS image instead of live efivarfs
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+lamboot\-nvram inventory
+lamboot\-nvram inventory \-\-efidisk /dev/zvol/AB/vm\-129\-disk\-1 \-\-json
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Resolves each Boot#### against present partitions. Reads live efivarfs (unprivileged) or, with \-\-efidisk, an offline vars image via virt\-fw\-vars.
+.RE
+.PP
+.B OFFLINE:
+Yes \- supports \fB\-\-offline\fR \fIDISK\fR
+.br
+.B PRIVILEGE:
+Runs unprivileged
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+clean
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.RE
+.PP
+.SS clean
+.PP
+.I Remove stale UEFI boot entries (dry\-run by default)
+.PP
+.B Category:
+Maintenance
+.br
+.B Maturity:
+draft
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-nvram clean [\-\-apply] [\-\-category CAT ...] [\-\-exclude CAT ...] [\-\-efidisk FILE] [\-\-backup\-dir DIR] [\-\-json]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B \-\-apply
+Actually delete entries (default: preview only)
+.TP
+.B \-\-category CAT
+dangling 
+.TP
+.B  duplicate 
+ duplicate 
+.TP
+.B  dead\-os 
+ dead\-os 
+.TP
+.B  orphan\-bootorder (repeatable; default
+ all)
+.TP
+.B \-\-exclude CAT
+Skip a category (repeatable)
+.TP
+.B \-\-efidisk FILE
+Operate on an offline efidisk image (inventory/preview; apply is live\-only)
+.TP
+.B \-\-backup\-dir DIR
+Where to export the pre\-change NVRAM
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+lamboot\-nvram clean
+sudo lamboot\-nvram clean \-\-category duplicate \-\-apply
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+NEVER removes BootCurrent or the default (BootOrder head). Backs up via efibootmgr \-v before \-\-apply; reverse with \'lamboot\-nvram restore\'. Logs every action to /var/log/lamboot/.
+.RE
+.PP
+.B OFFLINE:
+Yes \- supports \fB\-\-offline\fR \fIDISK\fR
+.br
+.B PRIVILEGE:
+Requires root (sudo)
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+inventory,restore
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.RE
+.PP
+.SS restore
+.PP
+.I Re\-create boot entries removed by a previous clean (from its backup)
+.PP
+.B Category:
+Maintenance
+.br
+.B Maturity:
+draft
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-nvram restore [\-\-apply] [\-\-backup\-dir DIR] [\-\-json]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B \-\-apply
+Actually re\-create entries (default: preview only)
+.TP
+.B \-\-backup\-dir DIR
+Backup to restore from (default: most recent /var/backups/lamboot\-{nvram,doctor}\-*)
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+lamboot\-nvram restore
+sudo lamboot\-nvram restore \-\-apply
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Reads the backup\'s efibootmgr.pre.txt, re\-creates any entry present then but missing now (efibootmgr \-c, resolving the disk from the partition UUID). Idempotent.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Requires root (sudo)
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+clean
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.RE
+.PP
+.SH GLOBAL FLAGS
+Every subcommand accepts these universal flags (documented in
+.BR lamboot-tools (7)):
+.TP
+.BR \-\-help ", " \-h
+Show inline help
+.TP
+.B \-\-version
+Print tool and toolkit version
+.TP
+.B \-\-json
+Emit unified JSON output (schema v1)
+.TP
+.B \-\-json-schema
+Print the JSON schema this tool emits
+.TP
+.BR \-\-verbose ", " \-v
+Informational output beyond the default
+.TP
+.BR \-\-quiet ", " \-q
+Only warnings and errors
+.TP
+.B \-\-no-color
+Disable ANSI color (auto on non-TTY)
+.TP
+.B \-\-dry-run
+Print planned actions without executing
+.TP
+.BR \-\-yes ", " \-y
+Answer yes to interactive prompts
+.TP
+.B \-\-force
+Skip safety checks (per-subcommand semantics)
+.TP
+.B \-\-auto
+Non-interactive full automation (implies \fB\-\-yes\fR)
+.TP
+.BI \-\-offline " DISK"
+Operate on an unmounted disk or image
+.TP
+.B \-\-suggest-next-command
+Print the recommended follow-up command
+.SH EXIT STATUS
+.TP
+.B 0
+Success
+.TP
+.B 1
+Fatal error
+.TP
+.B 2
+Partial \- some operations succeeded, some failed
+.TP
+.B 3
+Nothing to do (already in requested state)
+.TP
+.B 4
+Refused due to a safety check
+.TP
+.B 5
+User declined interactive confirmation
+.TP
+.B 6
+Operation does not apply to this system
+.TP
+.B 7
+Required tool or capability is missing
+.SH FILES
+.TP
+.I /usr/lib/lamboot-tools/lamboot-toolkit-lib.sh
+Shared library sourced by every tool
+.TP
+.I /usr/lib/lamboot-tools/lamboot-toolkit-help.sh
+Help registry driver
+.TP
+.I /var/backups/lamboot-*-<timestamp>/
+Per-run backup directory (when a tool mutates state)
+.SH ENVIRONMENT
+.TP
+.B LAMBOOT_LIB_DIR
+Override shared library directory (default:
+.IR /usr/lib/lamboot-tools ).
+.TP
+.B NO_COLOR
+When set (to any value), disables ANSI color (freedesktop convention).
+.SH SEE ALSO
+.BR lamboot-tools (7),
+.BR lamboot-toolkit (1),
+.BR lamboot-diagnose (1),
+.BR lamboot-esp (1),
+.BR lamboot-backup (1),
+.BR lamboot-repair (1),
+.BR lamboot-migrate (1),
+.BR lamboot-doctor (1),
+.BR lamboot-uki-build (1),
+.BR lamboot-signing-keys (1)
+.PP
+Full documentation at
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.SH AUTHORS
+The lamboot-tools suite is developed by
+.B Lamco Development LLC
+(https://lamco.io). Source:
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.SH LICENSE
+MIT OR Apache-2.0

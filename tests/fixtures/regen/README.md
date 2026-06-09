@@ -18,7 +18,7 @@ Every regen script:
 4. Shuts down the VM
 5. Writes the disk image to `tests/fixtures/<name>.raw`
 6. Updates `tests/fixtures/fixtures.sha256` with the new SHA
-7. Optionally: uploads to `fixtures.lamboot.dev` (gated on `PUBLISH_FIXTURES=1`)
+7. Optionally: uploads to `https://github.com/lamco-admin/lamboot-tools` (gated on `PUBLISH_FIXTURES=1`)
 
 ## Scripts
 

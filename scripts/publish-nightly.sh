@@ -1,12 +1,12 @@
 #!/bin/bash
-# publish-nightly.sh — upload nightly fleet-test results to lamboot.dev/tools/nightly
+# publish-nightly.sh — upload nightly fleet-test results to https://github.com/lamco-admin/lamboot-tools
 #
 # Called by .github/workflows/fleet-test.yml after scripts/fleet-test.sh.
 # Builds a static report from the latest tests/results/<date>/ tree and
 # publishes to the configured hosting location.
 #
 # Env:
-#   FLEET_PUBLISH_URL     Target URL (default: https://lamboot.dev/tools/nightly/upload)
+#   FLEET_PUBLISH_URL     Target URL (default: https://github.com/lamco-admin/lamboot-tools)
 #   FLEET_PUBLISH_TOKEN   Auth token (required)
 #   RESULTS_DIR           Source directory (default: tests/results/<today>)
 
@@ -15,7 +15,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/tests/results/$(date -u +%Y-%m-%d)}"
 BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build/nightly-report}"
-FLEET_PUBLISH_URL="${FLEET_PUBLISH_URL:-https://lamboot.dev/tools/nightly/upload}"
+FLEET_PUBLISH_URL="${FLEET_PUBLISH_URL:-https://github.com/lamco-admin/lamboot-tools}"
 
 readonly RED=$'\033[0;31m'
 readonly YELLOW=$'\033[0;33m'

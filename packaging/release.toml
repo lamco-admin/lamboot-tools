@@ -1,0 +1,25 @@
+# Single source of truth for the UPSTREAM version that downstream packaging targets.
+# Per-channel packaging revisions live in each channel's native field
+# (deb: debian/changelog; rpm: Release; aur: pkgrel) — see PACKAGING.md §4.
+# The lamco-admin render step reads this to fetch the right artifact and to
+# verify each channel's metadata matches; checksums are computed at publish,
+# never committed here.
+
+[upstream]
+version = "0.9.1"
+tag = "v0.9.1"
+
+# The published release tarball that the prebuilt channels repackage. Unlike
+# lamboot, lamboot-tools has ONE release artifact: the source tarball already
+# carries the vendored static-musl component binaries (vendor/bin/<arch>/), so
+# the prebuilt channels and the "source" channel repackage the same file. It is
+# arch-independent at the tarball level; each channel selects vendor/bin/<arch>
+# matching the package's target architecture at build time.
+# {version}/{tag} are substituted by the render step.
+tarball     = "lamboot-tools-{version}.tar.gz"
+tarball_url = "https://github.com/lamco-admin/lamboot-tools/releases/download/{tag}/lamboot-tools-{version}.tar.gz"
+
+# Architectures the vendored component binaries are built for. A package can
+# only ship the lamboot-capcheck / lamboot-reader binaries on these arches;
+# on any other arch the shell suite installs alone (it degrades gracefully).
+arches = ["x86_64", "aarch64"]

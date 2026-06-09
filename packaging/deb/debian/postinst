@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        cat <<'EOF'
+
+lamboot-tools installed. Start with:
+    lamboot-diagnose         scan this system's UEFI boot chain
+    lamboot-doctor           guided diagnose -> repair -> verify
+    lamboot-toolkit help     list every tool
+
+Man pages: man lamboot-tools, man lamboot-diagnose, ...
+EOF
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

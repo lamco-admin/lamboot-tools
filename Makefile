@@ -46,9 +46,20 @@ CORE_TOOLS = \
 # Makefile-level install-pve target provided for dev-tree local installation.
 PVE_TOOLS = \
     lamboot-pve-setup \
-    lamboot-pve-fleet
+    lamboot-pve-fleet \
+    lamboot-pve-migrate
 # lamboot-pve-monitor + lamboot-pve-ovmf-vars are mirrored from lamboot-dev
 # (see publish/mirror-pve-from-lamboot-dev.sh)
+
+# Toolkit-native Python tools (live under tools/). Excluded from CORE_TOOLS
+# because the inlined-build + shellcheck loops are bash-only; they carry their
+# own man rules below. registry-to-man detects the python shebang and extracts
+# the registry via --dump-registry instead of
+# sourcing. lamboot-inspect is Python too but its source + registry-generated man
+# page are mirrored in from lamboot-dev (its canonical home) at release time, not
+# built here — see publish/mirror-from-lamboot-dev.sh.
+PYTHON_TOOLS = \
+    lamboot-nvram
 
 # Vendored Rust component binaries (federation phase 1 — see ROADMAP.md).
 # Source lives in the sibling repos lamco-admin/lamboot-{capcheck,reader};
@@ -87,9 +98,6 @@ help:
 	@echo "  mirror-lamboot-dev Run publish/mirror-from-lamboot-dev.sh"
 	@echo "  mirror-pve         Run publish/mirror-pve-from-lamboot-dev.sh"
 	@echo "  man                Regenerate man pages from help registry"
-	@echo "  website            Regenerate website tool pages from help registry"
-	@echo "  serve-website      Run mkdocs dev server at http://127.0.0.1:8001"
-	@echo "  build-website      Build static site to website/build/"
 	@echo "  test               Run core bats CLI tests (fast, no fixtures)"
 	@echo "  test-integration   Run integration tests (requires fixtures + root)"
 	@echo "  test-pve           Run PVE companion bats tests"
@@ -354,7 +362,7 @@ mirror-lamboot-dev:
 mirror-pve:
 	publish/mirror-pve-from-lamboot-dev.sh
 
-man: $(foreach t,$(CORE_TOOLS),man/$(t).1) $(foreach t,$(PVE_TOOLS),man/$(t).1)
+man: $(foreach t,$(CORE_TOOLS),man/$(t).1) $(foreach t,$(PVE_TOOLS),man/$(t).1) $(foreach t,$(PYTHON_TOOLS),man/$(t).1)
 	@echo "  man pages generated"
 
 # Per-tool man generation rule
@@ -369,25 +377,10 @@ $(foreach t,$(PVE_TOOLS),man/$(t).1): man/%.1: pve/tools/% scripts/registry-to-m
 	@scripts/registry-to-man $< man/ >/dev/null
 	@echo "  generated man/$$(basename $@)"
 
-# Website content generation from help registry (§10 of toolkit spec)
-website: $(foreach t,$(CORE_TOOLS),website/tools/$(t).md) $(foreach t,$(PVE_TOOLS),website/tools/$(t).md)
-	@echo "  website tool pages generated"
-
-website/tools/%.md: tools/% scripts/registry-to-markdown lib/lamboot-toolkit-help.sh
-	@mkdir -p website/tools
-	@scripts/registry-to-markdown $< website/tools/ >/dev/null
-	@echo "  generated website/tools/$$(basename $@)"
-
-$(foreach t,$(PVE_TOOLS),website/tools/$(t).md): website/tools/%.md: pve/tools/% scripts/registry-to-markdown lib/lamboot-toolkit-help.sh
-	@mkdir -p website/tools
-	@scripts/registry-to-markdown $< website/tools/ >/dev/null
-	@echo "  generated website/tools/$$(basename $@)"
-
-serve-website:
-	@cd website && mkdocs serve -a 127.0.0.1:8001
-
-build-website: website
-	@cd website && mkdocs build -d build/ 2>&1 | tail -20
+# Website doc generation retired. The detailed documentation lives in docs/ as
+# standalone documents and is adapted to the website manually by the website
+# manager (see pipelines/lamboot-tools/website/). man pages (above) remain the
+# generated quick-reference; there is no site generator in this repo.
 
 clean:
 	rm -rf $(BUILD_DIR)

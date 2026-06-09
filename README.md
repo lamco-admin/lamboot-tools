@@ -2,7 +2,7 @@
 
 The Linux UEFI boot toolkit — a suite of standalone CLI tools for boot
 diagnosis, ESP management, backup, repair, migration, UKI building, and
-Secure Boot key handling. Companion to [LamBoot](https://github.com/lamco-admin/lamboot-dev),
+Secure Boot key handling. Companion to [LamBoot](https://lamco.ai/products/lamboot/),
 but every tool works on any UEFI Linux system regardless of which
 bootloader is installed.
 
@@ -22,6 +22,7 @@ the Proxmox VE companion tools.
 |---|---|
 | `lamboot-diagnose` | Read-only scan of the UEFI boot chain across 11 categories, with remediation commands |
 | `lamboot-esp` | ESP health check, inventory, stale-file cleanup, and (offline) deploy |
+| `lamboot-nvram` | UEFI boot-entry (`Boot####`/`BootOrder`) inventory, dead-entry cleanup, and restore — online or against an offline OVMF VARS image |
 | `lamboot-backup` | Save / restore / show / list UEFI boot-config snapshots (NVRAM, boot order, Secure Boot state) |
 | `lamboot-repair` | Diagnose-plan-confirm-execute-verify boot repair, online or against an offline disk |
 | `lamboot-migrate` | BIOS→UEFI conversion, cross-bootloader migration, post-conversion verification, rollback |
@@ -37,6 +38,7 @@ the Proxmox VE companion tools.
 |---|---|
 | `lamboot-pve-setup` | Per-VM LamBoot integration setup on a Proxmox host |
 | `lamboot-pve-fleet` | Fleet-wide inventory, setup, and reporting |
+| `lamboot-pve-migrate` | Host-side BIOS→UEFI migration lifecycle for Proxmox guests (snapshot, convert, verify, rollback) |
 | `lamboot-pve-monitor` | Host-side reader of guest NVRAM boot-health state |
 | `lamboot-pve-ovmf-vars` | Build OVMF_VARS.fd with a cert pre-enrolled in db |
 
@@ -45,14 +47,13 @@ Start with `lamboot-toolkit status` to see what's installed, or
 
 ## Versioning
 
-lamboot-tools uses a **hybrid** version model (per
-`docs/SPEC-LAMBOOT-TOOLKIT-V1.md` §8): a unified toolkit umbrella
+lamboot-tools uses a **hybrid** version model: a unified toolkit umbrella
 version bundles per-tool semantic versions. Each tool reports both via
 `--version`:
 
 ```
 $ lamboot-diagnose --version
-lamboot-diagnose 0.7.3 (lamboot-tools 0.7.12)
+lamboot-diagnose 0.7.3 (lamboot-tools 0.9.1)
 ```
 
 The umbrella version (`lamboot-tools X.Y.Z`) is the release tag; a tool's
@@ -103,6 +104,7 @@ Every tool shares one command shape and flag set:
 ```
 lamboot-diagnose      scan
 lamboot-esp           check · inventory · clean · deploy
+lamboot-nvram         inventory · clean · restore
 lamboot-backup        save · restore · show · list
 lamboot-repair        repair
 lamboot-doctor        check
@@ -146,26 +148,24 @@ sudo lamboot-doctor          # guided diagnose → repair
 ## Installation
 
 ```bash
-git clone https://github.com/lamco-admin/lamboot-tools-dev.git
-cd lamboot-tools-dev
+git clone https://github.com/lamco-admin/lamboot-tools.git
+cd lamboot-tools
 sudo make install            # core suite + man pages
-# Proxmox companion:
-sudo make install-pve        # see `make help` for targets
+sudo make install-pve        # optional: Proxmox VE companion
 sudo make uninstall
 ```
 
 ## Documentation
 
+- **Website:** <https://lamco.ai/products/lamboot-tools/>
+- **Install / download:** <https://github.com/lamco-admin/lamboot-tools/releases> (signed release tarball)
+- **Repository:** <https://github.com/lamco-admin/lamboot-tools>
 - Per-tool man pages: `man lamboot-diagnose`, `man lamboot-tools` (suite overview), `man lamboot-tools-schema` (JSON schema)
-- Specs: `docs/` (`SPEC-LAMBOOT-*` — the design contract per tool)
-- Website: <https://lamboot.dev/tools/>
-- `README.md` — documentation index
 
 ## Related
 
-- [LamBoot](https://github.com/lamco-admin/lamboot-dev) — the memory-safe UEFI bootloader
-- The tools are bootloader-agnostic; LamBoot is the reference target
+- [LamBoot](https://lamco.ai/products/lamboot/) — the memory-safe UEFI bootloader. The tools are bootloader-agnostic; LamBoot is the reference target.
 
-## License
+## About
 
-MIT OR Apache-2.0
+lamboot-tools is developed by **Lamco Development LLC** (<https://lamco.ai/about/>) and is licensed under **MIT OR Apache-2.0**.

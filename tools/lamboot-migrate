@@ -8,7 +8,7 @@
 # Subcommands:
 #   to-uefi [OPTIONS]    Convert BIOS/MBR system to UEFI/GPT (10-phase pipeline)
 #   to-lamboot [OPTIONS] Migrate UEFI system from competing bootloader to LamBoot
-#   verify [OPTIONS]     Run 11-check post-conversion verification
+#   verify [OPTIONS]     Run 12-check post-conversion verification
 #   rollback [OPTIONS]   Revert the most recent to-uefi run using backup dir
 #   status               Show current boot configuration
 #
@@ -21,7 +21,7 @@ source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
 source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
 
 LAMBOOT_TOOL_NAME="lamboot-migrate"
-LAMBOOT_TOOL_VERSION="0.7.3"
+LAMBOOT_TOOL_VERSION="0.7.6"
 
 # ── Tool-specific options ────────────────────────────────────────────────
 OPT_SUBCOMMAND=""
@@ -92,7 +92,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "true" \
         --see-also "to-lamboot, verify, rollback, status" \
-        --doc-url "https://lamboot.dev/tools/migrate/to-uefi" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "stable"
 
     register_subcommand \
@@ -110,17 +110,17 @@ _register_subcommands() {
         --example "sudo lamboot-migrate to-lamboot --unsigned    # SB-off systems" \
         --example "sudo lamboot-migrate to-lamboot --remove-grub    # asks for confirmation" \
         --example "sudo lamboot-migrate to-lamboot --remove-grub --force" \
-        --notes "Invokes lamboot-install. Default is --signed (Secure Boot path: lambootx64-signed.efi shipped from /usr/share/lamboot/). Pass --unsigned to install the unsigned binary on SB-off systems (must still be installed from /usr/share/lamboot/ but lamboot-install will use lambootx64.efi instead). With --preserve-grub (default) the prior bootloader stays as a UEFI fallback. With --remove-grub the tool runs verify first; if all 11 checks pass, it uninstalls the distro's GRUB packages, removes GRUB files from the ESP, and deletes GRUB Boot#### entries from NVRAM. Refuses to remove if verify fails. Requires typed-yes confirmation unless --force." \
+        --notes "Invokes lamboot-install. Default is --signed (Secure Boot path: lambootx64-signed.efi shipped from /usr/share/lamboot/). Pass --unsigned to install the unsigned binary on SB-off systems (must still be installed from /usr/share/lamboot/ but lamboot-install will use lambootx64.efi instead). With --preserve-grub (default) the prior bootloader stays as a UEFI fallback. With --remove-grub the tool runs verify first; if all 12 checks pass, it uninstalls the distro's GRUB packages, removes GRUB files from the ESP, and deletes GRUB Boot#### entries from NVRAM. Refuses to remove if verify fails. Requires typed-yes confirmation unless --force." \
         --offline-capable "false" \
         --requires-root "true" \
         --see-also "to-uefi, rollback" \
-        --doc-url "https://lamboot.dev/tools/migrate/to-lamboot" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "stable"
 
     register_subcommand \
         --name "verify" \
         --category "Verification" \
-        --summary "Run the 11-check post-conversion verification suite" \
+        --summary "Run the 12-check post-conversion verification suite" \
         --syntax "lamboot-migrate verify [--all] [--path BACKUP-DIR] [--json]" \
         --arg "--all:Run all checks (default)" \
         --arg "--path PATH:Verify a backup directory produced by --backup-dir" \
@@ -131,7 +131,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "to-uefi, rollback" \
-        --doc-url "https://lamboot.dev/tools/migrate/verify" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "stable"
 
     register_subcommand \
@@ -147,7 +147,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "true" \
         --see-also "to-uefi, verify" \
-        --doc-url "https://lamboot.dev/tools/migrate/rollback" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "stable"
 
     register_subcommand \
@@ -161,18 +161,27 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "to-uefi, verify" \
-        --doc-url "https://lamboot.dev/tools/migrate/status" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "stable"
 }
 
 # ── Phase 1 preflight guardrails (SDS-7 §5) ──────────────────────────────
 
 guard_boot_mode_is_bios() {
+    # Method B converts a BIOS *target* disk while booted from a UEFI live ISO.
+    # The live environment's own UEFI firmware (/sys/firmware/efi present) is
+    # REQUIRED for Method B — it must not be mistaken for "the running system is
+    # already UEFI, nothing to do". Only the in-place path (Method A / auto on
+    # the running system, where the running system IS the target) treats a UEFI
+    # /sys/firmware/efi as a no-op.
+    if [[ "$OPT_METHOD" == "B" ]]; then
+        return 0
+    fi
     if [[ -d /sys/firmware/efi ]]; then
         emit_finding "migrate.boot_mode.already_uefi" "firmware" "info" "pass" \
             "System is already UEFI" \
             "No BIOS→UEFI conversion needed; boot mode is UEFI." \
-            "{}" '{"summary":"Run lamboot-migrate to-lamboot if you want to switch to LamBoot","command":"lamboot-migrate to-lamboot","doc_url":"https://lamboot.dev/tools/migrate/to-lamboot"}'
+            "{}" '{"summary":"Run lamboot-migrate to-lamboot if you want to switch to LamBoot","command":"lamboot-migrate to-lamboot","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
         die_noop "system is already UEFI"
     fi
 }
@@ -187,7 +196,7 @@ guard_required_tools() {
             "Required tools not found" \
             "Missing: ${missing[*]}. Install gdisk + dosfstools + efibootmgr + util-linux." \
             "{\"missing\":[\"$(printf '%s' "${missing[*]}" | sed 's/ /","/g')\"]}" \
-            '{"summary":"Install required tools via your package manager","command":"sudo apt install gdisk dosfstools efibootmgr || sudo dnf install gdisk dosfstools efibootmgr","doc_url":"https://lamboot.dev/tools/migrate/prerequisites"}'
+            '{"summary":"Install required tools via your package manager","command":"sudo apt install gdisk dosfstools efibootmgr || sudo dnf install gdisk dosfstools efibootmgr","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
         die_prerequisite "required tools missing: ${missing[*]}"
     fi
 }
@@ -197,12 +206,19 @@ guard_root_not_on_lvm_or_crypt() {
     root_source=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/\[.*\]//')
 
     if [[ "$root_source" == /dev/mapper/* ]]; then
-        if command -v cryptsetup >/dev/null 2>&1 && cryptsetup status "$(basename "$root_source")" >/dev/null 2>&1; then
+        # `cryptsetup status` exits 0 for ANY active device-mapper node — an LVM
+        # LV included — printing "type: n/a" for non-crypt. Confirm a real crypt
+        # mapping (LUKS/PLAIN) so an LVM root is not misreported as encrypted;
+        # otherwise this branch shadows the LVM check below for every LVM root
+        # (observed on RHEL 9.7: XFS-root-on-LVM reported as dm-crypt).
+        if command -v cryptsetup >/dev/null 2>&1 \
+            && cryptsetup status "$(basename "$root_source")" 2>/dev/null \
+                | grep -qiE '^[[:space:]]*type:[[:space:]]*(LUKS|PLAIN)'; then
             emit_finding "migrate.preflight.encrypted_root" "preflight" "critical" "fail" \
                 "Root filesystem is on dm-crypt" \
                 "Encrypted-root BIOS→UEFI migration is not automated in v1.0 (too much risk)." \
                 "{}" \
-                '{"summary":"Manual migration path — see documentation","doc_url":"https://lamboot.dev/tools/migrate/encrypted-root"}'
+                '{"summary":"Manual migration path — see documentation","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
             die_unsafe "root on dm-crypt — automated conversion refused"
         fi
 
@@ -211,7 +227,7 @@ guard_root_not_on_lvm_or_crypt() {
                 "Root filesystem is on LVM" \
                 "LVM-root BIOS→UEFI migration is not automated in v1.0." \
                 "{}" \
-                '{"summary":"Manual migration path — see documentation","doc_url":"https://lamboot.dev/tools/migrate/lvm-root"}'
+                '{"summary":"Manual migration path — see documentation","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
             die_unsafe "root on LVM — automated conversion refused"
         fi
     fi
@@ -296,7 +312,7 @@ guard_no_windows() {
                 "$detail" \
                 "Windows dual-boot with MBR→GPT conversion requires BCD rewriting, not automated in v1.0." \
                 "{\"disk\":\"$(json_escape "$disk")\",\"ntfs_partition\":\"$(json_escape "${ntfs_part:-unknown}")\",\"detection\":\"${bmgr:-partition-type}\"}" \
-                '{"summary":"Manual dual-boot migration","doc_url":"https://lamboot.dev/tools/migrate/dual-boot"}'
+                '{"summary":"Manual dual-boot migration","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
             die_unsafe "Windows present on $disk — refusing automated conversion"
         fi
     fi
@@ -312,7 +328,7 @@ guard_fstab_uuid_form() {
             "fstab contains device-path entries" \
             "${dev_entries} fstab entries use /dev/ paths. These may break after MBR→GPT conversion. Phase 6 will rewrite them to UUID= form." \
             "{\"count\":${dev_entries}}" \
-            '{"summary":"Phase 6 rewrites automatically; nothing to do","doc_url":"https://lamboot.dev/tools/migrate/fstab"}'
+            '{"summary":"Phase 6 rewrites automatically; nothing to do","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
     fi
 }
 
@@ -404,7 +420,7 @@ guard_disk_free_space() {
             "Will shrink last partition to make room for ESP" \
             "No unallocated space at end of $disk; Phase 3b will shrink ${last_part_dev} (ext4, ~${shrinkable_mb} MB shrinkable) from ${part_size_mb} MB to ${new_part_mb} MB to free ${need_mb} MB for the ESP." \
             "{\"disk\":\"$(json_escape "$disk")\",\"shrink_part\":\"$(json_escape "$last_part_dev")\",\"shrinkable_mb\":${shrinkable_mb},\"need_mb\":${need_mb},\"current_mb\":${part_size_mb},\"new_part_mb\":${new_part_mb}}" \
-            '{"summary":"Phase 3b will resize2fs + sfdisk shrink before MBR→GPT","doc_url":"https://lamboot.dev/tools/migrate/disk-space"}'
+            '{"summary":"Phase 3b will resize2fs + sfdisk shrink before MBR→GPT","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
         warn "no unallocated space; Phase 3b will shrink $last_part_dev to ${new_part_mb} MB (was ${part_size_mb} MB)"
         return 0
     fi
@@ -414,7 +430,7 @@ guard_disk_free_space() {
         "Insufficient free space at end of disk" \
         "Need ${need_mb} MB for ESP; ${free_mb} MB unallocated, ${shrinkable_mb} MB shrinkable from last partition (${last_part_dev:-none}, ${last_part_fstype:-unknown})." \
         "{\"disk\":\"$(json_escape "$disk")\",\"free_mb\":${free_mb},\"shrinkable_mb\":${shrinkable_mb},\"need_mb\":${need_mb}}" \
-        '{"summary":"Use a smaller --esp-size or attach a second disk","doc_url":"https://lamboot.dev/tools/migrate/disk-space"}'
+        '{"summary":"Use a smaller --esp-size or attach a second disk","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
 
     if [[ $LAMBOOT_FORCE -eq 0 ]]; then
         die "insufficient free space for ESP ($free_mb MB free, $shrinkable_mb MB shrinkable, need $need_mb MB)"
@@ -940,7 +956,7 @@ _capcheck_readiness_gate() {
             "Capability audit found critical firmware quirks: $id_list" \
             "lamboot-capcheck matched one or more quirks marked 'critical' against this hardware. Migration is unsafe until these are addressed. Run \`lamboot-capcheck quirks --list\` for details." \
             "{\"quirk_ids\":\"$(json_escape "$id_list")\"}" \
-            '{"summary":"Resolve quirks before retrying","command":"lamboot-capcheck quirks --list","doc_url":"https://lamboot.dev/migrate/preflight#critical-quirks"}'
+            '{"summary":"Resolve quirks before retrying","command":"lamboot-capcheck quirks --list","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
         die_prerequisite "capcheck preflight: critical quirks block migration ($id_list)"
     fi
 
@@ -1039,7 +1055,7 @@ to_uefi_phase_3b_pre_mbr_to_gpt_shrink() {
             "Cannot shrink mounted filesystem $shrink_dev (at $mountpoint)" \
             "ext4 online resize supports growing only, never shrinking. Boot from a live ISO and re-run with --method=B." \
             "{\"device\":\"$(json_escape "$shrink_dev")\",\"mountpoint\":\"$(json_escape "$mountpoint")\"}" \
-            '{"summary":"Boot live media + retry","doc_url":"https://lamboot.dev/tools/migrate/method-b"}'
+            '{"summary":"Boot live media + retry","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
         die "cannot shrink mounted $shrink_dev; reboot into live ISO and re-run with --method=B"
     fi
 
@@ -1097,7 +1113,7 @@ to_uefi_phase_4_mbr_to_gpt() {
                 "sgdisk --mbrtogpt aborted write" \
                 "sgdisk printed 'Aborting write' (overlap with secondary GPT header). Phase 3b should have pre-shrunk the last partition." \
                 "{\"disk\":\"$(json_escape "$OPT_DISK")\"}" \
-                '{"summary":"This is a bug — Phase 3b should run first","doc_url":"https://lamboot.dev/tools/migrate/overlap"}'
+                '{"summary":"This is a bug — Phase 3b should run first","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
             die "sgdisk --mbrtogpt aborted write (overlap with secondary GPT header)"
         fi
         if [[ $sg_rc -ne 0 ]]; then
@@ -1178,6 +1194,10 @@ to_uefi_phase_5_create_esp() {
     # capture and corrupt esp_dev with command chatter like
     # "Creating new GPT entries in memory." or "mkfs.fat 4.2 (2021-01-31)".
     LAMBOOT_PHASE5_ESP_DEV="$esp_dev"
+    # Persist the partition number too: Phase 9 needs it for efibootmgr --part,
+    # and re-deriving it there via `sgdisk -p` returns empty in dry-run (no GPT
+    # was actually written) and is redundant work in a real run.
+    LAMBOOT_PHASE5_ESP_PARTNUM="$esp_partnum"
 }
 
 to_uefi_phase_5b_mount_target() {
@@ -1370,9 +1390,14 @@ to_uefi_phase_8_install_bootloader() {
                 target_run lamboot-install --set-default \
                     || die "lamboot-install failed"
                 record_action "bootloader.lamboot.install" "/boot/efi/EFI/LamBoot" "ok" "false" '{}' "null"
+            elif [[ $LAMBOOT_DRY_RUN -eq 1 && -n "$LAMBOOT_TARGET_ROOT" ]]; then
+                # The Phase 5b target mount was a dry-run no-op, so the target's
+                # /usr/bin is not actually populated here — detection can't run.
+                # A real run mounts the target first and finds lamboot-install.
+                printf 'DRY-RUN: would run lamboot-install --set-default in target (detection skipped: target not mounted in dry-run)\n' >&2
             else
                 warn "lamboot-install not found in target; GRUB installed as fallback"
-                warn "install LamBoot later: https://lamboot.dev/install"
+                warn "install LamBoot later: https://github.com/lamco-admin/lamboot-tools"
             fi
             ;;
         systemd-boot)
@@ -1408,8 +1433,13 @@ to_uefi_phase_9_uefi_entry() {
         return 0
     fi
 
-    local esp_partnum
-    esp_partnum=$(sgdisk -p "$OPT_DISK" 2>/dev/null | awk '$6 == "EF00" {print $1}' | head -1 || true)
+    # Prefer the partnum Phase 5 recorded; fall back to deriving it from the live
+    # GPT only if that global is somehow unset (e.g. Phase 5 was skipped because
+    # an ESP already existed and the run resumed mid-pipeline).
+    local esp_partnum="${LAMBOOT_PHASE5_ESP_PARTNUM:-}"
+    if [[ -z "$esp_partnum" ]]; then
+        esp_partnum=$(sgdisk -p "$OPT_DISK" 2>/dev/null | awk '$6 == "EF00" {print $1}' | head -1 || true)
+    fi
     [[ -n "$esp_partnum" ]] || die "cannot determine ESP partition number for efibootmgr"
 
     local distro
@@ -1465,6 +1495,11 @@ populate_fallback_path() {
         target_run cp "$source_loader" /boot/efi/EFI/BOOT/BOOTX64.EFI
         record_action "uefi.fallback_path.populate" "/boot/efi/EFI/BOOT/BOOTX64.EFI" "ok" "false" \
             "{\"source\":\"$(json_escape "$source_loader")\"}" "null"
+    elif [[ $LAMBOOT_DRY_RUN -eq 1 ]]; then
+        # Phase 8's bootloader install was a dry-run no-op, so its loader was
+        # never written to the ESP — there's nothing to copy yet. A real run
+        # installs the loader first, then this finds and mirrors it.
+        printf 'DRY-RUN: would copy %s → /boot/efi/EFI/BOOT/BOOTX64.EFI (source not present under --dry-run)\n' "$source_loader" >&2
     else
         warn "could not find a source loader for fallback path population"
     fi
@@ -1555,7 +1590,7 @@ to_uefi_phase_10_verify() {
 
     if [[ $fail_count -eq 0 ]]; then
         backup_success "$OPT_BACKUP_DIR"
-        success "Phase 10 — all 11 verification checks passed"
+        success "Phase 10 — all 12 verification checks passed"
     else
         warn "Phase 10 — $fail_count verification check(s) failed; system in EXIT_PARTIAL state"
         warn "run 'lamboot-migrate verify' to inspect, or 'lamboot-migrate rollback' to revert"
@@ -1648,7 +1683,7 @@ do_to_lamboot() {
             "System is not booted in UEFI mode" \
             "Run 'lamboot-migrate to-uefi' first to convert BIOS/MBR to UEFI/GPT." \
             "{}" \
-            '{"summary":"Run to-uefi first","command":"sudo lamboot-migrate to-uefi","doc_url":"https://lamboot.dev/tools/migrate/to-uefi"}'
+            '{"summary":"Run to-uefi first","command":"sudo lamboot-migrate to-uefi","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
         emit_json "$EXIT_NOT_APPLICABLE"
         exit "$EXIT_NOT_APPLICABLE"
     fi
@@ -1704,7 +1739,7 @@ do_to_lamboot() {
 # ── --remove-grub: uninstall prior bootloader after LamBoot is verified ──
 #
 # Flow:
-#   1. Run the full 11-check verify pass. Refuse to remove if any fail.
+#   1. Run the full 12-check verify pass. Refuse to remove if any fail.
 #   2. Confirm with typed-yes (unless --force / --yes / --auto).
 #   3. Snapshot the NVRAM + GRUB package list into $backup_dir for rollback.
 #   4. Distro-aware package uninstall (apt/dnf/pacman/zypper/generic).
@@ -1891,7 +1926,7 @@ _remove_grub() {
     success "GRUB removed. To restore, use: sudo lamboot-migrate rollback --backup-dir $backup_dir"
 }
 
-# ── verify (SDS-7 §2.3, 11 checks) ───────────────────────────────────────
+# ── verify (SDS-7 §2.3, 12 checks) ───────────────────────────────────────
 
 verify_check_1_boot_mode_uefi() {
     if [[ -d /sys/firmware/efi ]]; then
@@ -1901,7 +1936,7 @@ verify_check_1_boot_mode_uefi() {
     fi
     emit_finding "migrate.verify.boot_mode" "verify" "critical" "fail" \
         "Check 1: Boot mode is NOT UEFI" "/sys/firmware/efi not present." "{}" \
-        '{"summary":"Switch firmware from Legacy/CSM to UEFI","doc_url":"https://lamboot.dev/tools/migrate/firmware-setup"}'
+        '{"summary":"Switch firmware from Legacy/CSM to UEFI","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
     return 1
 }
 
@@ -1919,7 +1954,7 @@ verify_check_2_disk_is_gpt() {
     emit_finding "migrate.verify.gpt" "verify" "error" "fail" \
         "Check 2: Disk is NOT GPT" "Partition table on $disk is '$pttype' (expected gpt)." \
         "{\"disk\":\"$(json_escape "$disk")\",\"pttype\":\"$pttype\"}" \
-        '{"summary":"Run lamboot-migrate to-uefi","command":"sudo lamboot-migrate to-uefi","doc_url":"https://lamboot.dev/tools/migrate/to-uefi"}'
+        '{"summary":"Run lamboot-migrate to-uefi","command":"sudo lamboot-migrate to-uefi","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
     return 1
 }
 
@@ -1951,7 +1986,7 @@ verify_check_3_esp_exists_ef00() {
         "Check 3: No ESP partition found" \
         "No partition on any disk has type EF00." \
         "{}" \
-        '{"summary":"Create ESP via lamboot-migrate to-uefi","command":"sudo lamboot-migrate to-uefi","doc_url":"https://lamboot.dev/tools/migrate/esp"}'
+        '{"summary":"Create ESP via lamboot-migrate to-uefi","command":"sudo lamboot-migrate to-uefi","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
     return 1
 }
 
@@ -1971,7 +2006,7 @@ verify_check_4_esp_mounted() {
     emit_finding "migrate.verify.esp_mounted" "verify" "error" "fail" \
         "Check 4: ESP not mounted" \
         "Neither /boot/efi nor /efi is a vfat mountpoint." "{}" \
-        '{"summary":"Mount the ESP","command":"sudo mount /boot/efi","doc_url":"https://lamboot.dev/tools/migrate/esp"}'
+        '{"summary":"Mount the ESP","command":"sudo mount /boot/efi","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
     return 1
 }
 
@@ -1994,7 +2029,7 @@ verify_check_5_efibootmgr_entries() {
     fi
     emit_finding "migrate.verify.efibootmgr" "verify" "error" "fail" \
         "Check 5: No UEFI boot entries" "efibootmgr shows 0 entries." "{}" \
-        '{"summary":"Create boot entry via bootloader reinstall","doc_url":"https://lamboot.dev/tools/migrate/uefi-entries"}'
+        '{"summary":"Create boot entry via bootloader reinstall","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
     return 1
 }
 
@@ -2008,7 +2043,7 @@ verify_check_6_fallback_path() {
     emit_finding "migrate.verify.fallback_path" "verify" "warning" "fail" \
         "Check 6: Fallback path missing" \
         "/boot/efi/EFI/BOOT/BOOTX64.EFI not present (removable/portable boot will not work)." "{}" \
-        '{"summary":"Run to-uefi which populates the fallback path","command":"sudo lamboot-migrate to-uefi","doc_url":"https://lamboot.dev/tools/migrate/fallback"}'
+        '{"summary":"Run to-uefi which populates the fallback path","command":"sudo lamboot-migrate to-uefi","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
     return 1
 }
 
@@ -2022,7 +2057,7 @@ verify_check_7_bootloader_pe32() {
         emit_finding "migrate.verify.pe32_bootloader" "verify" "error" "fail" \
             "Check 7: No bootloader binary found" \
             "No grubx64.efi, lambootx64.efi, or systemd-bootx64.efi on ESP." "{}" \
-            '{"summary":"Reinstall the bootloader","doc_url":"https://lamboot.dev/tools/migrate/bootloader"}'
+            '{"summary":"Reinstall the bootloader","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
         return 1
     fi
 
@@ -2040,7 +2075,7 @@ verify_check_7_bootloader_pe32() {
         "Check 7: Bootloader is NOT PE32+" \
         "$found is not a UEFI binary (may be BIOS GRUB instead)." \
         "{\"path\":\"$(json_escape "$found")\",\"type\":\"$(json_escape "$info")\"}" \
-        '{"summary":"Reinstall with --target=x86_64-efi","doc_url":"https://lamboot.dev/tools/migrate/bootloader"}'
+        '{"summary":"Reinstall with --target=x86_64-efi","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
     return 1
 }
 
@@ -2058,7 +2093,7 @@ verify_check_8_fstab_uses_uuids() {
         "Check 8: fstab still has /dev/ paths" \
         "${dev_entries} fstab entries use /dev/ paths." \
         "{\"count\":${dev_entries}}" \
-        '{"summary":"Rewrite fstab to UUID form","doc_url":"https://lamboot.dev/tools/migrate/fstab"}'
+        '{"summary":"Rewrite fstab to UUID form","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
     return 1
 }
 
@@ -2075,7 +2110,7 @@ verify_check_9_boot_has_kernels() {
     emit_finding "migrate.verify.kernels_present" "verify" "error" "fail" \
         "Check 9: No kernels in /boot" \
         "/boot has no vmlinuz-* files." "{}" \
-        '{"summary":"Reinstall kernel package","doc_url":"https://lamboot.dev/tools/migrate/kernels"}'
+        '{"summary":"Reinstall kernel package","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
     return 1
 }
 
@@ -2140,6 +2175,40 @@ verify_check_11_rollback_dry_run() {
     return 1
 }
 
+verify_check_12_fallback_identity() {
+    # The firmware-removable fallback (\EFI\BOOT\BOOTX64.EFI) decides what boots
+    # when there is no NVRAM entry. It MUST be byte-identical to the intended
+    # primary loader — not a stale or foreign binary (e.g. GRUB's shim). This is
+    # the md5/sha check the migration case studies do by hand (SPEC §6.1).
+    local fb=/boot/efi/EFI/BOOT/BOOTX64.EFI primary=""
+    local cand
+    for cand in /boot/efi/EFI/LamBoot/lambootx64.efi /boot/efi/EFI/*/grubx64.efi; do
+        [[ -f "$cand" ]] && { primary="$cand"; break; }
+    done
+    if [[ ! -f "$fb" || -z "$primary" ]]; then
+        emit_finding "migrate.verify.fallback_identity" "verify" "info" "skip" \
+            "Check 12: Fallback identity not applicable" \
+            "No fallback path or no primary loader to compare against." "{}" '{}'
+        return 0
+    fi
+    local fb_sha pr_sha
+    fb_sha=$(sha256sum "$fb" 2>/dev/null | awk '{print $1}')
+    pr_sha=$(sha256sum "$primary" 2>/dev/null | awk '{print $1}')
+    if [[ -n "$fb_sha" && "$fb_sha" == "$pr_sha" ]]; then
+        emit_finding "migrate.verify.fallback_identity" "verify" "info" "pass" \
+            "Check 12: Fallback is the intended loader" \
+            "\\EFI\\BOOT\\BOOTX64.EFI is byte-identical to ${primary##*/}." \
+            "{\"sha256\":\"$(json_escape "$fb_sha")\"}" '{}'
+        return 0
+    fi
+    emit_finding "migrate.verify.fallback_identity" "verify" "warning" "fail" \
+        "Check 12: Fallback is NOT the intended loader" \
+        "\\EFI\\BOOT\\BOOTX64.EFI does not match $primary — the firmware fallback may boot a different or stale loader." \
+        "{\"fallback_sha\":\"$(json_escape "$fb_sha")\",\"primary_sha\":\"$(json_escape "$pr_sha")\",\"primary\":\"$(json_escape "$primary")\"}" \
+        '{"summary":"Re-run to-uefi to repopulate the fallback","command":"sudo lamboot-migrate to-uefi","doc_url":"https://github.com/lamco-admin/lamboot-tools"}'
+    return 1
+}
+
 run_verify_checks() {
     local fail=0
     verify_check_1_boot_mode_uefi       || fail=$((fail + 1))
@@ -2153,16 +2222,17 @@ run_verify_checks() {
     verify_check_9_boot_has_kernels     || fail=$((fail + 1))
     verify_check_10_backup_manifest_valid || fail=$((fail + 1))
     verify_check_11_rollback_dry_run    || fail=$((fail + 1))
+    verify_check_12_fallback_identity   || fail=$((fail + 1))
     return $fail
 }
 
 do_verify() {
-    info "Running post-conversion verification (11 checks)"
+    info "Running post-conversion verification (12 checks)"
     local fail=0
     run_verify_checks || fail=$?
 
     if [[ $fail -eq 0 ]]; then
-        success "All 11 verification checks passed"
+        success "All 12 verification checks passed"
         emit_json "$EXIT_OK"
         exit "$EXIT_OK"
     fi
@@ -2319,7 +2389,7 @@ do_status() {
                 "Ready for BIOS→UEFI migration" \
                 "System is BIOS+MBR. Run 'sudo lamboot-migrate to-uefi --disk $disk' to convert." \
                 "{\"action\":\"to-uefi\"}" \
-                "{\"summary\":\"Run to-uefi conversion\",\"command\":\"sudo lamboot-migrate to-uefi --disk $disk\",\"doc_url\":\"https://lamboot.dev/tools/migrate/to-uefi\"}"
+                "{\"summary\":\"Run to-uefi conversion\",\"command\":\"sudo lamboot-migrate to-uefi --disk $disk\",\"doc_url\":\"https://github.com/lamco-admin/lamboot-tools\"}"
         fi
     fi
 
@@ -2386,7 +2456,7 @@ parse_args() {
                fi
                exit 0 ;;
             3) show_version; exit 0 ;;
-            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            4) printf '{"$schema":"https://github.com/lamco-admin/lamboot-tools"}\n'; exit 0 ;;
             5) shift; OPT_DISK="$1"; shift; continue ;;
             0) ;;
         esac

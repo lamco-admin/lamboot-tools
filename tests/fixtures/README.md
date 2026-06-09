@@ -27,7 +27,7 @@ Disk images used by bats integration tests. Not committed to git directly (4 GB 
 ./tests/fixtures/download-fixtures.sh
 ```
 
-Downloads fixtures from the hosting location (`https://fixtures.lamboot.dev/`) and verifies against `fixtures.sha256`. Re-run to fetch only missing fixtures.
+Downloads fixtures from the hosting location (`https://github.com/lamco-admin/lamboot-tools`) and verifies against `fixtures.sha256`. Re-run to fetch only missing fixtures.
 
 ## Regeneration
 
@@ -52,7 +52,7 @@ Output of regen is a new `.raw` file + updated `fixtures.sha256` entry.
 
 ## Hosting
 
-Fixtures are hosted at `https://fixtures.lamboot.dev/` (behind the lamco-admin infrastructure). Public read-only; HTTPS + sha256 verification provides integrity.
+Fixtures are hosted at `https://github.com/lamco-admin/lamboot-tools` (behind the lamco-admin infrastructure). Public read-only; HTTPS + sha256 verification provides integrity.
 
 Hosting bandwidth is rate-limited; CI caches per-fixture on the self-hosted runner to avoid repeat downloads.
 

@@ -47,7 +47,7 @@ fi
 # ── [3/10] syntax ───────────────────────────────────────────────────────
 section "3/10" "bash -n clean across all tools + scripts"
 fails=0
-for f in tools/lamboot-* pve/tools/lamboot-* lib/*.sh scripts/*.sh scripts/inline-tool scripts/registry-to-man scripts/registry-to-markdown publish/*.sh .githooks/pre-commit tests/fixtures/download-fixtures.sh tests/fixtures/regen/*.sh; do
+for f in tools/lamboot-* pve/tools/lamboot-* lib/*.sh scripts/*.sh scripts/inline-tool scripts/registry-to-man publish/*.sh .githooks/pre-commit tests/fixtures/download-fixtures.sh tests/fixtures/regen/*.sh; do
     [[ -f "$f" ]] || continue
     # Skip Python files (lamboot-inspect + package, lamboot-pve-monitor) —
     # they live in tools/ but aren't bash. First-line shebang discriminates.
@@ -99,14 +99,13 @@ done
 [[ -f "man/lamboot-tools-schema.5" ]] || { check_fail "missing man/lamboot-tools-schema.5"; missing=$((missing+1)); }
 [[ $missing -eq 0 ]] && check_pass "13/13 man pages present"
 
-# ── [8/10] website pages ────────────────────────────────────────────────
-section "8/10" "Website pages complete"
+# ── [8/10] documentation set ────────────────────────────────────────────
+section "8/10" "Standalone documentation present in docs/"
 missing=0
-for t in lamboot-diagnose lamboot-esp lamboot-backup lamboot-repair lamboot-migrate lamboot-doctor lamboot-toolkit lamboot-uki-build lamboot-signing-keys lamboot-pve-setup lamboot-pve-fleet; do
-    [[ -f "website/tools/${t}.md" ]] || { check_fail "missing website/tools/${t}.md"; missing=$((missing+1)); }
+for d in QUICK-START.md BIOS-TO-UEFI-MIGRATION.md DIAGNOSE-WORKFLOW.md PROXMOX-FLEET-SETUP.md CLI-CONTRACTS.md EXIT-CODES.md JSON-SCHEMA.md; do
+    [[ -f "docs/${d}" ]] || { check_fail "missing docs/${d}"; missing=$((missing+1)); }
 done
-[[ -f "website/index.md" ]] || { check_fail "missing website/index.md"; missing=$((missing+1)); }
-[[ $missing -eq 0 ]] && check_pass "website pages present"
+[[ $missing -eq 0 ]] && check_pass "documentation set present in docs/"
 
 # ── [9/10] publish scripts + executables ────────────────────────────────
 section "9/10" "Publish scripts ready"

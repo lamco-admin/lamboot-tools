@@ -8,6 +8,147 @@ Versioning: hybrid model per `SPEC-LAMBOOT-TOOLKIT-V1.md` §8 — unified
 
 ---
 
+## [Unreleased]
+
+## [0.9.1] — 2026-06-09 — first public release of the 0.9 line
+
+Umbrella-only release: no tool-behavior changes since 0.9.0. The 0.9.0 work
+(below) was an internal milestone; 0.9.1 is its first public publication, with
+the suite documentation and version metadata brought current. Per-tool versions
+are unchanged from 0.9.0.
+
+### Changed
+
+- **Documentation brought current for publication.** The README, the website,
+  and the `lamboot-tools(7)` suite overview now list `lamboot-nvram` and
+  `lamboot-pve-migrate` (both introduced in 0.9.0). The website install guide
+  leads with the GPG-signed release tarball and no longer advertises channels
+  that are not yet live.
+- **Suite umbrella version `0.9.0 → 0.9.1`**; packaging metadata
+  (`packaging/release.toml`) aligned to the published tag.
+- **Documentation home consolidated.** Per-finding `doc_url` values and the JSON
+  output's `$schema` id now reference the public repository; a defunct
+  placeholder domain was removed across the tools, packaging, and docs.
+  The detailed guides are maintained as standalone documents under `docs/`, and
+  the unused site generator was retired. README links point at the canonical
+  lamco.ai pages.
+
+## [0.9.0] — 2026-06-08 — boot audit & hygiene: inspect verdicts, NVRAM cleanup, PVE migration lifecycle
+
+Minor release. The toolkit gains a boot-audit-and-hygiene capability set: every
+troubleshooting or migration action a human takes now has a corresponding tool,
+each one dry-run-by-default with backup, restore, and logging. Toolkit
+`0.8.2 → 0.9.0`.
+
+Per-tool semvers in this bundle:
+`lamboot-inspect 0.8.3 → 0.9.0`, `lamboot-nvram 0.1.0` (new),
+`lamboot-pve-migrate 0.1.0` (new), `lamboot-pve-fleet 0.7.2 → 0.8.0`,
+`lamboot-doctor 0.7.5 → 0.8.0`, `lamboot-migrate 0.7.5 → 0.7.6`.
+
+### Added
+
+- **`lamboot-nvram` (new tool) — UEFI boot-entry inventory and cleanup.**
+  `inventory` lists every `Boot####` and classifies it (live / dangling /
+  duplicate / dead-OS / orphaned BootOrder), resolving each entry against the
+  partitions actually present. `clean` removes dead entries and `restore` puts
+  them back from a backup. Operates on live `efivarfs` (inventory is
+  unprivileged) or, with `--efidisk FILE`, an offline OVMF_VARS image via
+  `virt-fw-vars`. Never touches `BootCurrent`, the running entry, or the first
+  `BootOrder` slot. Backs up (`efibootmgr` dump) and logs every mutation to
+  `/var/log/lamboot/`.
+- **`lamboot-inspect` `diagnose` — boot-verdict rules engine.** Reads the last
+  boot's trust log and renders a verdict (pass / warn / fail), flagging
+  crash-loops, missing entries, firmware-fallback boots, skipped measurement,
+  kernel mismatch, and explicit load/policy failures. Exit `0` (clean/warnings)
+  or `2` (problems); `--strict` escalates integrity violations to `4`.
+- **`lamboot-inspect` `history` / `diff` / `attest` — audit surfaces.**
+  `history` reads the per-boot log archive; `diff` compares two boots and
+  reports regressions (e.g. a boot that loaded native last time and didn't
+  this time); `attest` surfaces the measured-boot PCRs.
+- **`lamboot-inspect.service` — post-boot oneshot.** Runs
+  `lamboot-inspect diagnose --severity warn` and writes the verdict to the
+  journal (`journalctl -u lamboot-inspect`). Read-only; treats both exit `0`
+  and `2` as a successful *run* — it logs the verdict, never blocks boot.
+- **`lamboot-doctor` `clean` / `restore` — boot hygiene orchestration.**
+  `clean` backs up to a timestamped directory (with a MANIFEST + log), delegates
+  NVRAM cleanup to `lamboot-nvram`, owns ESP-file backup, and stays deferential
+  to the package manager on `/boot`. `restore` requires a backup before it will
+  run. Hygiene surfaces default to ESP + NVRAM (never `/boot`).
+- **`lamboot-pve-migrate` (new tool) — PVE BIOS→UEFI migration lifecycle.**
+  `snapshot` / `prep-uefi` / `finalize-uefi` / `rollback`, with strict
+  power-discipline: the tool never starts, stops, or resets a VM — it refuses
+  (exit `4`, before privilege checks) if the VM is running and leaves power to
+  the operator.
+- **`lamboot-pve-fleet` `verify` / `exec`.** `verify` runs the post-migration
+  check suite across the fleet; `exec` runs a `lamboot-*` tool inside a guest
+  via `qm guest exec`, restricted to the suite's own tools.
+- **`lamboot-migrate` verify check 12 (`fallback_identity`).** Confirms
+  `\EFI\BOOT\BOOTX64.EFI` is byte-identical to the primary loader (status
+  `skip` when not applicable).
+- **`lamboot_toolkit` Python infra package.** The toolkit-owned contracts
+  (exit codes, JSON envelope schema v1, subcommand help-registry) expressed
+  once for every Python tool — the Python analogue of
+  `lib/lamboot-toolkit-lib.sh`. JSON output is byte-compatible with the bash
+  `emit_json`; `summary.status` derives from the exit code identically.
+- **Python tools render man/website from the help registry.**
+  `registry-to-man` and `registry-to-markdown` now detect a Python shebang and
+  extract the registry via `--dump-registry` (the same `0x1F` record envelope
+  the bash tools source), so the three doc surfaces (inline / man / website)
+  stay single-sourced across languages.
+
+### Changed
+
+- Toolkit version `0.8.2 → 0.9.0`; every tool's `--version` reports
+  `lamboot-tools 0.9.0`.
+
+## [0.8.2] — 2026-06-07 — migrate: Method B (live-ISO BIOS→UEFI) end-to-end
+
+Patch release. `lamboot-migrate` 0.7.4 → 0.7.5; toolkit 0.8.1 → 0.8.2. Three
+fixes that, together, make `to-uefi --method=B` complete a real BIOS→UEFI→LamBoot
+conversion. Validated end-to-end on Ubuntu 25.10 (ext4 root, no separate /boot):
+GPT conversion, 550 MB ESP, both kernels' BLS entries on the ESP with the
+`/boot/` prefix, `\EFI\BOOT\BOOTX64.EFI` fallback byte-identical to LamBoot.
+
+### Fixed
+
+- **`to-uefi --method=B` no longer aborts with "system is already UEFI".**
+  `guard_boot_mode_is_bios` treated any present `/sys/firmware/efi` as "nothing
+  to convert" and `die_noop`'d. But Method B runs from a UEFI live ISO converting
+  a BIOS *target* disk — the live environment's own UEFI firmware is required,
+  not a no-op. The guard now returns early for Method B; the in-place methods
+  (A / auto on the running system) keep the already-UEFI short-circuit.
+- **`to-uefi` Phase 9 no longer fails with "cannot determine ESP partition
+  number for efibootmgr".** Phase 5 computed the ESP partition number but
+  persisted only the device path (`LAMBOOT_PHASE5_ESP_DEV`); Phase 9 re-derived
+  the number from `sgdisk -p`, which returns nothing under `--dry-run` (no GPT
+  was actually written) and is redundant on a real run. Phase 5 now also records
+  `LAMBOOT_PHASE5_ESP_PARTNUM` and Phase 9 reuses it, falling back to the live
+  GPT only if that global is unset (mid-pipeline resume with a pre-existing ESP).
+- **`to-uefi --method=B --dry-run` no longer prints misleading warnings.** With
+  the target left unmounted under dry-run, the bootloader-install detection and
+  fallback-path population could not inspect the target and emitted alarming
+  "lamboot-install not found; GRUB installed as fallback" / "could not find a
+  source loader" warnings — neither of which reflects a real run, which mounts
+  the target first. Both now emit honest `DRY-RUN: would …` lines instead.
+
+## [0.8.1] — 2026-06-07 — migrate: LVM root no longer misread as dm-crypt
+
+Patch release. `lamboot-migrate` 0.7.3 → 0.7.4; toolkit 0.8.0 → 0.8.1.
+
+### Fixed
+
+- **`lamboot-migrate to-uefi`: an LVM root is no longer misreported as dm-crypt.**
+  `guard_root_not_on_lvm_or_crypt` trusted `cryptsetup status`'s *exit code*,
+  which is 0 for any active device-mapper node — an LVM LV included (it prints
+  `type: n/a`). So every LVM root tripped the crypt branch and died with
+  `root on dm-crypt — automated conversion refused`, shadowing the accurate
+  `root on LVM` finding directly below it. Observed live on RHEL 9.7
+  (XFS-root-on-LVM, the RHEL default). The check now confirms a real LUKS/PLAIN
+  mapping, so an LVM root correctly reports `root on LVM`. (The refusal itself is
+  unchanged — LVM-root BIOS→UEFI is still out of scope for v1.0 auto-migration.)
+
+---
+
 ## [0.8.0] — 2026-06-03
 
 Re-architecture release. The toolkit returns to a shell-only codebase; the two
@@ -889,7 +1030,7 @@ operations to reach their green state:
   manual.
 - **Integration-test fixture images** — all 11 fixtures have working
   regen scripts in `tests/fixtures/regen/*.sh`, each producing a
-  synthetic image in minutes. Hosting at `fixtures.lamboot.dev` is a
+  synthetic image in minutes. Hosting at `https://lamco.ai/products/lamboot-tools/` is a
   separate step; `download-fixtures.sh` resolves checksums from the
   repo's `fixtures.sha256`. Integration tests skip cleanly when
   fixtures are absent (and will pass once the SHAs are populated).
@@ -925,7 +1066,7 @@ operations to reach their green state:
 - **`scripts/registry-to-man`** — generates `man(1)` pages from help registries.
 - **`scripts/registry-to-markdown`** — generates per-tool website walkthroughs.
 - **11 auto-generated man pages** + `lamboot-tools(7)` suite overview + `lamboot-tools-schema(5)` JSON schema reference.
-- **MkDocs website** at `lamboot.dev/tools/` with landing page, 4 guides (quick-start, BIOS→UEFI migration, Proxmox fleet setup, diagnose workflow), 3 reference pages (CLI contracts, JSON schema, exit codes), per-tool walkthroughs, findings index.
+- **MkDocs website** at `https://lamco.ai/products/lamboot-tools/` with landing page, 4 guides (quick-start, BIOS→UEFI migration, Proxmox fleet setup, diagnose workflow), 3 reference pages (CLI contracts, JSON schema, exit codes), per-tool walkthroughs, findings index.
 - **Fleet-test plan** (`FLEET-TEST-PLAN.md`) with 3-tier model and 26-VM Tier 1 matrix.
 - **Fixture disk image catalog** (`tests/fixtures/`) with download + regen scripts.
 - **Integration tests** (`tests/integration/`) using fixtures; skip gracefully when fixtures absent.

@@ -3,7 +3,7 @@ Version:        0.8.0
 Release:        1%{?dist}
 Summary:        The Linux UEFI boot toolkit: diagnose, repair, migrate
 License:        MIT OR Apache-2.0
-URL:            https://lamboot.dev/tools/
+URL:            https://lamco.ai/products/lamboot-tools/
 Source0:        https://github.com/lamco-admin/%{name}/archive/v%{version}/%{name}-%{version}.tar.gz
 
 # The prebuilt vendored static-musl binaries (lamboot-tools-firmware
@@ -255,7 +255,7 @@ fi
 
 %files
 %license LICENSE-MIT LICENSE-APACHE
-%doc README.md CHANGELOG.md docs/SPEC-LAMBOOT-TOOLKIT-V1.md
+%doc README.md CHANGELOG.md
 
 # Core tools (excluding lamboot-migrate — split into its own subpackage)
 %{_bindir}/lamboot-diagnose
@@ -309,7 +309,7 @@ fi
 
 %files -n lamboot-toolkit-pve
 %license LICENSE-MIT LICENSE-APACHE
-%doc pve/README.md pve/docs/SPEC-LAMBOOT-PVE-SETUP.md pve/docs/SPEC-LAMBOOT-PVE-FLEET.md
+%doc pve/README.md
 
 %{_bindir}/lamboot-pve-setup
 %{_bindir}/lamboot-pve-fleet
@@ -340,7 +340,7 @@ Next steps:
        lamboot-pve-setup doctor-hookscript
   2. Create /etc/lamboot/fleet.toml — see:
        man lamboot-pve-setup
-       https://lamboot.dev/tools/guides/proxmox-fleet-setup
+       https://lamco.ai/products/lamboot-tools/
   3. Run initial inventory:
        lamboot-pve-fleet inventory
 

@@ -1,6 +1,6 @@
 .\" lamboot-tools(7) — suite overview
 .\" Hand-authored; companion to registry-generated (1) pages.
-.TH "LAMBOOT-TOOLS" "7" "2026-04-22" "lamboot-tools 0.7.12" "lamboot-tools"
+.TH "LAMBOOT-TOOLS" "7" "2026-06-08" "lamboot-tools 0.9.1" "lamboot-tools"
 .SH NAME
 lamboot-tools \- The Linux UEFI boot toolkit
 .SH DESCRIPTION
@@ -23,6 +23,12 @@ warning+ finding.
 .BR lamboot-esp (1)
 EFI System Partition health check, inventory, and cleanup. Bootloader-
 critical-safe file removal.
+.TP
+.BR lamboot-nvram (1)
+UEFI boot-entry (\fBBoot####\fR/\fBBootOrder\fR) inventory and cleanup.
+Classifies every entry (live / dangling / duplicate / dead-OS / orphaned),
+removes dead entries and restores from backup, online or against an offline
+OVMF VARS image. Never touches the running entry or the first BootOrder slot.
 .TP
 .BR lamboot-backup (1)
 UEFI boot configuration snapshot and restore. save / restore / show / list
@@ -69,6 +75,10 @@ attachment, per-VM JSON at
 .BR lamboot-pve-fleet (1)
 Fleet-wide inventory, setup, status, and reporting.
 .TP
+.BR lamboot-pve-migrate (1)
+Host-side BIOS\(->UEFI migration lifecycle for Proxmox guests: snapshot,
+convert, verify, and roll back a VM's boot mode from the host.
+.TP
 .BR lamboot-pve-monitor (1)
 Host-side NVRAM health reader for LamBoot VMs.
 .TP
@@ -97,8 +107,8 @@ Every tool emits a consistent envelope when \fB\-\-json\fR is passed:
 {
   "schema_version": "v1",
   "tool": "lamboot-diagnose",
-  "version": "0.7.12",
-  "toolkit_version": "0.7.12",
+  "version": "0.7.3",
+  "toolkit_version": "0.9.1",
   "timestamp": "...",
   "host": "...",
   "run_id": "...",
@@ -183,7 +193,7 @@ hosts diagnosing or repairing unmounted VM disks.
 .TP
 .B LamBoot
 UEFI bootloader by Lamco Development LLC. Available at
-.UR https://lamboot.dev
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 and
 .UR https://github.com/lamco-admin/lamboot-dev
@@ -194,11 +204,11 @@ and
 RDP protocol library. Lamco contributes upstream.
 .SH DOCUMENTATION
 Full documentation at
-.UR https://lamboot.dev/tools/
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 .
 Per-finding deep-dives at
-.UR https://lamboot.dev/tools/findings/
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 (the URLs emitted in every remediation.doc_url field).
 .SH SEE ALSO
@@ -211,6 +221,7 @@ Per-finding deep-dives at
 .BR lamboot-uki-build (1),
 .BR lamboot-signing-keys (1),
 .BR lamboot-toolkit (1),
+.BR lamboot-nvram (1),
 .BR lamboot-tools-schema (5)
 .SH AUTHORS
 .B Lamco Development LLC

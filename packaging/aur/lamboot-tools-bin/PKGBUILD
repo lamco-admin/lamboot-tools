@@ -1,0 +1,102 @@
+# Maintainer: Lamco Development LLC <office@lamco.io>
+#
+# lamboot-tools-bin: the Linux UEFI boot toolkit, packaged from the published
+# release tarball. The shell suite is shipped as-is; the bundled component
+# binaries (lamboot-capcheck, lamboot-reader) are the prebuilt static-musl
+# binaries carried in the tarball under vendor/bin/<arch>/. This is a -bin
+# package (it repackages upstream binaries) because those two components are not
+# yet open-sourced + on crates.io; see ../../PACKAGING.md.
+
+pkgname=lamboot-tools-bin
+_pkgname=lamboot-tools
+pkgver=0.8.0
+pkgrel=1
+pkgdesc="Linux UEFI boot toolkit: diagnose, repair, migrate (GRUB/systemd-boot/rEFInd/Limine/LamBoot)"
+arch=('x86_64' 'aarch64')
+url="https://lamco.ai/products/lamboot-tools/"
+license=('MIT OR Apache-2.0')
+# bash + the userspace the scripts call; python3 for lamboot-inspect.
+depends=('bash' 'python3' 'gawk' 'util-linux' 'coreutils' 'findutils' 'sed'
+         'efibootmgr' 'dosfstools')
+optdepends=('gptfdisk: GPT partitioning for lamboot-migrate'
+            'jq: richer JSON post-processing and the capcheck bridge'
+            'rsync: file migration in lamboot-migrate'
+            'mokutil: Secure Boot MOK enrollment'
+            'sbsigntools: Secure Boot signing in lamboot-signing-keys'
+            'qemu-img: disk-image handling for lamboot-uki-build'
+            'systemd-ukify: Unified Kernel Image builds')
+provides=('lamboot-tools' 'lamboot-capcheck' 'lamboot-reader' 'lamboot-migrate')
+conflicts=('lamboot-tools' 'lamboot-capcheck' 'lamboot-reader' 'lamboot-migrate')
+# Already-stripped static binaries: do not let makepkg re-strip them.
+options=('!strip')
+
+# One published tarball for every arch; it carries vendor/bin for both arches.
+# The render step computes the checksum at publish; SKIP until then.
+source=("${_pkgname}-${pkgver}.tar.gz::https://github.com/lamco-admin/${_pkgname}/releases/download/v${pkgver}/${_pkgname}-${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    cd "${srcdir}/${_pkgname}-${pkgver}"
+
+    # Vendor arch directory name matches Arch's $CARCH (x86_64 / aarch64).
+    local _va="$CARCH"
+    if [ ! -d "vendor/bin/${_va}" ]; then
+        echo "error: no vendored binaries for arch '${_va}' in the tarball" >&2
+        return 1
+    fi
+
+    # Shared library + python helper -> /usr/lib/lamboot-tools (the tools' built-in
+    # default ${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}; not a libdir variant).
+    install -d "${pkgdir}/usr/lib/lamboot-tools"
+    install -Dm0644 lib/lamboot-toolkit-lib.sh     "${pkgdir}/usr/lib/lamboot-tools/lamboot-toolkit-lib.sh"
+    install -Dm0644 lib/lamboot-toolkit-help.sh    "${pkgdir}/usr/lib/lamboot-tools/lamboot-toolkit-help.sh"
+    install -Dm0644 lib/esp-deploy.sh              "${pkgdir}/usr/lib/lamboot-tools/esp-deploy.sh"
+    install -Dm0644 lib/lamboot-capcheck-bridge.sh "${pkgdir}/usr/lib/lamboot-tools/lamboot-capcheck-bridge.sh"
+    install -Dm0755 lib/_nvram_set_first_boot.py   "${pkgdir}/usr/lib/lamboot-tools/_nvram_set_first_boot.py"
+
+    # Shell tools -> /usr/bin
+    install -d "${pkgdir}/usr/bin"
+    local _t
+    for _t in lamboot-diagnose lamboot-esp lamboot-backup lamboot-repair \
+              lamboot-migrate lamboot-doctor lamboot-toolkit lamboot-uki-build \
+              lamboot-signing-keys; do
+        install -Dm0755 "tools/${_t}" "${pkgdir}/usr/bin/${_t}"
+    done
+
+    # lamboot-inspect: real script + sibling package in /usr/lib/lamboot-tools,
+    # relative PATH symlink so the script's realpath-based package lookup works.
+    install -Dm0755 tools/lamboot-inspect "${pkgdir}/usr/lib/lamboot-tools/lamboot-inspect"
+    cp -a tools/lamboot_inspect "${pkgdir}/usr/lib/lamboot-tools/"
+    find "${pkgdir}/usr/lib/lamboot-tools/lamboot_inspect" -type d -exec chmod 0755 {} +
+    find "${pkgdir}/usr/lib/lamboot-tools/lamboot_inspect" -type f -exec chmod 0644 {} +
+    find "${pkgdir}/usr/lib/lamboot-tools/lamboot_inspect" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+    ln -s ../lib/lamboot-tools/lamboot-inspect "${pkgdir}/usr/bin/lamboot-inspect"
+
+    # Vendored component binaries -> /usr/bin (arch-matching). The capcheck bridge
+    # finds lamboot-capcheck via `command -v`; lamboot-reader is a standalone CLI.
+    install -Dm0755 "vendor/bin/${_va}/lamboot-capcheck" "${pkgdir}/usr/bin/lamboot-capcheck"
+    install -Dm0755 "vendor/bin/${_va}/lamboot-reader"   "${pkgdir}/usr/bin/lamboot-reader"
+
+    # Man pages (skip pve pages - those tools are not in this package).
+    local _m
+    for _m in man/*.1; do
+        [ -f "${_m}" ] || continue
+        case "$(basename "${_m}")" in lamboot-pve-*) continue ;; esac
+        install -Dm0644 "${_m}" "${pkgdir}/usr/share/man/man1/$(basename "${_m}")"
+    done
+    [ -f man/lamboot-tools-schema.5 ] && install -Dm0644 man/lamboot-tools-schema.5 "${pkgdir}/usr/share/man/man5/lamboot-tools-schema.5"
+    [ -f man/lamboot-tools.7 ]        && install -Dm0644 man/lamboot-tools.7        "${pkgdir}/usr/share/man/man7/lamboot-tools.7"
+
+    # Licenses -> Arch convention. Include the bundled-binary third-party notices.
+    install -Dm0644 LICENSE-MIT    "${pkgdir}/usr/share/licenses/${_pkgname}/LICENSE-MIT"
+    install -Dm0644 LICENSE-APACHE "${pkgdir}/usr/share/licenses/${_pkgname}/LICENSE-APACHE"
+    local _n
+    for _n in vendor/notices/*.md; do
+        [ -f "${_n}" ] && install -Dm0644 "${_n}" "${pkgdir}/usr/share/licenses/${_pkgname}/$(basename "${_n}")"
+    done
+
+    # Docs: README, CHANGELOG, provenance record.
+    install -Dm0644 README.md    "${pkgdir}/usr/share/doc/${_pkgname}/README.md"
+    install -Dm0644 CHANGELOG.md "${pkgdir}/usr/share/doc/${_pkgname}/CHANGELOG.md"
+    [ -f vendor/BINARY-PROVENANCE.txt ]    && install -Dm0644 vendor/BINARY-PROVENANCE.txt    "${pkgdir}/usr/share/doc/${_pkgname}/BINARY-PROVENANCE.txt"
+}

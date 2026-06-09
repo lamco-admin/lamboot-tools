@@ -8,7 +8,7 @@
 # records into doctor finding objects with stable dotted IDs and the
 # same severity/status vocabulary diagnose uses.
 #
-# Mapping rules (per docs/SPEC-LAMBOOT-DOCTOR.md §3 — capcheck addendum):
+# Mapping rules (capcheck addendum):
 #
 #   capcheck status   →  doctor severity   →  default policy
 #   pass               info                    none (filtered)
@@ -184,7 +184,7 @@ capcheck_to_findings_jq() {
               summary: ($c.remediation // ""),
               command: first_safe_command($c.actions),
               risk: highest_risk($c.actions),
-              doc_url: "https://lamboot.dev/capcheck/\($d.name)"
+              doc_url: "https://github.com/lamco-admin/lamboot-tools\($d.name)"
             }
           }
       ]

@@ -8,7 +8,7 @@
 # specific check in lamboot-diagnose / lamboot-esp / lamboot-migrate.
 #
 # The .raw files themselves are NOT committed (sizes 100MB-500MB,
-# ~3GB total). Hosting decision: upload to fixtures.lamboot.dev OR a
+# ~3GB total). Hosting decision: upload to https://github.com/lamco-admin/lamboot-tools OR a
 # lamco-admin/lamboot-fixtures GitHub release-assets repo.
 # download-fixtures.sh verifies sha256 on fetch.
 

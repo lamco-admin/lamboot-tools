@@ -15,7 +15,7 @@
 # Versioning — single source of truth for the toolkit version
 # ────────────────────────────────────────────────────────────────────────────
 
-readonly LAMBOOT_TOOLKIT_VERSION="0.8.0"
+readonly LAMBOOT_TOOLKIT_VERSION="0.9.1"
 readonly LAMBOOT_TOOLKIT_SCHEMA_VERSION="v1"
 
 # ────────────────────────────────────────────────────────────────────────────

@@ -23,7 +23,7 @@
 #         --example "sudo lamboot-esp check --esp /boot/efi --json" \
 #         --offline-capable true \
 #         --requires-root true \
-#         --doc-url "https://lamboot.dev/tools/esp#check"
+#         --doc-url "https://github.com/lamco-admin/lamboot-tools"
 #
 #     dispatch_help "$@"
 #

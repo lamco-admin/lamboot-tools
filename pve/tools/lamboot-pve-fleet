@@ -5,7 +5,6 @@
 # filters, invokes per-VM setup serially. Reads /etc/lamboot/fleet.toml for
 # defaults.
 #
-# Governed by pve/docs/SPEC-LAMBOOT-PVE-FLEET.md.
 # Part of lamboot-toolkit-pve (SPEC-LAMBOOT-TOOLKIT-V1.md §3.2).
 
 # shellcheck source=../../lib/lamboot-toolkit-lib.sh
@@ -14,9 +13,9 @@ source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
 source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
 
 LAMBOOT_TOOL_NAME="lamboot-pve-fleet"
-LAMBOOT_TOOL_VERSION="0.7.2"
+LAMBOOT_TOOL_VERSION="0.8.0"
 
-readonly DOC_BASE="https://lamboot.dev/tools/findings"
+readonly DOC_BASE="https://github.com/lamco-admin/lamboot-tools"
 readonly DEFAULT_FLEET_CONFIG="/etc/lamboot/fleet.toml"
 readonly FW_CFG_NAME="opt/lamboot/config"
 
@@ -28,6 +27,8 @@ OPT_EXCLUDE=()
 OPT_CONFIG="$DEFAULT_FLEET_CONFIG"
 OPT_RUNNING_OK=0
 OPT_CONTINUE_ON_ERROR=1
+OPT_EXEC_ARGS=()
+OPT_POSITIONAL=()
 
 # Result tallies for fleet setup
 FLEET_SUCCESS=0
@@ -48,7 +49,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "setup, status, report" \
-        --doc-url "https://lamboot.dev/tools/pve-fleet/inventory" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "experimental"
 
     register_subcommand \
@@ -69,7 +70,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "true" \
         --see-also "inventory, status, lamboot-pve-setup" \
-        --doc-url "https://lamboot.dev/tools/pve-fleet/setup" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "experimental"
 
     register_subcommand \
@@ -82,7 +83,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "inventory, report" \
-        --doc-url "https://lamboot.dev/tools/pve-fleet/status" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "experimental"
 
     register_subcommand \
@@ -95,8 +96,34 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "status, inventory" \
-        --doc-url "https://lamboot.dev/tools/pve-fleet/report" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "experimental"
+
+    register_subcommand \
+        --name "verify" --category "Fleet" \
+        --summary "Run guest-side migration/boot verification inside one or all VMs" \
+        --syntax "lamboot-pve-fleet verify [VMID|--all] [--json]" \
+        --arg "VMID:A single Proxmox VMID (omit with --all)" \
+        --arg "--all:Verify every LamBoot-integrated, running VM" \
+        --example "lamboot-pve-fleet verify 129" \
+        --example "lamboot-pve-fleet verify --all --json" \
+        --notes "Runs 'lamboot-migrate verify' inside the guest via the QEMU guest agent and folds the result into the fleet report. Requires the guest agent (agent: 1) and the guest tools installed. Read-only in the guest." \
+        --offline-capable "false" --requires-root "true" \
+        --see-also "inventory, status, exec" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" --maturity "draft"
+
+    register_subcommand \
+        --name "exec" --category "Fleet" \
+        --summary "Run a lamboot guest tool inside a VM from the host" \
+        --syntax "lamboot-pve-fleet exec VMID -- TOOL [ARGS ...]" \
+        --arg "VMID:Proxmox VMID" \
+        --arg "TOOL [ARGS ...]:A lamboot-* guest tool and its arguments (after --)" \
+        --example "lamboot-pve-fleet exec 129 -- lamboot-inspect summary" \
+        --example "lamboot-pve-fleet exec 129 -- lamboot-migrate status --json" \
+        --notes "Runs the named tool inside the guest via the QEMU guest agent and streams its output. Restricted to lamboot-* tools (the host does not become an arbitrary remote shell). Requires the guest agent." \
+        --offline-capable "false" --requires-root "true" \
+        --see-also "verify, status" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" --maturity "draft"
 }
 
 # ── Remediation helper ───────────────────────────────────────────────────
@@ -486,6 +513,81 @@ do_report() {
 
 # ── CLI ──────────────────────────────────────────────────────────────────
 
+# ── Guest execution (verify / exec) ──────────────────────────────────────────
+
+vm_running() { qm status "$1" 2>/dev/null | grep -q 'status: running'; }
+
+# Run a command inside a guest via the QEMU guest agent. Echoes the guest's
+# stdout, returns the guest command's exit code (70 if the agent call failed).
+guest_exec() {
+    local vmid="$1"; shift
+    local raw
+    raw=$(qm guest exec "$vmid" --timeout 60 -- "$@" 2>/dev/null) || return 70
+    LAMBOOT_GE_RAW="$raw" python3 - <<'PY'
+import json, os, sys
+raw = os.environ.get("LAMBOOT_GE_RAW", "")
+try:
+    d = json.loads(raw)
+except Exception:
+    sys.stdout.write(raw); sys.exit(70)
+sys.stdout.write(d.get("out-data", "") or d.get("err-data", "") or "")
+sys.exit(int(d.get("exitcode", 0) or 0))
+PY
+}
+
+do_verify() {
+    require_proxmox_host
+    local targets=()
+    if [[ $OPT_ALL -eq 1 ]]; then
+        while read -r vmid; do
+            [[ -z "$vmid" ]] && continue
+            case "$(determine_state "$vmid")" in full|partial) ;; *) continue ;; esac
+            vm_running "$vmid" || continue
+            targets+=("$vmid")
+        done < <(qm_list_vmids)
+    elif [[ ${#OPT_POSITIONAL[@]} -gt 0 ]]; then
+        targets=("${OPT_POSITIONAL[0]}")
+    else
+        die "verify requires a VMID or --all"
+    fi
+    if [[ ${#targets[@]} -eq 0 ]]; then
+        info "No integrated, running VMs to verify."
+        emit_json "$EXIT_NOOP"; exit "$EXIT_NOOP"
+    fi
+    require_root  # qm guest exec needs root on the host
+
+    local overall=0 vmid out rc
+    for vmid in "${targets[@]}"; do
+        out=$(guest_exec "$vmid" lamboot-migrate verify); rc=$?
+        if [[ $rc -eq 0 ]]; then
+            emit_finding "fleet.verify.${vmid}" "fleet_verify" "info" "pass" \
+                "VM ${vmid}: verify OK" "" "{\"vmid\":\"$vmid\",\"rc\":0}" '{}'
+            success "VM ${vmid}: verify OK"
+        else
+            overall=2
+            emit_finding "fleet.verify.${vmid}" "fleet_verify" "error" "fail" \
+                "VM ${vmid}: verify FAILED (rc=${rc})" \
+                "$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-280)" \
+                "{\"vmid\":\"$vmid\",\"rc\":$rc}" '{}'
+            warn "VM ${vmid}: verify FAILED (rc=${rc})"
+        fi
+    done
+    emit_json "$overall"; exit "$overall"
+}
+
+do_exec() {
+    require_proxmox_host
+    [[ ${#OPT_POSITIONAL[@]} -gt 0 ]] || die "exec requires a VMID"
+    [[ ${#OPT_EXEC_ARGS[@]} -gt 0 ]] || die "exec requires a tool after '--' (e.g. exec VMID -- lamboot-inspect summary)"
+    case "${OPT_EXEC_ARGS[0]}" in
+        lamboot-*) ;;
+        *) die "exec is restricted to lamboot-* tools (got: ${OPT_EXEC_ARGS[0]})" ;;
+    esac
+    require_root
+    guest_exec "${OPT_POSITIONAL[0]}" "${OPT_EXEC_ARGS[@]}"
+    exit $?
+}
+
 parse_args() {
     local positional=()
     while [[ $# -gt 0 ]]; do
@@ -496,7 +598,7 @@ parse_args() {
             2) _register_subcommands; dispatch_help; exit 0 ;;
             3) printf 'lamboot-pve-fleet %s (lamboot-tools %s)\n' \
                 "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
-            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            4) printf '{"$schema":"https://github.com/lamco-admin/lamboot-tools"}\n'; exit 0 ;;
             5) shift; shift; continue ;;
             0) ;;
         esac
@@ -510,17 +612,19 @@ parse_args() {
             --running-ok)           OPT_RUNNING_OK=1; shift ;;
             --continue-on-error)    OPT_CONTINUE_ON_ERROR=1; shift ;;
             --no-continue-on-error) OPT_CONTINUE_ON_ERROR=0; shift ;;
-            inventory|setup|status|report|help)
+            inventory|setup|status|report|verify|exec|help)
                 if [[ -z "$OPT_SUBCOMMAND" ]]; then
                     OPT_SUBCOMMAND="$1"
                 else
                     positional+=("$1")
                 fi
                 shift ;;
+            --) shift; OPT_EXEC_ARGS=("$@"); break ;;
             -*) die "unknown option: $1" ;;
             *)  positional+=("$1"); shift ;;
         esac
     done
+    OPT_POSITIONAL=("${positional[@]+${positional[@]}}")
 
     if [[ "$OPT_SUBCOMMAND" == "help" ]]; then
         _register_subcommands
@@ -542,6 +646,8 @@ main() {
         setup)     do_setup ;;
         status)    do_status ;;
         report)    do_report ;;
+        verify)    do_verify ;;
+        exec)      do_exec ;;
         *)         die "unknown subcommand: $OPT_SUBCOMMAND" ;;
     esac
 }

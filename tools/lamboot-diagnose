@@ -4,7 +4,6 @@
 # Flagship tool of the lamboot-tools suite. Read-only scan of the boot chain
 # across 11 categories; emits findings with remediation commands.
 #
-# Governed by docs/SPEC-LAMBOOT-DIAGNOSE.md.
 # Part of the lamboot-tools suite (SPEC-LAMBOOT-TOOLKIT-V1.md §3.1).
 
 # shellcheck source=../lib/lamboot-toolkit-lib.sh
@@ -17,7 +16,7 @@ LAMBOOT_TOOL_VERSION="0.7.3"
 
 # ── ESP partition type GUID constant ─────────────────────────────────────
 readonly ESP_PARTTYPE_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
-readonly DOC_BASE="https://lamboot.dev/tools/findings"
+readonly DOC_BASE="https://github.com/lamco-admin/lamboot-tools"
 
 # ── Tool-specific flags ──────────────────────────────────────────────────
 OPT_ESP_OVERRIDE=""
@@ -48,11 +47,11 @@ _register_subcommands() {
         --example "sudo lamboot-diagnose --offline /dev/pve/vm-201-disk-1 --json" \
         --example "lamboot-diagnose --category esp --category partition_table" \
         --example "lamboot-diagnose --id esp.free_space" \
-        --notes "Read-only. Runs unprivileged where possible; some checks require root (noted per finding). Every finding at severity warning or above includes a remediation command and documentation URL pointing at lamboot.dev/tools/findings/." \
+        --notes "Read-only. Runs unprivileged where possible; some checks require root (noted per finding). Every finding at severity warning or above includes a remediation command and documentation URL pointing at https://github.com/lamco-admin/lamboot-tools" \
         --offline-capable "true" \
         --requires-root "false" \
         --see-also "lamboot-esp, lamboot-repair, lamboot-migrate" \
-        --doc-url "https://lamboot.dev/tools/diagnose" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "stable"
 }
 
@@ -996,7 +995,7 @@ parse_args() {
             2) _register_subcommands; dispatch_help; exit 0 ;;
             3) printf 'lamboot-diagnose %s (lamboot-tools %s)\n' \
                 "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
-            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            4) printf '{"$schema":"https://github.com/lamco-admin/lamboot-tools"}\n'; exit 0 ;;
             5) shift; OPT_DISK="$1"; shift; continue ;;
             0) ;;
         esac

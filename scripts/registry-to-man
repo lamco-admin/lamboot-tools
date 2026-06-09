@@ -31,6 +31,16 @@ mkdir -p "$OUTPUT_DIR"
 
 # ── Extract static tool metadata without executing main() ───────────────
 
+# Python tools can't be sourced as bash. They emit the identical intermediate
+# envelope (TOOL_NAME=…/---REGISTRY-BEGIN---/0x1F records/---REGISTRY-END---) via
+# their --dump-registry flag (lamboot_toolkit.registry.dump), so the parser below
+# is language-agnostic — only the extraction differs.
+TOOL_SHEBANG="$(head -1 "$TOOL")"
+
+if [[ "$TOOL_SHEBANG" == *python* ]]; then
+    dump=$("$TOOL" --dump-registry 2>/dev/null)
+else
+
 # Extract via source in a subshell where we neuter `main`
 # shellcheck disable=SC1090  # dynamic source path for registry extraction
 dump=$(
@@ -68,6 +78,7 @@ dump=$(
     printf '%s\n' "${LAMBOOT_HELP_REGISTRY:-}"
     printf -- '---REGISTRY-END---\n'
 )
+fi
 
 [[ -z "$dump" ]] && { echo "failed to extract registry from $TOOL" >&2; exit 1; }
 
@@ -380,7 +391,7 @@ When set (to any value), disables ANSI color (freedesktop convention).
 .BR lamboot-signing-keys (1)
 .PP
 Full documentation at
-.UR https://lamboot.dev/tools/
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 .SH AUTHORS
 The lamboot-tools suite is developed by

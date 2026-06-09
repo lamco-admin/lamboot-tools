@@ -1,6 +1,6 @@
 # Copr package configuration for standalone lamboot-migrate
 #
-# Per R22 of SPEC-LAMBOOT-TOOLKIT-V1.md: lamboot-migrate ships BOTH as
+# Per R22 of the toolkit design spec: lamboot-migrate ships BOTH as
 # a subpackage of lamboot-tools AND as a standalone distro package.
 # This Copr project publishes the standalone form.
 #
@@ -47,4 +47,4 @@ instructions: |
     sudo lamboot-migrate to-uefi --disk /dev/sda      # migrate
     sudo lamboot-migrate verify                       # post-migration verify
 
-  See: https://lamboot.dev/migrate/
+  See: https://lamco.ai/products/lamboot-tools/

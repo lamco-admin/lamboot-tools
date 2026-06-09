@@ -13,7 +13,10 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 readonly REPO_ROOT
-readonly SPEC="$REPO_ROOT/docs/SPEC-LAMBOOT-TOOLKIT-V1.md"
+# The umbrella spec lives in the dev tree only; the public release tree ships
+# no specs, so the spec-derived checks below self-skip when it is absent.
+readonly DOCS_DIR="$REPO_ROOT/docs"
+readonly SPEC="$DOCS_DIR/SPEC-LAMBOOT-TOOLKIT-V1.md"
 readonly CI_YAML="$REPO_ROOT/.github/workflows/ci.yml"
 
 readonly RED=$'\033[0;31m'
@@ -70,7 +73,7 @@ done
 # ── Claim 2: Every tool --json-schema prints schema envelope ─────────────
 for t in "${section_tools[@]}"; do
     out=$(_tool "$t" --json-schema 2>/dev/null) || { skip "$(basename "$t") --json-schema not supported"; continue; }
-    if [[ "$out" == *'"$schema"'*'lamboot.dev/schemas'* ]]; then
+    if [[ "$out" == *'"$schema"'*'https://github.com/lamco-admin/lamboot-tools'* ]]; then
         ok "$(basename "$t") --json-schema emits schema envelope"
     else
         fail "$(basename "$t") --json-schema output missing schema URL"
@@ -97,7 +100,7 @@ for t in "${section_tools[@]}"; do
     fi
 done
 
-# ── Claim 4: lamboot-migrate has 5 subcommands + 11 verify checks ────────
+# ── Claim 4: lamboot-migrate has 5 subcommands + 12 verify checks ────────
 migrate_subcmds=$(grep -c '^\s*--name "' "$REPO_ROOT/tools/lamboot-migrate" 2>/dev/null || echo 0)
 if [[ "$migrate_subcmds" -eq 5 ]]; then
     ok "lamboot-migrate has 5 subcommands ($migrate_subcmds)"
@@ -113,10 +116,10 @@ else
 fi
 
 migrate_verify_checks=$(grep -cE '^verify_check_[0-9]+' "$REPO_ROOT/tools/lamboot-migrate" 2>/dev/null || echo 0)
-if [[ "$migrate_verify_checks" -eq 11 ]]; then
-    ok "lamboot-migrate has 11 verify_check_* functions"
+if [[ "$migrate_verify_checks" -eq 12 ]]; then
+    ok "lamboot-migrate has 12 verify_check_* functions"
 else
-    fail "verify check count wrong: got $migrate_verify_checks, want 11"
+    fail "verify check count wrong: got $migrate_verify_checks, want 12"
 fi
 
 # ── Claim 5: lamboot-repair defines its declared repair actions ──────────
@@ -229,7 +232,11 @@ for t in tools/lamboot-diagnose tools/lamboot-esp tools/lamboot-backup tools/lam
 done
 
 # ── Claim 14: Claims appendix (§13) exists + non-trivial ─────────────────
-if grep -q '^## 13' "$SPEC"; then
+# The SPEC is a dev-internal design contract and is intentionally not shipped to
+# the public repo; skip the appendix checks where it is absent rather than fail.
+if [[ ! -f "$SPEC" ]]; then
+    skip "claims appendix (§13) — SPEC is dev-internal, absent in this tree"
+elif grep -q '^## 13' "$SPEC"; then
     claims_chars=$(awk '/^## 13/,/^## 14/' "$SPEC" 2>/dev/null | wc -c)
     if [[ "$claims_chars" -gt 200 ]]; then
         ok "claims appendix (§13) present and non-trivial ($claims_chars chars)"
@@ -241,7 +248,9 @@ else
 fi
 
 # ── Claim 15: fleet.toml schema with TOML section markers in spec ────────
-if grep -q 'fleet.toml' "$SPEC"; then
+if [[ ! -f "$SPEC" ]]; then
+    skip "fleet.toml schema — SPEC is dev-internal, absent in this tree"
+elif grep -q 'fleet.toml' "$SPEC"; then
     if grep -qE '^\[(fleet|hookscript|roles|tags|monitor)\]' "$SPEC"; then
         ok "fleet.toml schema includes TOML section definitions"
     else
@@ -323,9 +332,8 @@ for f in MIRROR-CHECKSUMS.txt pve/MIRROR-CHECKSUMS.txt; do
 done
 
 # ── Claim 22: Registry-driven generators present ────────────────────────
-for g in scripts/registry-to-man scripts/registry-to-markdown; do
-    if [[ -x "$REPO_ROOT/$g" ]]; then ok "$(basename "$g") present"; else fail "$(basename "$g") missing"; fi
-done
+g=scripts/registry-to-man
+if [[ -x "$REPO_ROOT/$g" ]]; then ok "$(basename "$g") present"; else fail "$(basename "$g") missing"; fi
 
 # ── Claim 23: 13 man pages present ──────────────────────────────────────
 expected_mans=(

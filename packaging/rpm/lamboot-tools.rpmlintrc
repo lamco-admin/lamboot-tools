@@ -17,7 +17,7 @@ addFilter(r"non-executable-script /usr/lib/lamboot-tools/lamboot-toolkit-(lib|he
 
 # lamboot-pve-monitor and lamboot-pve-ovmf-vars are mirrored from lamboot-dev
 # at release-build time. Their man pages are pending lamboot-dev v0.9.x work.
-# Documented in docs/CROSS-REPO-STATUS.md.
+# Mirrored from lamboot-dev at release-build time.
 addFilter(r"no-manual-page-for-binary lamboot-pve-monitor")
 addFilter(r"no-manual-page-for-binary lamboot-pve-ovmf-vars")
 
@@ -56,4 +56,4 @@ addFilter(r"invalid-spec-name")
 # A single rpmlintrc serves three RPMs (lamboot-tools + subpackage + migrate-
 # standalone). Filters that don't apply to every RPM surface as "unused" —
 # that is acceptable; invoke rpmlint with --ignore-unused-rpmlintrc to
-# suppress them. See docs/RELEASE.md §5 for the exact command.
+# suppress them. Invoke rpmlint with --ignore-unused-rpmlintrc.

@@ -129,7 +129,7 @@ Each tool has its own `help`, `--help`, and man page. Start with:
     lamboot-toolkit help diagnose       # same, via dispatcher
     man lamboot-tools                   # suite overview
 
-Documentation: https://lamboot.dev/tools/
+Documentation: https://github.com/lamco-admin/lamboot-tools
 EOF
 }
 

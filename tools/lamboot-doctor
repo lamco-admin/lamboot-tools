@@ -4,7 +4,6 @@
 # The "it just works" entry point. Orchestrates sibling tools per a
 # conservative default-action policy matrix. Users type sudo ONCE.
 #
-# Governed by docs/SPEC-LAMBOOT-DOCTOR.md.
 # Part of the lamboot-tools suite (SPEC-LAMBOOT-TOOLKIT-V1.md §6.7).
 
 # shellcheck source=../lib/lamboot-toolkit-lib.sh
@@ -19,9 +18,9 @@ if [[ -f "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-capcheck-bridge.sh"
 fi
 
 LAMBOOT_TOOL_NAME="lamboot-doctor"
-LAMBOOT_TOOL_VERSION="0.7.5"
+LAMBOOT_TOOL_VERSION="0.8.0"
 
-readonly DOC_BASE="https://lamboot.dev/tools/findings"
+readonly DOC_BASE="https://github.com/lamco-admin/lamboot-tools"
 readonly STATE_DIR="/var/lib/lamboot-doctor"
 
 OPT_NO_REPAIR=0
@@ -29,6 +28,13 @@ OPT_NO_CLEAN=0
 OPT_RISK_LIMIT="moderate"
 OPT_RESUME_ID=""
 OPT_KEEP_RESUME=0
+OPT_SUBCOMMAND="check"
+OPT_CLEAN_APPLY=0
+OPT_ONLY=""
+OPT_BACKUP_DIR=""
+OPT_CLEAN_CATEGORY=""
+
+DOCTOR_CLEAN_LOG="/var/log/lamboot/lamboot-doctor.log"
 
 # Tallies
 DOCTOR_APPLIED=0
@@ -63,8 +69,35 @@ _register_subcommands() {
         --offline-capable "true" \
         --requires-root "false" \
         --see-also "lamboot-diagnose, lamboot-repair, lamboot-esp, lamboot-migrate" \
-        --doc-url "https://lamboot.dev/tools/doctor" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "beta"
+
+    register_subcommand \
+        --name "clean" --category "Maintenance" \
+        --summary "Guided, reversible cleanup of ESP and NVRAM (dry-run by default)" \
+        --syntax "lamboot-doctor clean [--apply] [--only esp,nvram,boot] [--category CAT] [--backup-dir DIR] [--json] [--yes]" \
+        --arg "--apply:Perform the cleanup (default: preview only)" \
+        --arg "--only LIST:Restrict to surfaces: esp, nvram, boot (default: esp,nvram)" \
+        --arg "--category CAT:Pass a hygiene category through to the worker (e.g. duplicate)" \
+        --arg "--backup-dir DIR:Override the backup directory (default: /var/backups/lamboot-doctor-<ts>)" \
+        --example "lamboot-doctor clean" \
+        --example "sudo lamboot-doctor clean --only nvram --apply" \
+        --notes "Orchestrates lamboot-nvram clean (NVRAM) and lamboot-esp clean (ESP files). Backs up before --apply (NVRAM via lamboot-nvram; ESP files copied into the backup dir by doctor) and logs every action to /var/log/lamboot/. Reverse with 'lamboot-doctor restore'. /boot kernel removal is package-manager-deferential (reported, never auto-removed). Never removes the running kernel, active bootloader, or current/default boot entry." \
+        --offline-capable "false" --requires-root "true" \
+        --see-also "restore, lamboot-nvram, lamboot-esp" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" --maturity "draft"
+
+    register_subcommand \
+        --name "restore" --category "Maintenance" \
+        --summary "Reverse a previous 'clean' from its backup directory" \
+        --syntax "lamboot-doctor restore [--backup-dir DIR] [--only esp,nvram] [--json] [--yes]" \
+        --arg "--backup-dir DIR:Backup to restore (default: most recent /var/backups/lamboot-doctor-*)" \
+        --arg "--only LIST:Restrict restore to surfaces: esp, nvram" \
+        --example "sudo lamboot-doctor restore" \
+        --notes "Reads MANIFEST.json in the backup dir, copies removed ESP files back, and runs 'lamboot-nvram restore' to re-create removed boot entries. Idempotent; logs every action." \
+        --offline-capable "false" --requires-root "true" \
+        --see-also "clean" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" --maturity "draft"
 }
 
 # ── Remediation helper ───────────────────────────────────────────────────
@@ -694,6 +727,137 @@ do_check() {
 ORIGINAL_ARGS=("$@")
 CACHED_DIAGNOSE_OUTPUT=""
 
+# ── Guided hygiene: clean / restore (backup + reversible + logged) ────────────
+
+_doctor_clean_log() {  # msg [backup_dir]
+    local line; line="$(date -u +%Y-%m-%dT%H:%M:%SZ) lamboot-doctor: $1"
+    mkdir -p "$(dirname "$DOCTOR_CLEAN_LOG")" 2>/dev/null \
+        && printf '%s\n' "$line" >> "$DOCTOR_CLEAN_LOG" 2>/dev/null || true
+    if [[ -n "${2:-}" ]]; then
+        mkdir -p "$2" 2>/dev/null
+        printf '%s\n' "$line" >> "$2/actions.log" 2>/dev/null || true
+    fi
+}
+
+# Surfaces default to esp + nvram (NOT boot — kernel removal is PM-deferential).
+_surface_enabled() {
+    if [[ -z "$OPT_ONLY" ]]; then
+        case "$1" in esp|nvram) return 0 ;; *) return 1 ;; esac
+    fi
+    printf '%s' "$OPT_ONLY" | tr ',' '\n' | grep -qx "$1"
+}
+
+_esp_clean_candidate_files() {  # esp_bin -> newline-separated file list
+    "$1" clean --json 2>/dev/null | python3 -c '
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+for f in d.get("findings", []):
+    for x in ((f.get("context") or {}).get("files") or []):
+        print(x)
+' 2>/dev/null || true
+}
+
+do_clean() {
+    [[ $OPT_CLEAN_APPLY -eq 1 ]] && require_root
+    local backup_dir="${OPT_BACKUP_DIR:-/var/backups/lamboot-doctor-$(date -u +%Y-%m-%dT%H-%M-%S)}"
+    local nvram_done=0 esp_backed=0
+
+    info "lamboot-doctor clean (apply=${OPT_CLEAN_APPLY}, surfaces=${OPT_ONLY:-esp,nvram}, backup=${backup_dir})"
+    if [[ $OPT_CLEAN_APPLY -eq 1 ]]; then
+        if ! confirm "CLEAN ESP/NVRAM (backed up + reversible)" "yes"; then
+            emit_json "$EXIT_ABORT"; exit "$EXIT_ABORT"
+        fi
+        mkdir -p "$backup_dir"
+        _doctor_clean_log "clean --apply surfaces=${OPT_ONLY:-esp,nvram} backup=$backup_dir" "$backup_dir"
+    fi
+
+    if _surface_enabled nvram; then
+        local nv
+        if nv=$(_find_sibling lamboot-nvram); then
+            local args=(clean)
+            [[ -n "$OPT_CLEAN_CATEGORY" ]] && args+=(--category "$OPT_CLEAN_CATEGORY")
+            if [[ $OPT_CLEAN_APPLY -eq 1 ]]; then
+                args+=(--apply --backup-dir "$backup_dir/nvram")
+                "$nv" "${args[@]}" >&2 && nvram_done=1 || true
+                _doctor_clean_log "ran lamboot-nvram clean --apply" "$backup_dir"
+            else
+                "$nv" "${args[@]}" >&2 || true
+            fi
+        else
+            warn "lamboot-nvram not found; skipping NVRAM surface"
+        fi
+    fi
+
+    if _surface_enabled esp; then
+        local esp
+        if esp=$(_find_sibling lamboot-esp); then
+            local files; files=$(_esp_clean_candidate_files "$esp")
+            local n; n=$(printf '%s' "$files" | grep -c . 2>/dev/null || echo 0)
+            if [[ $OPT_CLEAN_APPLY -eq 1 && -n "$files" ]]; then
+                while IFS= read -r f; do
+                    [[ -z "$f" || ! -e "$f" ]] && continue
+                    mkdir -p "$backup_dir/esp$(dirname "$f")" 2>/dev/null
+                    cp -a "$f" "$backup_dir/esp$f" 2>/dev/null \
+                        && { esp_backed=$((esp_backed + 1)); _doctor_clean_log "backed up $f" "$backup_dir"; }
+                done <<< "$files"
+                "$esp" clean --apply --yes >&2 || warn "lamboot-esp clean reported issues"
+                _doctor_clean_log "ran lamboot-esp clean --apply ($esp_backed files backed up first)" "$backup_dir"
+            else
+                info "ESP: ${n} stale file(s) would be removed (preview)"
+            fi
+        else
+            warn "lamboot-esp not found; skipping ESP surface"
+        fi
+    fi
+
+    if _surface_enabled boot; then
+        info "/boot: kernel hygiene defers to the package manager — review old kernels with 'apt autoremove' / 'dnf remove' (never auto-removed here)."
+    fi
+
+    if [[ $OPT_CLEAN_APPLY -eq 1 ]]; then
+        printf '{"backup_dir":"%s","surfaces":"%s","nvram_cleaned":%d,"esp_files_backed_up":%d}\n' \
+            "$backup_dir" "${OPT_ONLY:-esp,nvram}" "$nvram_done" "$esp_backed" > "$backup_dir/MANIFEST.json"
+        success "Clean complete. Backup + log: $backup_dir"
+        info "Reverse with: sudo lamboot-doctor restore --backup-dir $backup_dir"
+    else
+        info "Dry-run preview complete. Re-run with --apply (backed up + reversible + logged)."
+    fi
+    emit_json "$EXIT_OK"; exit "$EXIT_OK"
+}
+
+do_restore() {
+    local backup_dir="${OPT_BACKUP_DIR:-}"
+    [[ -z "$backup_dir" ]] && backup_dir=$(ls -td /var/backups/lamboot-doctor-* 2>/dev/null | head -1)
+    [[ -n "$backup_dir" && -f "$backup_dir/MANIFEST.json" ]] \
+        || die_prerequisite "no lamboot-doctor backup found (looked in ${backup_dir:-/var/backups/lamboot-doctor-*})"
+    require_root
+
+    info "lamboot-doctor restore from $backup_dir"
+    _doctor_clean_log "restore from $backup_dir" "$backup_dir"
+
+    if _surface_enabled esp && [[ -d "$backup_dir/esp" ]]; then
+        local esp_n=0
+        while IFS= read -r f; do
+            local target="${f#"$backup_dir"/esp}"
+            mkdir -p "$(dirname "$target")" 2>/dev/null
+            cp -a "$f" "$target" 2>/dev/null && { esp_n=$((esp_n + 1)); _doctor_clean_log "restored $target" "$backup_dir"; }
+        done < <(find "$backup_dir/esp" -type f 2>/dev/null)
+        info "ESP: restored $esp_n file(s)"
+    fi
+
+    if _surface_enabled nvram && [[ -d "$backup_dir/nvram" ]]; then
+        local nv
+        if nv=$(_find_sibling lamboot-nvram); then
+            "$nv" restore --apply --backup-dir "$backup_dir/nvram" >&2 || warn "lamboot-nvram restore reported issues"
+            _doctor_clean_log "ran lamboot-nvram restore --apply" "$backup_dir"
+        fi
+    fi
+
+    success "Restore complete from $backup_dir"
+    emit_json "$EXIT_OK"; exit "$EXIT_OK"
+}
+
 parse_args() {
     while [[ $# -gt 0 ]]; do
         parse_common_flag "$1"
@@ -703,7 +867,7 @@ parse_args() {
             2) _register_subcommands; dispatch_help; exit 0 ;;
             3) printf 'lamboot-doctor %s (lamboot-tools %s)\n' \
                 "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
-            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            4) printf '{"$schema":"https://github.com/lamco-admin/lamboot-tools"}\n'; exit 0 ;;
             5) LAMBOOT_OFFLINE_DISK="${2:-}"; [[ -n "$LAMBOOT_OFFLINE_DISK" ]] || die "--offline requires DISK argument"; shift 2; continue ;;
             0) ;;
         esac
@@ -714,6 +878,11 @@ parse_args() {
             --risk-limit)         OPT_RISK_LIMIT="${2:-moderate}"; shift 2 ;;
             --doctor-resume)      OPT_RESUME_ID="${2:-}"; shift 2 ;;
             --keep-resume-state)  OPT_KEEP_RESUME=1; shift ;;
+            --apply)              OPT_CLEAN_APPLY=1; shift ;;
+            --only)               OPT_ONLY="${2:-}"; shift 2 ;;
+            --category)           OPT_CLEAN_CATEGORY="${2:-}"; shift 2 ;;
+            --backup-dir)         OPT_BACKUP_DIR="${2:-}"; shift 2 ;;
+            clean|restore)        OPT_SUBCOMMAND="$1"; shift ;;
             help)                 _register_subcommands
                                   if [[ -n "${2:-}" ]]; then
                                       dispatch_help "$2"
@@ -730,7 +899,11 @@ parse_args() {
 
 main() {
     parse_args "$@"
-    do_check
+    case "$OPT_SUBCOMMAND" in
+        clean)   do_clean ;;
+        restore) do_restore ;;
+        *)       do_check ;;
+    esac
 }
 
 main "$@"

@@ -5,7 +5,6 @@
 # LamBoot-specific vars) to a versioned JSON file for disaster recovery
 # and audit.
 #
-# Governed by docs/SPEC-LAMBOOT-BACKUP.md.
 # Part of the lamboot-tools suite (SPEC-LAMBOOT-TOOLKIT-V1.md §3.1).
 
 # shellcheck source=../lib/lamboot-toolkit-lib.sh
@@ -16,7 +15,7 @@ source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
 LAMBOOT_TOOL_NAME="lamboot-backup"
 LAMBOOT_TOOL_VERSION="0.7.2"
 
-readonly DOC_BASE="https://lamboot.dev/tools/findings"
+readonly DOC_BASE="https://github.com/lamco-admin/lamboot-tools"
 
 OPT_SUBCOMMAND=""
 OPT_FILE=""
@@ -43,7 +42,7 @@ _register_subcommands() {
         --offline-capable "true" \
         --requires-root "false" \
         --see-also "restore, show, list" \
-        --doc-url "https://lamboot.dev/tools/backup/save" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "stable"
 
     register_subcommand \
@@ -62,7 +61,7 @@ _register_subcommands() {
         --offline-capable "true" \
         --requires-root "true" \
         --see-also "save, show" \
-        --doc-url "https://lamboot.dev/tools/backup/restore" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "stable"
 
     register_subcommand \
@@ -77,7 +76,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "save, list" \
-        --doc-url "https://lamboot.dev/tools/backup/show" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "stable"
 
     register_subcommand \
@@ -91,7 +90,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "save, show" \
-        --doc-url "https://lamboot.dev/tools/backup/list" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "stable"
 }
 
@@ -896,7 +895,7 @@ parse_args() {
             2) _register_subcommands; dispatch_help; exit 0 ;;
             3) printf 'lamboot-backup %s (lamboot-tools %s)\n' \
                 "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
-            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            4) printf '{"$schema":"https://github.com/lamco-admin/lamboot-tools"}\n'; exit 0 ;;
             5) shift
                [[ $# -gt 0 ]] || die "--offline requires a disk path"
                offline_setup "$1"

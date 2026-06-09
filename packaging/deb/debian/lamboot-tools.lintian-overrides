@@ -1,0 +1,16 @@
+# lamboot-capcheck and lamboot-reader are prebuilt, statically linked (musl)
+# binaries of the lamboot-tools Rust components, vendored into the release. They
+# are static-pie ELF executables, not shared libraries: lintian misreads the
+# static-pie object as a shared library that "lacks prerequisites" (an ELF
+# DT_NEEDED / dependency list). Static linking is deliberate - one binary per
+# arch runs across glibc-skewed distributions with no runtime dependency - so
+# the absence of shared-library prerequisites is expected and correct.
+lamboot-tools: shared-library-lacks-prerequisites [usr/bin/lamboot-capcheck]
+lamboot-tools: shared-library-lacks-prerequisites [usr/bin/lamboot-reader]
+
+# The shared shell library is sourced by the tools, not executed, so it is
+# intentionally non-executable (0644). Same stance as lamboot's esp-deploy.sh.
+lamboot-tools: script-not-executable [usr/lib/lamboot-tools/lamboot-toolkit-lib.sh]
+lamboot-tools: script-not-executable [usr/lib/lamboot-tools/lamboot-toolkit-help.sh]
+lamboot-tools: script-not-executable [usr/lib/lamboot-tools/lamboot-capcheck-bridge.sh]
+lamboot-tools: script-not-executable [usr/lib/lamboot-tools/esp-deploy.sh]

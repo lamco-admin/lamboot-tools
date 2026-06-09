@@ -6,7 +6,7 @@
 # sgdisk, sfdisk, mkfs.fat, mkfs.ext4, cryptsetup, python3.
 #
 # After regen, tests/fixtures/download-fixtures.sh verifies checksums. If
-# the fixtures are uploaded to fixtures.lamboot.dev for CI consumption,
+# the fixtures are uploaded to https://github.com/lamco-admin/lamboot-tools for CI consumption,
 # commit the updated fixtures.sha256 to reflect the new hashes.
 
 set -uo pipefail

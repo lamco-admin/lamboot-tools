@@ -39,6 +39,7 @@ coverage/
 tools/lamboot-inspect
 tools/lamboot_inspect/
 man/lamboot-inspect.1
+website/tools/lamboot-inspect.md
 # Cargo build outputs for crates/
 crates/*/target/
 crates/*/Cargo.lock

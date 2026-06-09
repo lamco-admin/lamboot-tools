@@ -16,7 +16,7 @@ three built from one `packaging/rpm/lamboot-tools.spec`).
 
 ## Shared config: `/etc/lamboot/fleet.toml`
 
-Schema defined in `docs/SPEC-LAMBOOT-TOOLKIT-V1.md` §16 Appendix C.
+Schema defined in the toolkit design spec (Appendix C).
 Consumed by three tools across two repos:
 
 - `lamboot-pve-setup` (this subtree) — reads `[fleet]`, `[roles]`, `[tags]`

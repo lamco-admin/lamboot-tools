@@ -8,7 +8,6 @@
 # RSA-2048 enforcement on db / MOK-bound keys per Debian bug #1013320.
 # RSA-4096 allowed for PK/KEK (firmware-level, not shim-path).
 #
-# Governed by docs/SPEC-LAMBOOT-SIGNING-KEYS.md.
 # Part of the lamboot-tools suite (SPEC-LAMBOOT-TOOLKIT-V1.md §3.1).
 
 # shellcheck source=../lib/lamboot-toolkit-lib.sh
@@ -19,7 +18,7 @@ source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
 LAMBOOT_TOOL_NAME="lamboot-signing-keys"
 LAMBOOT_TOOL_VERSION="0.7.2"
 
-readonly DOC_BASE="https://lamboot.dev/tools/findings"
+readonly DOC_BASE="https://github.com/lamco-admin/lamboot-tools"
 
 OPT_SUBCOMMAND=""
 OPT_MODE="auto"
@@ -63,7 +62,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "inspect, mok-enroll, status" \
-        --doc-url "https://lamboot.dev/tools/signing-keys/generate" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "experimental"
 
     register_subcommand \
@@ -85,7 +84,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "generate, generate-hierarchy, mok-enroll" \
-        --doc-url "https://lamboot.dev/tools/signing-keys/rotate" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "experimental"
 
     register_subcommand \
@@ -100,7 +99,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "generate" \
-        --doc-url "https://lamboot.dev/tools/signing-keys/inspect" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "experimental"
 
     register_subcommand \
@@ -114,7 +113,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "mok-list, mok-enroll" \
-        --doc-url "https://lamboot.dev/tools/signing-keys/status" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "experimental"
 
     register_subcommand \
@@ -128,7 +127,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "true" \
         --see-also "mok-list, mok-delete, generate" \
-        --doc-url "https://lamboot.dev/tools/signing-keys/mok-enroll" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "experimental"
 
     register_subcommand \
@@ -141,7 +140,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "mok-enroll" \
-        --doc-url "https://lamboot.dev/tools/signing-keys/mok-list" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "experimental"
 
     register_subcommand \
@@ -155,7 +154,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "true" \
         --see-also "mok-enroll" \
-        --doc-url "https://lamboot.dev/tools/signing-keys/mok-delete" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "experimental"
 
     register_subcommand \
@@ -170,7 +169,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "generate, lamboot-pve-ovmf-vars" \
-        --doc-url "https://lamboot.dev/tools/signing-keys/ovmf-vars" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "experimental"
 
     register_subcommand \
@@ -184,7 +183,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "generate, sign-binary" \
-        --doc-url "https://lamboot.dev/tools/signing-keys/generate-hierarchy" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "experimental"
 
     register_subcommand \
@@ -195,7 +194,7 @@ _register_subcommands() {
         --arg "BINARY:File to sign" \
         --arg "--key PATH:Private key" \
         --arg "--cert PATH:Cert" \
-        --arg "--sbat CSV:Inline SBAT CSV line (e.g. \"lamboot,1,LamCo,lamboot,0.8.4,https://lamboot.dev/sbat\")" \
+        --arg "--sbat CSV:Inline SBAT CSV line (e.g. \"lamboot,1,LamCo,lamboot,0.8.4,https://github.com/lamco-admin/lamboot-tools\")" \
         --arg "--sbat-file PATH:Path to SBAT CSV file (header row + one entry per component); overrides --sbat" \
         --arg "--no-sbat:Skip SBAT section injection (NOT recommended — shim may refuse to chain unsigned SBAT binaries)" \
         --example "lamboot-signing-keys sign-binary dist/lambootx64.efi --key keys/db.key --cert keys/db.crt" \
@@ -204,7 +203,7 @@ _register_subcommands() {
         --offline-capable "false" \
         --requires-root "false" \
         --see-also "generate-hierarchy, lamboot-uki-build" \
-        --doc-url "https://lamboot.dev/tools/signing-keys/sign-binary" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "experimental"
 }
 
@@ -907,7 +906,7 @@ _resolve_sbat_content() {
     # binaries (component ID "lamboot") and from shim (component ID "shim").
     local version="${LAMBOOT_TOOLKIT_VERSION:-unknown}"
     printf 'sbat,1,SBAT Version,sbat,1,https://github.com/rhboot/shim/blob/main/SBAT.md\n'
-    printf 'lamboot-tools.signed,1,Lamco Development LLC,lamboot-tools,%s,https://lamboot.dev/tools/sbat\n' "$version"
+    printf 'lamboot-tools.signed,1,Lamco Development LLC,lamboot-tools,%s,https://github.com/lamco-admin/lamboot-tools\n' "$version"
     return 0
 }
 
@@ -1045,7 +1044,7 @@ parse_args() {
             2) _register_subcommands; dispatch_help; exit 0 ;;
             3) printf 'lamboot-signing-keys %s (lamboot-tools %s)\n' \
                 "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
-            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            4) printf '{"$schema":"https://github.com/lamco-admin/lamboot-tools"}\n'; exit 0 ;;
             5) shift; shift; continue ;;
             0) ;;
         esac
@@ -1346,7 +1345,7 @@ EOF
         "Rotated $type key → $outdir" \
         "Old: $old_subj | New: $new_subj | Cross-signed: $([[ $can_cross_sign -eq 1 ]] && printf 'YES' || printf 'NO (self-signed; cross-sign with parent manually before distribution)')" \
         "{\"type\":\"$type\",\"output_dir\":\"$(json_escape "$outdir")\",\"cross_signed\":$([[ $can_cross_sign -eq 1 ]] && printf 'true' || printf 'false')}" \
-        "{\"summary\":\"Re-enroll the new cert\",\"command\":\"$(json_escape "$re_enroll_cmd")\",\"doc_url\":\"https://lamboot.dev/tools/signing-keys/rotate\"}"
+        "{\"summary\":\"Re-enroll the new cert\",\"command\":\"$(json_escape "$re_enroll_cmd")\",\"doc_url\":\"https://github.com/lamco-admin/lamboot-tools\"}"
 
     if [[ $can_cross_sign -eq 0 ]] && [[ "$type" != "pk" ]]; then
         emit_finding "keys.rotate.manual_cross_sign_required" "signing_keys" "warning" "warn" \

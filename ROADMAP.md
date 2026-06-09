@@ -1,7 +1,5 @@
 # lamboot-tools Roadmap
 
-**Authoritative spec:** [`docs/SPEC-LAMBOOT-TOOLKIT-V1.md`](docs/SPEC-LAMBOOT-TOOLKIT-V1.md)
-
 This roadmap is a living tracker. It reflects the product scope, tool maturity,
 release cadence, and the federated component architecture decided in the
 toolkit spec.
@@ -10,9 +8,11 @@ toolkit spec.
 
 ## Current status
 
-**Shipping release: lamboot-tools 0.8.0** (June 2026). This is the first public
-release of the federated, shell-only product. The suite is feature-complete
-across its core tools and ships the bundled component binaries described below.
+**Shipping release: lamboot-tools 0.9.1** (June 2026). The 0.9 line adds a
+boot-audit-and-hygiene capability set (`lamboot-nvram`, `lamboot-pve-migrate`,
+and the `lamboot-inspect` boot-verdict engine) on top of the federated,
+shell-only 0.8.0 architecture. The suite is feature-complete across its core
+tools and ships the bundled component binaries described below.
 
 lamboot-tools is the Linux UEFI boot toolkit: a suite of standalone CLI tools
 for boot diagnosis, ESP management, backup, repair, BIOS-to-UEFI and
@@ -77,9 +77,12 @@ change.
 | 0.2.0 | 2026-04-23 | First public release (coordinated with lamboot 0.8.4). |
 | 0.3.0 | 2026-04-26 | Follow-up release. |
 | 0.8.0 | 2026-06-03 | Federated, shell-only re-architecture; bundled component binaries; copyright to Lamco Development LLC. |
+| 0.9.1 | 2026-06-08 | Boot audit & hygiene: `lamboot-nvram` (boot-entry cleanup), `lamboot-pve-migrate` (host-side BIOS→UEFI lifecycle), `lamboot-inspect` boot-verdict engine; documentation brought current for publication. |
 
 (The internal 0.7.x tags tracked the capability-auditor development that has
-since been extracted to `lamboot-capcheck`; they were never published.)
+since been extracted to `lamboot-capcheck`; they were never published. The
+internal 0.8.1, 0.8.2, and 0.9.0 milestones were folded into the public 0.9.1
+release.)
 
 ---
 
@@ -96,7 +99,8 @@ since been extracted to `lamboot-capcheck`; they were never published.)
 | `lamboot-uki-build` | beta | Build / inspect / sign / verify Unified Kernel Images |
 | `lamboot-signing-keys` | experimental | Secure Boot key lifecycle |
 | `lamboot-toolkit` | stable | Suite dispatcher |
-| `lamboot-inspect` | stable | LamBoot-specific introspection (Python, mirrored from lamboot) |
+| `lamboot-inspect` | stable | LamBoot-specific introspection + boot-verdict engine (Python, mirrored from lamboot) |
+| `lamboot-nvram` | beta | UEFI boot-entry inventory + dead-entry cleanup (Python); online or offline OVMF VARS |
 
 ### Bundled component binaries (`lamboot-tools-firmware`)
 
@@ -111,6 +115,7 @@ since been extracted to `lamboot-capcheck`; they were never published.)
 |---|---|---|
 | `lamboot-pve-setup` | beta | This repository (`pve/`) |
 | `lamboot-pve-fleet` | experimental | This repository (`pve/`) |
+| `lamboot-pve-migrate` | experimental | This repository (`pve/`) — host-side BIOS→UEFI guest lifecycle |
 | `lamboot-pve-monitor` | stable | Mirrored from lamboot |
 | `lamboot-pve-ovmf-vars` | stable | Mirrored from lamboot |
 
@@ -118,7 +123,12 @@ since been extracted to `lamboot-capcheck`; they were never published.)
 
 ## Forward roadmap
 
-### Next (0.8.x / 0.9.0)
+> **Direction sketch (draft, unsettled):** a longer-term language and
+> architecture direction is under exploration (selected tools graduating to
+> self-contained Rust CLIs, with PVE integration as the expected accelerant).
+> It is not yet promoted into the items below.
+
+### Next (0.9.x / 0.10.0)
 
 - Integrate `lamboot-reader` directly into the shell tools (command-line-drift
   detection for `lamboot-migrate`, GRUB compatibility reporting).
@@ -141,7 +151,7 @@ since been extracted to `lamboot-capcheck`; they were never published.)
 - Debian upstream submission for the standalone `lamboot-migrate`.
 - `lamboot-signing-keys` stable across the full key lifecycle.
 - `lamboot-migrate` spin-off milestone: a distinct product page at
-  `lamboot.dev/migrate/` with an independent release cadence.
+  `https://lamco.ai/products/lamboot-tools/` with an independent release cadence.
 
 ---
 
@@ -173,5 +183,5 @@ since been extracted to `lamboot-capcheck`; they were never published.)
 ## Amendment procedure
 
 Changes to this roadmap that are not purely status updates (new tools, deferred
-tools, version-target changes) require updating `docs/SPEC-LAMBOOT-TOOLKIT-V1.md`
-first. This file tracks execution; the spec tracks scope.
+tools, version-target changes) require updating the toolkit design spec first.
+This file tracks execution; the spec tracks scope.

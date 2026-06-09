@@ -1,8 +1,8 @@
 .\" lamboot-migrate(1) — auto-generated from help registry
 .\" Source: tools/lamboot-migrate
-.\" Generated: 2026-06-03T23:49:38Z
+.\" Generated: 2026-06-09T07:04:56Z
 .\" DO NOT EDIT — regenerate via `make man` or `scripts/registry-to-man`.
-.TH "LAMBOOT-MIGRATE" "1" "2026-06-03" "lamboot-migrate 0.7.3" "lamboot-tools"
+.TH "LAMBOOT-MIGRATE" "1" "2026-06-09" "lamboot-migrate 0.7.6" "lamboot-tools"
 .SH NAME
 lamboot-migrate \- part of the lamboot-tools suite
 .SH SYNOPSIS
@@ -106,7 +106,7 @@ to\-lamboot, verify, rollback, status
 .B DOCUMENTATION URL
 .PP
 .RS 4
-.UR https://lamboot.dev/tools/migrate/to-uefi
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 .RE
 .PP
@@ -163,7 +163,7 @@ sudo lamboot\-migrate to\-lamboot \-\-remove\-grub \-\-force
 .B NOTES
 .PP
 .RS 4
-Invokes lamboot\-install. Default is \-\-signed (Secure Boot path: lambootx64\-signed.efi shipped from /usr/share/lamboot/). Pass \-\-unsigned to install the unsigned binary on SB\-off systems (must still be installed from /usr/share/lamboot/ but lamboot\-install will use lambootx64.efi instead). With \-\-preserve\-grub (default) the prior bootloader stays as a UEFI fallback. With \-\-remove\-grub the tool runs verify first; if all 11 checks pass, it uninstalls the distro\'s GRUB packages, removes GRUB files from the ESP, and deletes GRUB Boot#### entries from NVRAM. Refuses to remove if verify fails. Requires typed\-yes confirmation unless \-\-force.
+Invokes lamboot\-install. Default is \-\-signed (Secure Boot path: lambootx64\-signed.efi shipped from /usr/share/lamboot/). Pass \-\-unsigned to install the unsigned binary on SB\-off systems (must still be installed from /usr/share/lamboot/ but lamboot\-install will use lambootx64.efi instead). With \-\-preserve\-grub (default) the prior bootloader stays as a UEFI fallback. With \-\-remove\-grub the tool runs verify first; if all 12 checks pass, it uninstalls the distro\'s GRUB packages, removes GRUB files from the ESP, and deletes GRUB Boot#### entries from NVRAM. Refuses to remove if verify fails. Requires typed\-yes confirmation unless \-\-force.
 .RE
 .PP
 .B OFFLINE:
@@ -181,13 +181,13 @@ to\-uefi, rollback
 .B DOCUMENTATION URL
 .PP
 .RS 4
-.UR https://lamboot.dev/tools/migrate/to-lamboot
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 .RE
 .PP
 .SS verify
 .PP
-.I Run the 11\-check post\-conversion verification suite
+.I Run the 12\-check post\-conversion verification suite
 .PP
 .B Category:
 Verification
@@ -245,7 +245,7 @@ to\-uefi, rollback
 .B DOCUMENTATION URL
 .PP
 .RS 4
-.UR https://lamboot.dev/tools/migrate/verify
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 .RE
 .PP
@@ -306,7 +306,7 @@ to\-uefi, verify
 .B DOCUMENTATION URL
 .PP
 .RS 4
-.UR https://lamboot.dev/tools/migrate/rollback
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 .RE
 .PP
@@ -359,7 +359,7 @@ to\-uefi, verify
 .B DOCUMENTATION URL
 .PP
 .RS 4
-.UR https://lamboot.dev/tools/migrate/status
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 .RE
 .PP
@@ -461,7 +461,7 @@ When set (to any value), disables ANSI color (freedesktop convention).
 .BR lamboot-signing-keys (1)
 .PP
 Full documentation at
-.UR https://lamboot.dev/tools/
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 .SH AUTHORS
 The lamboot-tools suite is developed by

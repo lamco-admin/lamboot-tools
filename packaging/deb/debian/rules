@@ -1,0 +1,103 @@
+#!/usr/bin/make -f
+# lamboot-tools - prebuilt binary packaging for the Lamco apt repository
+# (apt.lamco.ai). It repackages the published release tarball: it does NOT run
+# the suite's Makefile build. The shell tools are already final; the vendored
+# component binaries (lamboot-capcheck, lamboot-reader) are already built
+# static-musl and shipped in the tarball under vendor/bin/<arch>/.
+#
+# Install contract (see ../PACKAGING.md §3): shell tools on /usr/bin; the shared
+# library + python lamboot_inspect package under the hardcoded /usr/lib/lamboot-tools
+# (NOT a multiarch libdir - the tools source ${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools});
+# the arch-matching component binaries on /usr/bin (the capcheck bridge finds
+# lamboot-capcheck via `command -v`, and lamboot-reader is a standalone CLI).
+#
+# The vendored binaries are already-stripped static musl: there is no debuginfo
+# to extract and no shared-library dependency to scan, so disable dh_strip,
+# dh_dwz, and dh_shlibdeps. (Unlike lamboot's .efi, there is no PE signature to
+# protect - the reason differs but the override shape is the same.)
+
+export DEB_BUILD_OPTIONS += nostrip nodwz
+P := debian/lamboot-tools
+
+# Map the Debian host CPU to the vendor/bin/<arch> directory name. dpkg's
+# DEB_HOST_GNU_CPU is already "x86_64" / "aarch64", which is exactly how the
+# tarball names its vendor arch dirs, so this is an identity map today; keep it
+# explicit so an unexpected CPU fails loudly rather than installing nothing.
+DEB_HOST_GNU_CPU ?= $(shell dpkg-architecture -qDEB_HOST_GNU_CPU)
+VENDOR_ARCH := $(DEB_HOST_GNU_CPU)
+
+%:
+	dh $@
+
+# Prebuilt payload: nothing to configure, build, or test at package time.
+override_dh_auto_configure:
+override_dh_auto_build:
+override_dh_auto_test:
+
+# Already-stripped static binaries: no debuginfo, no shlib deps.
+override_dh_strip:
+override_dh_dwz:
+override_dh_shlibdeps:
+
+override_dh_auto_install:
+	# --- shared library + python helper -> /usr/lib/lamboot-tools ---
+	# This literal path is the tools' hardcoded default; do not use a multiarch
+	# libdir here.
+	install -d $(P)/usr/lib/lamboot-tools
+	install -Dm0644 lib/lamboot-toolkit-lib.sh    $(P)/usr/lib/lamboot-tools/lamboot-toolkit-lib.sh
+	install -Dm0644 lib/lamboot-toolkit-help.sh   $(P)/usr/lib/lamboot-tools/lamboot-toolkit-help.sh
+	install -Dm0644 lib/esp-deploy.sh             $(P)/usr/lib/lamboot-tools/esp-deploy.sh
+	install -Dm0644 lib/lamboot-capcheck-bridge.sh $(P)/usr/lib/lamboot-tools/lamboot-capcheck-bridge.sh
+	install -Dm0755 lib/_nvram_set_first_boot.py  $(P)/usr/lib/lamboot-tools/_nvram_set_first_boot.py
+
+	# --- shell tools -> /usr/bin (lamboot-inspect handled separately below) ---
+	install -d $(P)/usr/bin
+	for t in lamboot-diagnose lamboot-esp lamboot-backup lamboot-repair \
+	         lamboot-migrate lamboot-doctor lamboot-toolkit lamboot-uki-build \
+	         lamboot-signing-keys; do \
+	    install -Dm0755 tools/$$t $(P)/usr/bin/$$t; \
+	done
+
+	# --- lamboot-inspect: real script + sibling package in /usr/lib/lamboot-tools,
+	#     PATH symlink so _bootstrap()'s realpath finds lamboot_inspect/ ---
+	install -Dm0755 tools/lamboot-inspect $(P)/usr/lib/lamboot-tools/lamboot-inspect
+	cp -a tools/lamboot_inspect $(P)/usr/lib/lamboot-tools/
+	find $(P)/usr/lib/lamboot-tools/lamboot_inspect -type d -exec chmod 0755 {} +
+	find $(P)/usr/lib/lamboot-tools/lamboot_inspect -type f -exec chmod 0644 {} +
+	# Strip any python bytecode that rode along in the tarball; dh_python3
+	# byte-compiles on the target host.
+	find $(P)/usr/lib/lamboot-tools/lamboot_inspect -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+	ln -s ../lib/lamboot-tools/lamboot-inspect $(P)/usr/bin/lamboot-inspect
+
+	# --- vendored component binaries -> /usr/bin (arch-matching) ---
+	# The capcheck bridge does `command -v lamboot-capcheck`; lamboot-reader is a
+	# standalone CLI. Both must be on PATH. Fail loudly if the tarball lacks the
+	# binary for this arch (we should never publish an unsupported-arch deb).
+	if [ -d "vendor/bin/$(VENDOR_ARCH)" ]; then \
+	    install -Dm0755 vendor/bin/$(VENDOR_ARCH)/lamboot-capcheck $(P)/usr/bin/lamboot-capcheck; \
+	    install -Dm0755 vendor/bin/$(VENDOR_ARCH)/lamboot-reader   $(P)/usr/bin/lamboot-reader; \
+	else \
+	    echo "error: no vendored binaries for arch '$(VENDOR_ARCH)' in vendor/bin/" >&2; \
+	    exit 1; \
+	fi
+
+	# --- man pages ---
+	# Ship a man1 page only for a tool this package actually installs. The pve
+	# tools (lamboot-pve-*) are not in this package - they are the rpm
+	# lamboot-toolkit-pve subpackage - so skip their pages to avoid orphaned man
+	# pages. capcheck/reader pages stay (their binaries do ship here).
+	install -d $(P)/usr/share/man/man1 $(P)/usr/share/man/man5 $(P)/usr/share/man/man7
+	for m in man/*.1; do \
+	    [ -f "$$m" ] || continue; \
+	    case "$$(basename "$$m")" in lamboot-pve-*) continue ;; esac; \
+	    install -Dm0644 "$$m" $(P)/usr/share/man/man1/$$(basename "$$m"); \
+	done
+	[ -f man/lamboot-tools-schema.5 ] && install -Dm0644 man/lamboot-tools-schema.5 $(P)/usr/share/man/man5/lamboot-tools-schema.5 || true
+	[ -f man/lamboot-tools.7 ]        && install -Dm0644 man/lamboot-tools.7        $(P)/usr/share/man/man7/lamboot-tools.7 || true
+
+	# --- documentation, design spec, and vendored third-party notices ---
+	install -d $(P)/usr/share/doc/lamboot-tools
+	[ -f README.md ]    && install -Dm0644 README.md    $(P)/usr/share/doc/lamboot-tools/README.md || true
+	[ -f CHANGELOG.md ] && install -Dm0644 CHANGELOG.md $(P)/usr/share/doc/lamboot-tools/CHANGELOG.md || true
+	for n in vendor/notices/*.md; do [ -f "$$n" ] && install -Dm0644 "$$n" $(P)/usr/share/doc/lamboot-tools/$$(basename "$$n"); done
+	[ -f vendor/BINARY-PROVENANCE.txt ] && install -Dm0644 vendor/BINARY-PROVENANCE.txt $(P)/usr/share/doc/lamboot-tools/BINARY-PROVENANCE.txt || true

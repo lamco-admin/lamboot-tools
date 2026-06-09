@@ -5,7 +5,6 @@
 # diagnose → plan → show → confirm → execute → verify. Each plan step has
 # a risk tier; destructive steps require extra confirmation regardless of --yes.
 #
-# Governed by docs/SPEC-LAMBOOT-REPAIR.md.
 # Part of the lamboot-tools suite (SPEC-LAMBOOT-TOOLKIT-V1.md §3.1).
 
 # shellcheck source=../lib/lamboot-toolkit-lib.sh
@@ -16,7 +15,7 @@ source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
 LAMBOOT_TOOL_NAME="lamboot-repair"
 LAMBOOT_TOOL_VERSION="0.7.2"
 
-readonly DOC_BASE="https://lamboot.dev/tools/findings"
+readonly DOC_BASE="https://github.com/lamco-admin/lamboot-tools"
 
 # Tool-specific flags
 OPT_FIX_FSTAB_ONLY=0
@@ -58,7 +57,7 @@ _register_subcommands() {
         --offline-capable "true" \
         --requires-root "true" \
         --see-also "lamboot-diagnose, lamboot-esp, lamboot-migrate, lamboot-doctor" \
-        --doc-url "https://lamboot.dev/tools/repair" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "stable"
 }
 
@@ -939,7 +938,7 @@ parse_args() {
             2) _register_subcommands; dispatch_help; exit 0 ;;
             3) printf 'lamboot-repair %s (lamboot-tools %s)\n' \
                 "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
-            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            4) printf '{"$schema":"https://github.com/lamco-admin/lamboot-tools"}\n'; exit 0 ;;
             5) shift
                [[ $# -gt 0 ]] || die "--offline requires a disk path"
                offline_setup "$1"

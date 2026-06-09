@@ -1,0 +1,14 @@
+lamboot-tools (0.8.0-1) stable; urgency=medium
+
+  * Initial Lamco apt repository packaging of lamboot-tools 0.8.0.
+  * Installs the shell suite (lamboot-diagnose, lamboot-esp, lamboot-backup,
+    lamboot-repair, lamboot-migrate, lamboot-doctor, lamboot-uki-build,
+    lamboot-signing-keys, lamboot-toolkit) and the Python lamboot-inspect to
+    /usr/bin, with the shared library and the lamboot_inspect package under
+    /usr/lib/lamboot-tools.
+  * Bundles the prebuilt static-musl component binaries lamboot-capcheck and
+    lamboot-reader (arch-matching) on /usr/bin.
+  * Distributed from apt.lamco.ai only: the bundled prebuilt binaries make this
+    package ineligible for Debian main.
+
+ -- Lamco Development LLC <office@lamco.io>  Thu, 04 Jun 2026 12:00:00 +0000

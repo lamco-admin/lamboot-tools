@@ -36,6 +36,11 @@ if [[ -n "$staged_sh" ]]; then
     while IFS= read -r file; do
         [[ -z "$file" ]] && continue
         [[ ! -f "$file" ]] && continue
+        # Skip non-bash files (e.g. native Python tools like lamboot-nvram, whose
+        # exec shim sits at tools/lamboot-* with a python3 shebang). Matches the
+        # CI shellcheck/syntax jobs, which guard the same way.
+        case "$file" in *.py|*.pyc) continue ;; esac
+        head -1 "$file" | grep -qE '^#!.*(bash|sh)' || continue
 
         if ! bash -n "$file" 2>&1; then
             fail "bash -n failed: $file"

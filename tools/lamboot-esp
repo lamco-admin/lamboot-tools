@@ -5,7 +5,6 @@
 # ESP layer; complements lamboot-diagnose which covers the full boot
 # chain.
 #
-# Governed by docs/SPEC-LAMBOOT-ESP.md.
 # Part of the lamboot-tools suite (SPEC-LAMBOOT-TOOLKIT-V1.md §3.1).
 
 # shellcheck source=../lib/lamboot-toolkit-lib.sh
@@ -21,7 +20,7 @@ LAMBOOT_TOOL_NAME="lamboot-esp"
 LAMBOOT_TOOL_VERSION="0.7.2"
 
 readonly ESP_PARTTYPE_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
-readonly DOC_BASE="https://lamboot.dev/tools/findings"
+readonly DOC_BASE="https://github.com/lamco-admin/lamboot-tools"
 
 OPT_SUBCOMMAND=""
 OPT_ESP_OVERRIDE=""
@@ -52,7 +51,7 @@ _register_subcommands() {
         --offline-capable "true" \
         --requires-root "false" \
         --see-also "inventory, clean, lamboot-diagnose" \
-        --doc-url "https://lamboot.dev/tools/esp/check" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "stable"
 
     register_subcommand \
@@ -66,7 +65,7 @@ _register_subcommands() {
         --offline-capable "true" \
         --requires-root "false" \
         --see-also "check, clean" \
-        --doc-url "https://lamboot.dev/tools/esp/inventory" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "stable"
 
     register_subcommand \
@@ -83,7 +82,7 @@ _register_subcommands() {
         --offline-capable "true" \
         --requires-root "true" \
         --see-also "check, inventory" \
-        --doc-url "https://lamboot.dev/tools/esp/clean" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "stable"
 
     register_subcommand \
@@ -103,7 +102,7 @@ _register_subcommands() {
         --offline-capable "true" \
         --requires-root "true" \
         --see-also "check, inventory, clean, lamboot-repair" \
-        --doc-url "https://lamboot.dev/tools/esp/deploy" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" \
         --maturity "stable"
 }
 
@@ -929,7 +928,7 @@ parse_args() {
             2) _register_subcommands; dispatch_help; exit 0 ;;
             3) printf 'lamboot-esp %s (lamboot-tools %s)\n' \
                 "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
-            4) printf '{"$schema":"https://lamboot.dev/schemas/tools/v1"}\n'; exit 0 ;;
+            4) printf '{"$schema":"https://github.com/lamco-admin/lamboot-tools"}\n'; exit 0 ;;
             5) shift
                [[ $# -gt 0 ]] || die "--offline requires a disk path"
                offline_setup "$1"

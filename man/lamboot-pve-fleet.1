@@ -1,8 +1,8 @@
 .\" lamboot-pve-fleet(1) — auto-generated from help registry
 .\" Source: pve/tools/lamboot-pve-fleet
-.\" Generated: 2026-06-03T23:49:39Z
+.\" Generated: 2026-06-09T07:04:57Z
 .\" DO NOT EDIT — regenerate via `make man` or `scripts/registry-to-man`.
-.TH "LAMBOOT-PVE-FLEET" "1" "2026-06-03" "lamboot-pve-fleet 0.7.2" "lamboot-tools"
+.TH "LAMBOOT-PVE-FLEET" "1" "2026-06-09" "lamboot-pve-fleet 0.8.0" "lamboot-tools"
 .SH NAME
 lamboot-pve-fleet \- part of the lamboot-tools suite
 .SH SYNOPSIS
@@ -69,7 +69,7 @@ setup, status, report
 .B DOCUMENTATION URL
 .PP
 .RS 4
-.UR https://lamboot.dev/tools/pve-fleet/inventory
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 .RE
 .PP
@@ -145,7 +145,7 @@ inventory, status, lamboot\-pve\-setup
 .B DOCUMENTATION URL
 .PP
 .RS 4
-.UR https://lamboot.dev/tools/pve-fleet/setup
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 .RE
 .PP
@@ -196,7 +196,7 @@ inventory, report
 .B DOCUMENTATION URL
 .PP
 .RS 4
-.UR https://lamboot.dev/tools/pve-fleet/status
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 .RE
 .PP
@@ -248,7 +248,133 @@ status, inventory
 .B DOCUMENTATION URL
 .PP
 .RS 4
-.UR https://lamboot.dev/tools/pve-fleet/report
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.RE
+.PP
+.SS verify
+.PP
+.I Run guest\-side migration/boot verification inside one or all VMs
+.PP
+.B Category:
+Fleet
+.br
+.B Maturity:
+draft
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-pve\-fleet verify [VMID|\-\-all] [\-\-json]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B VMID
+A single Proxmox VMID (omit with \-\-all)
+.TP
+.B \-\-all
+Verify every LamBoot\-integrated, running VM
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+lamboot\-pve\-fleet verify 129
+lamboot\-pve\-fleet verify \-\-all \-\-json
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Runs \'lamboot\-migrate verify\' inside the guest via the QEMU guest agent and folds the result into the fleet report. Requires the guest agent (agent: 1) and the guest tools installed. Read\-only in the guest.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Requires root (sudo)
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+inventory, status, exec
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.RE
+.PP
+.SS exec
+.PP
+.I Run a lamboot guest tool inside a VM from the host
+.PP
+.B Category:
+Fleet
+.br
+.B Maturity:
+draft
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-pve\-fleet exec VMID \-\- TOOL [ARGS ...]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B VMID
+Proxmox VMID
+.TP
+.B TOOL [ARGS ...]
+A lamboot\-* guest tool and its arguments (after \-\-)
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+lamboot\-pve\-fleet exec 129 \-\- lamboot\-inspect summary
+lamboot\-pve\-fleet exec 129 \-\- lamboot\-migrate status \-\-json
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Runs the named tool inside the guest via the QEMU guest agent and streams its output. Restricted to lamboot\-* tools (the host does not become an arbitrary remote shell). Requires the guest agent.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Requires root (sudo)
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+verify, status
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 .RE
 .PP
@@ -350,7 +476,7 @@ When set (to any value), disables ANSI color (freedesktop convention).
 .BR lamboot-signing-keys (1)
 .PP
 Full documentation at
-.UR https://lamboot.dev/tools/
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 .SH AUTHORS
 The lamboot-tools suite is developed by

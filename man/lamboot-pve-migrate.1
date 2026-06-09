@@ -1,0 +1,398 @@
+.\" lamboot-pve-migrate(1) — auto-generated from help registry
+.\" Source: pve/tools/lamboot-pve-migrate
+.\" Generated: 2026-06-09T07:04:58Z
+.\" DO NOT EDIT — regenerate via `make man` or `scripts/registry-to-man`.
+.TH "LAMBOOT-PVE-MIGRATE" "1" "2026-06-09" "lamboot-pve-migrate 0.1.0" "lamboot-tools"
+.SH NAME
+lamboot-pve-migrate \- part of the lamboot-tools suite
+.SH SYNOPSIS
+.B lamboot-pve-migrate
+[\fIGLOBAL FLAGS\fR] [\fISUBCOMMAND\fR] [\fIARGS\fR]
+.SH DESCRIPTION
+lamboot-pve-migrate is part of
+.BR lamboot-tools (7),
+"The Linux UEFI boot toolkit." See that page for suite-level conventions
+and cross-tool composition.
+.PP
+This page documents every subcommand registered in lamboot-pve-migrate's help
+registry. Every subcommand is also accessible via
+.BI "lamboot-pve-migrate help " SUBCOMMAND
+at runtime.
+.SH SUBCOMMANDS
+.SS snapshot
+.PP
+.I Take a pre\-migration hypervisor snapshot (the authoritative rollback)
+.PP
+.B Category:
+Migration
+.br
+.B Maturity:
+draft
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-pve\-migrate snapshot VMID [\-\-name NAME] [\-\-json]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B VMID
+Proxmox VMID
+.TP
+.B \-\-name NAME
+Snapshot name (default: pre_uefi_migration)
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-pve\-migrate snapshot 129
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Quiesces via the guest agent when available. The hypervisor snapshot is the reliable migration rollback.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Requires root (sudo)
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+prep\-uefi, rollback
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.RE
+.PP
+.SS prep\-uefi
+.PP
+.I Prepare a VM for BIOS→UEFI migration (snapshot + OVMF/efidisk + method scaffolding)
+.PP
+.B Category:
+Migration
+.br
+.B Maturity:
+draft
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-pve\-migrate prep\-uefi VMID [\-\-method B|C] [\-\-storage POOL] [\-\-esp\-size MB] [\-\-iso VOLID] [\-\-no\-snapshot] [\-\-dry\-run] [\-\-yes] [\-\-json]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B VMID
+Proxmox VMID (must be powered off)
+.TP
+.B \-\-method B
+\-\-method B
+.TP
+.B C
+Migration method to scaffold for (default: B, live\-ISO chroot)
+.TP
+.B \-\-storage POOL
+Storage for the efidisk / ESP disk (default: derive from scsi0)
+.TP
+.B \-\-esp\-size MB
+Method C ESP disk size in MB (default: 550)
+.TP
+.B \-\-iso VOLID
+Method B live ISO volume to attach + boot first
+.TP
+.B \-\-no\-snapshot
+Skip the pre\-migration snapshot (not recommended)
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-pve\-migrate prep\-uefi 129 \-\-method B \-\-iso local:iso/ubuntu\-25.10\-desktop\-amd64.iso
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Sets machine=q35, bios=ovmf, adds efidisk0 (efitype=4m,pre\-enrolled\-keys=0). Method B attaches the ISO + boots it first; Method C adds a separate ESP disk. Requires the VM powered off; never powers it on.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Requires root (sudo)
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+snapshot, finalize\-uefi
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.RE
+.PP
+.SS finalize\-uefi
+.PP
+.I Finalize a VM after conversion (detach ISO, set boot order, seed fallback if needed)
+.PP
+.B Category:
+Migration
+.br
+.B Maturity:
+draft
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-pve\-migrate finalize\-uefi VMID [\-\-boot\-disk DEV] [\-\-seed\-fallback auto|always|never] [\-\-keep\-iso] [\-\-dry\-run] [\-\-yes] [\-\-json]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B VMID
+Proxmox VMID (must be powered off)
+.TP
+.B \-\-boot\-disk DEV
+Disk to boot (default: auto\-detect the converted root disk)
+.TP
+.B \-\-seed\-fallback MODE
+Seed \\EFI\\BOOT\\BOOTX64.EFI into the efidisk NVRAM — auto (only if empty), always, never (default: auto)
+.TP
+.B \-\-keep\-iso
+Leave the live ISO attached (default: detach)
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-pve\-migrate finalize\-uefi 129
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Detaches the live ISO, sets boot order to the converted disk, and — only when the efidisk NVRAM carries no boot entry — seeds the firmware\-removable fallback via virt\-fw\-vars. Requires the VM powered off; never powers it on.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Requires root (sudo)
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+prep\-uefi, lamboot\-nvram
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.RE
+.PP
+.SS rollback
+.PP
+.I Roll a VM back to its pre\-migration snapshot
+.PP
+.B Category:
+Migration
+.br
+.B Maturity:
+draft
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-pve\-migrate rollback VMID [\-\-name NAME] [\-\-yes] [\-\-json]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B VMID
+Proxmox VMID (must be powered off)
+.TP
+.B \-\-name NAME
+Snapshot to roll back to (default: pre_uefi_migration)
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-pve\-migrate rollback 129
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Restores the entire VM (disk + efidisk NVRAM) to the pre\-migration snapshot. Requires the VM powered off; never powers it off itself.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Requires root (sudo)
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+snapshot, prep\-uefi
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.RE
+.PP
+.SH GLOBAL FLAGS
+Every subcommand accepts these universal flags (documented in
+.BR lamboot-tools (7)):
+.TP
+.BR \-\-help ", " \-h
+Show inline help
+.TP
+.B \-\-version
+Print tool and toolkit version
+.TP
+.B \-\-json
+Emit unified JSON output (schema v1)
+.TP
+.B \-\-json-schema
+Print the JSON schema this tool emits
+.TP
+.BR \-\-verbose ", " \-v
+Informational output beyond the default
+.TP
+.BR \-\-quiet ", " \-q
+Only warnings and errors
+.TP
+.B \-\-no-color
+Disable ANSI color (auto on non-TTY)
+.TP
+.B \-\-dry-run
+Print planned actions without executing
+.TP
+.BR \-\-yes ", " \-y
+Answer yes to interactive prompts
+.TP
+.B \-\-force
+Skip safety checks (per-subcommand semantics)
+.TP
+.B \-\-auto
+Non-interactive full automation (implies \fB\-\-yes\fR)
+.TP
+.BI \-\-offline " DISK"
+Operate on an unmounted disk or image
+.TP
+.B \-\-suggest-next-command
+Print the recommended follow-up command
+.SH EXIT STATUS
+.TP
+.B 0
+Success
+.TP
+.B 1
+Fatal error
+.TP
+.B 2
+Partial \- some operations succeeded, some failed
+.TP
+.B 3
+Nothing to do (already in requested state)
+.TP
+.B 4
+Refused due to a safety check
+.TP
+.B 5
+User declined interactive confirmation
+.TP
+.B 6
+Operation does not apply to this system
+.TP
+.B 7
+Required tool or capability is missing
+.SH FILES
+.TP
+.I /usr/lib/lamboot-tools/lamboot-toolkit-lib.sh
+Shared library sourced by every tool
+.TP
+.I /usr/lib/lamboot-tools/lamboot-toolkit-help.sh
+Help registry driver
+.TP
+.I /var/backups/lamboot-*-<timestamp>/
+Per-run backup directory (when a tool mutates state)
+.SH ENVIRONMENT
+.TP
+.B LAMBOOT_LIB_DIR
+Override shared library directory (default:
+.IR /usr/lib/lamboot-tools ).
+.TP
+.B NO_COLOR
+When set (to any value), disables ANSI color (freedesktop convention).
+.SH SEE ALSO
+.BR lamboot-tools (7),
+.BR lamboot-toolkit (1),
+.BR lamboot-diagnose (1),
+.BR lamboot-esp (1),
+.BR lamboot-backup (1),
+.BR lamboot-repair (1),
+.BR lamboot-migrate (1),
+.BR lamboot-doctor (1),
+.BR lamboot-uki-build (1),
+.BR lamboot-signing-keys (1)
+.PP
+Full documentation at
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.SH AUTHORS
+The lamboot-tools suite is developed by
+.B Lamco Development LLC
+(https://lamco.io). Source:
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.SH LICENSE
+MIT OR Apache-2.0

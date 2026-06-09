@@ -3,7 +3,7 @@ Version:        0.7.3
 Release:        1%{?dist}
 Summary:        Automated Linux BIOS to UEFI and cross-bootloader migration tool
 License:        MIT OR Apache-2.0
-URL:            https://lamboot.dev/migrate/
+URL:            https://lamco.ai/products/lamboot-tools/
 Source0:        https://github.com/lamco-admin/%{name}/archive/v%{version}/%{name}-%{version}.tar.gz
 
 BuildArch:      noarch
@@ -62,7 +62,7 @@ Works on:
 Supports Proxmox VE VMs directly: three migration methods (pre-convert,
 live-chroot, add-ESP-disk) with auto-selection.
 
-Built by the authors of LamBoot (https://lamboot.dev). The complete
+Built by the authors of LamBoot (https://lamco.ai/products/lamboot-tools/). The complete
 [lamboot-tools](https://github.com/lamco-admin/lamboot-tools) suite
 provides additional diagnostic and repair utilities; this standalone
 package exists for users who want just the migration tool.

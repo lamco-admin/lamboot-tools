@@ -1,0 +1,295 @@
+#!/bin/bash
+# lamboot-pve-migrate — host-side BIOS→UEFI migration lifecycle for Proxmox VMs.
+#
+# The Proxmox-host companion to the guest-side `lamboot-migrate`. Turns the
+# manual `qm` + `virt-fw-vars` dance around a migration (the case studies'
+# "Next steps") into commands: snapshot → prep-uefi → (run guest migrate) →
+# finalize-uefi, with rollback.
+#
+# Power discipline (ABSOLUTE): this tool changes VM *configuration* and offline
+# *efidisk* state only. It NEVER starts, stops, resets, or reboots a VM — power
+# transitions are the operator's. Operations needing a stopped VM (firmware
+# change, snapshot rollback) refuse with EXIT_UNSAFE rather than powering off.
+#
+# shellcheck source=../../lib/lamboot-toolkit-lib.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-lib.sh"
+# shellcheck source=../../lib/lamboot-toolkit-help.sh
+source "${LAMBOOT_LIB_DIR:-/usr/lib/lamboot-tools}/lamboot-toolkit-help.sh"
+
+LAMBOOT_TOOL_NAME="lamboot-pve-migrate"
+LAMBOOT_TOOL_VERSION="0.1.0"
+
+OPT_SUBCOMMAND=""
+OPT_VMID=""
+OPT_NAME="pre_uefi_migration"
+OPT_METHOD="B"
+OPT_STORAGE=""
+OPT_ESP_SIZE_MB=550
+OPT_ISO=""
+OPT_NO_SNAPSHOT=0
+OPT_BOOT_DISK=""
+OPT_SEED_FALLBACK="auto"
+OPT_KEEP_ISO=0
+
+DOC_BASE="https://github.com/lamco-admin/lamboot-tools"
+_remediation_json() {
+    local id="$1" summary="$2" cmd="${3:-}"
+    local doc="${DOC_BASE}/${id//.//}"
+    local cmd_field="\"\""
+    [[ -n "$cmd" ]] && cmd_field="\"$(json_escape "$cmd")\""
+    printf '{"summary":"%s","command":%s,"doc_url":"%s"}' \
+        "$(json_escape "$summary")" "$cmd_field" "$doc"
+}
+
+# ── Help registry ─────────────────────────────────────────────────────────────
+_register_subcommands() {
+    register_subcommand \
+        --name "snapshot" --category "Migration" \
+        --summary "Take a pre-migration hypervisor snapshot (the authoritative rollback)" \
+        --syntax "lamboot-pve-migrate snapshot VMID [--name NAME] [--json]" \
+        --arg "VMID:Proxmox VMID" \
+        --arg "--name NAME:Snapshot name (default: pre_uefi_migration)" \
+        --example "sudo lamboot-pve-migrate snapshot 129" \
+        --notes "Quiesces via the guest agent when available. The hypervisor snapshot is the reliable migration rollback." \
+        --offline-capable "false" --requires-root "true" \
+        --see-also "prep-uefi, rollback" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" --maturity "draft"
+    register_subcommand \
+        --name "prep-uefi" --category "Migration" \
+        --summary "Prepare a VM for BIOS→UEFI migration (snapshot + OVMF/efidisk + method scaffolding)" \
+        --syntax "lamboot-pve-migrate prep-uefi VMID [--method B|C] [--storage POOL] [--esp-size MB] [--iso VOLID] [--no-snapshot] [--dry-run] [--yes] [--json]" \
+        --arg "VMID:Proxmox VMID (must be powered off)" \
+        --arg "--method B|C:Migration method to scaffold for (default: B, live-ISO chroot)" \
+        --arg "--storage POOL:Storage for the efidisk / ESP disk (default: derive from scsi0)" \
+        --arg "--esp-size MB:Method C ESP disk size in MB (default: 550)" \
+        --arg "--iso VOLID:Method B live ISO volume to attach + boot first" \
+        --arg "--no-snapshot:Skip the pre-migration snapshot (not recommended)" \
+        --example "sudo lamboot-pve-migrate prep-uefi 129 --method B --iso local:iso/ubuntu-25.10-desktop-amd64.iso" \
+        --notes "Sets machine=q35, bios=ovmf, adds efidisk0 (efitype=4m,pre-enrolled-keys=0). Method B attaches the ISO + boots it first; Method C adds a separate ESP disk. Requires the VM powered off; never powers it on." \
+        --offline-capable "false" --requires-root "true" \
+        --see-also "snapshot, finalize-uefi" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" --maturity "draft"
+    register_subcommand \
+        --name "finalize-uefi" --category "Migration" \
+        --summary "Finalize a VM after conversion (detach ISO, set boot order, seed fallback if needed)" \
+        --syntax "lamboot-pve-migrate finalize-uefi VMID [--boot-disk DEV] [--seed-fallback auto|always|never] [--keep-iso] [--dry-run] [--yes] [--json]" \
+        --arg "VMID:Proxmox VMID (must be powered off)" \
+        --arg "--boot-disk DEV:Disk to boot (default: auto-detect the converted root disk)" \
+        --arg "--seed-fallback MODE:Seed \\EFI\\BOOT\\BOOTX64.EFI into the efidisk NVRAM — auto (only if empty), always, never (default: auto)" \
+        --arg "--keep-iso:Leave the live ISO attached (default: detach)" \
+        --example "sudo lamboot-pve-migrate finalize-uefi 129" \
+        --notes "Detaches the live ISO, sets boot order to the converted disk, and — only when the efidisk NVRAM carries no boot entry — seeds the firmware-removable fallback via virt-fw-vars. Requires the VM powered off; never powers it on." \
+        --offline-capable "false" --requires-root "true" \
+        --see-also "prep-uefi, lamboot-nvram" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" --maturity "draft"
+    register_subcommand \
+        --name "rollback" --category "Migration" \
+        --summary "Roll a VM back to its pre-migration snapshot" \
+        --syntax "lamboot-pve-migrate rollback VMID [--name NAME] [--yes] [--json]" \
+        --arg "VMID:Proxmox VMID (must be powered off)" \
+        --arg "--name NAME:Snapshot to roll back to (default: pre_uefi_migration)" \
+        --example "sudo lamboot-pve-migrate rollback 129" \
+        --notes "Restores the entire VM (disk + efidisk NVRAM) to the pre-migration snapshot. Requires the VM powered off; never powers it off itself." \
+        --offline-capable "false" --requires-root "true" \
+        --see-also "snapshot, prep-uefi" \
+        --doc-url "https://github.com/lamco-admin/lamboot-tools" --maturity "draft"
+}
+
+# ── qm helpers ────────────────────────────────────────────────────────────────
+vm_exists()  { qm status "$1" >/dev/null 2>&1; }
+vm_running() { qm status "$1" 2>/dev/null | grep -q 'status: running'; }
+vm_cfg()     { qm config "$1" 2>/dev/null | sed -n "s/^$2: //p" | head -1; }
+
+require_vm() {
+    vm_exists "$OPT_VMID" || die_prerequisite "VM $OPT_VMID not found (qm status failed)"
+}
+
+# Power is the operator's. Refuse (EXIT_UNSAFE) rather than power off ourselves.
+require_stopped() {
+    if vm_running "$OPT_VMID"; then
+        emit_finding "pve_migrate.vm_running" "power" "critical" "fail" \
+            "VM $OPT_VMID is running" \
+            "This operation changes firmware/snapshot state and needs the VM powered off. Power transitions are the operator's responsibility — shut the VM down, then re-run." \
+            "{\"vmid\":\"$(json_escape "$OPT_VMID")\"}" \
+            "$(_remediation_json "pve_migrate.vm_running" "Power the VM off, then re-run" "qm shutdown $OPT_VMID")"
+        warn "VM $OPT_VMID is running — power it off first, then re-run. Power transitions are yours; this tool will not stop the VM."
+        emit_json "$EXIT_UNSAFE"
+        exit "$EXIT_UNSAFE"
+    fi
+}
+
+_storage_from_scsi0() {
+    local d; d=$(vm_cfg "$OPT_VMID" scsi0)
+    printf '%s' "${d%%:*}"
+}
+
+_efidisk_volid() { vm_cfg "$OPT_VMID" efidisk0 | sed 's/,.*//'; }
+
+# ── subcommands ───────────────────────────────────────────────────────────────
+do_snapshot() {
+    require_root; require_vm
+    if qm listsnapshot "$OPT_VMID" 2>/dev/null | grep -qE "\\b${OPT_NAME}\\b"; then
+        emit_finding "pve_migrate.snapshot.exists" "snapshot" "info" "pass" \
+            "Snapshot '$OPT_NAME' already exists" "" "{\"vmid\":\"$OPT_VMID\",\"name\":\"$OPT_NAME\"}" '{}'
+        info "Snapshot '$OPT_NAME' already present on VM $OPT_VMID."
+        emit_json "$EXIT_NOOP"; exit "$EXIT_NOOP"
+    fi
+    lamboot_run qm snapshot "$OPT_VMID" "$OPT_NAME" \
+        --description "Before BIOS->UEFI lamboot-migrate (lamboot-pve-migrate)" \
+        || die "qm snapshot failed"
+    record_action "pve_migrate.snapshot" "$OPT_VMID" "ok" "true" \
+        "{\"name\":\"$(json_escape "$OPT_NAME")\"}" "null"
+    success "Snapshot '$OPT_NAME' taken on VM $OPT_VMID."
+    emit_json "$EXIT_OK"; exit "$EXIT_OK"
+}
+
+do_prep_uefi() {
+    require_vm; require_stopped; require_root
+
+    local storage="${OPT_STORAGE:-$(_storage_from_scsi0)}"
+    [[ -n "$storage" ]] || die "could not determine storage; pass --storage POOL"
+
+    info "Phase 1 — snapshot"
+    if [[ $OPT_NO_SNAPSHOT -eq 0 ]]; then
+        if ! qm listsnapshot "$OPT_VMID" 2>/dev/null | grep -qE "\\b${OPT_NAME}\\b"; then
+            lamboot_run qm snapshot "$OPT_VMID" "$OPT_NAME" \
+                --description "Before BIOS->UEFI lamboot-migrate" || die "snapshot failed"
+            record_action "pve_migrate.snapshot" "$OPT_VMID" "ok" "true" "{\"name\":\"$OPT_NAME\"}" "null"
+        fi
+    fi
+
+    info "Phase 2 — firmware: q35 + OVMF + efidisk"
+    lamboot_run qm set "$OPT_VMID" --machine q35 --bios ovmf || die "qm set machine/bios failed"
+    if [[ -z "$(_efidisk_volid)" ]]; then
+        lamboot_run qm set "$OPT_VMID" --efidisk0 "${storage}:1,efitype=4m,pre-enrolled-keys=0" \
+            || die "qm set efidisk0 failed"
+        record_action "pve_migrate.efidisk" "$OPT_VMID" "ok" "true" "{\"storage\":\"$storage\"}" "null"
+    fi
+
+    case "$OPT_METHOD" in
+        B)
+            info "Phase 3 — Method B: attach live ISO, boot it first"
+            [[ -n "$OPT_ISO" ]] || die "Method B requires --iso VOLID (the UEFI live ISO)"
+            lamboot_run qm set "$OPT_VMID" --ide2 "${OPT_ISO},media=cdrom" || die "qm set ide2 failed"
+            lamboot_run qm set "$OPT_VMID" --boot "order=ide2" || die "qm set boot failed"
+            record_action "pve_migrate.iso" "$OPT_VMID" "ok" "true" "{\"iso\":\"$(json_escape "$OPT_ISO")\"}" "null"
+            ;;
+        C)
+            info "Phase 3 — Method C: add a separate ESP disk"
+            local gb=$(( (OPT_ESP_SIZE_MB + 1023) / 1024 )); (( gb < 1 )) && gb=1
+            lamboot_run qm set "$OPT_VMID" --scsi9 "${storage}:${gb}" || die "qm set scsi9 (ESP disk) failed"
+            record_action "pve_migrate.esp_disk" "$OPT_VMID" "ok" "true" "{\"storage\":\"$storage\",\"gb\":$gb}" "null"
+            ;;
+        *) die "unknown --method '$OPT_METHOD' (use B or C)" ;;
+    esac
+
+    emit_finding "pve_migrate.prep.done" "prep" "info" "pass" \
+        "VM $OPT_VMID prepared for Method $OPT_METHOD migration" \
+        "Power the VM on to boot $([ "$OPT_METHOD" = B ] && echo 'the live ISO' || echo 'and run the migration'); then run the guest-side lamboot-migrate." \
+        "{\"vmid\":\"$OPT_VMID\",\"method\":\"$OPT_METHOD\"}" '{}'
+    success "Prep complete. Power on the VM yourself, then run guest-side lamboot-migrate."
+    emit_json "$EXIT_OK"; exit "$EXIT_OK"
+}
+
+do_finalize_uefi() {
+    require_vm; require_stopped; require_root
+
+    info "Phase 1 — detach ISO + set boot order"
+    if [[ $OPT_KEEP_ISO -eq 0 ]] && [[ -n "$(vm_cfg "$OPT_VMID" ide2)" ]]; then
+        lamboot_run qm set "$OPT_VMID" --ide2 none,media=cdrom || warn "could not clear ide2"
+    fi
+    local disk="${OPT_BOOT_DISK:-scsi0}"
+    [[ -n "$(vm_cfg "$OPT_VMID" "$disk")" ]] || die "boot disk '$disk' not on VM $OPT_VMID (pass --boot-disk)"
+    lamboot_run qm set "$OPT_VMID" --boot "order=${disk}" || die "qm set boot order failed"
+    record_action "pve_migrate.boot_order" "$OPT_VMID" "ok" "true" "{\"disk\":\"$disk\"}" "null"
+
+    info "Phase 2 — efidisk NVRAM fallback seeding ($OPT_SEED_FALLBACK)"
+    local volid path seeded="skipped"
+    volid="$(_efidisk_volid)"
+    if [[ -n "$volid" ]] && command -v virt-fw-vars >/dev/null 2>&1 && command -v pvesm >/dev/null 2>&1; then
+        path="$(pvesm path "$volid" 2>/dev/null)"
+        local has_entry=0
+        if [[ -n "$path" ]] && virt-fw-vars --input "$path" --print 2>/dev/null | grep -qiE 'FilePath|boot entry'; then
+            has_entry=1
+        fi
+        if [[ "$OPT_SEED_FALLBACK" == "always" ]] || { [[ "$OPT_SEED_FALLBACK" == "auto" ]] && [[ $has_entry -eq 0 ]]; }; then
+            if [[ -n "$path" ]]; then
+                lamboot_run virt-fw-vars --inplace "$path" --append-boot-filepath '/EFI/BOOT/BOOTX64.EFI' \
+                    && seeded="seeded" || warn "virt-fw-vars seeding failed"
+                record_action "pve_migrate.seed_fallback" "$volid" "ok" "true" "{\"mode\":\"$OPT_SEED_FALLBACK\"}" "null"
+            fi
+        elif [[ $has_entry -eq 1 ]]; then
+            seeded="not-needed (efidisk already has boot entries)"
+        fi
+    fi
+
+    emit_finding "pve_migrate.finalize.done" "finalize" "info" "pass" \
+        "VM $OPT_VMID finalized (boot=$disk, fallback=$seeded)" \
+        "Power the VM on to boot the converted system; then run 'sudo lamboot-migrate verify' inside it." \
+        "{\"vmid\":\"$OPT_VMID\",\"boot_disk\":\"$disk\",\"fallback\":\"$(json_escape "$seeded")\"}" '{}'
+    success "Finalize complete (boot order $disk; fallback: $seeded). Power on the VM yourself."
+    emit_json "$EXIT_OK"; exit "$EXIT_OK"
+}
+
+do_rollback() {
+    require_vm; require_stopped; require_root
+    qm listsnapshot "$OPT_VMID" 2>/dev/null | grep -qE "\\b${OPT_NAME}\\b" \
+        || die_prerequisite "snapshot '$OPT_NAME' not found on VM $OPT_VMID"
+    if ! confirm "ROLL BACK VM $OPT_VMID to snapshot '$OPT_NAME'" "yes"; then
+        emit_json "$EXIT_ABORT"; exit "$EXIT_ABORT"
+    fi
+    lamboot_run qm rollback "$OPT_VMID" "$OPT_NAME" || die "qm rollback failed"
+    record_action "pve_migrate.rollback" "$OPT_VMID" "ok" "true" "{\"name\":\"$OPT_NAME\"}" "null"
+    success "Rolled VM $OPT_VMID back to '$OPT_NAME'. Power it on yourself."
+    emit_json "$EXIT_OK"; exit "$EXIT_OK"
+}
+
+# ── arg parsing + dispatch ────────────────────────────────────────────────────
+parse_args() {
+    local positional=()
+    while [[ $# -gt 0 ]]; do
+        parse_common_flag "$1"
+        local rc=$?
+        case $rc in
+            1) shift; continue ;;
+            2) _register_subcommands; dispatch_help; exit 0 ;;
+            3) printf 'lamboot-pve-migrate %s (lamboot-tools %s)\n' \
+                "$LAMBOOT_TOOL_VERSION" "$LAMBOOT_TOOLKIT_VERSION"; exit 0 ;;
+            4) printf '{"$schema":"https://github.com/lamco-admin/lamboot-tools"}\n'; exit 0 ;;
+            5) shift; shift; continue ;;
+            0) ;;
+        esac
+        case "$1" in
+            --name)           OPT_NAME="${2:-}"; shift 2 ;;
+            --method)         OPT_METHOD="${2:-}"; shift 2 ;;
+            --storage)        OPT_STORAGE="${2:-}"; shift 2 ;;
+            --esp-size)       OPT_ESP_SIZE_MB="${2:-}"; shift 2 ;;
+            --iso)            OPT_ISO="${2:-}"; shift 2 ;;
+            --no-snapshot)    OPT_NO_SNAPSHOT=1; shift ;;
+            --boot-disk)      OPT_BOOT_DISK="${2:-}"; shift 2 ;;
+            --seed-fallback)  OPT_SEED_FALLBACK="${2:-}"; shift 2 ;;
+            --keep-iso)       OPT_KEEP_ISO=1; shift ;;
+            snapshot|prep-uefi|finalize-uefi|rollback|help)
+                if [[ -z "$OPT_SUBCOMMAND" ]]; then OPT_SUBCOMMAND="$1"; else positional+=("$1"); fi
+                shift ;;
+            -*)               die "unknown option: $1" ;;
+            *)                positional+=("$1"); shift ;;
+        esac
+    done
+    OPT_VMID="${positional[0]:-}"
+}
+
+main() {
+    parse_args "$@"
+    [[ -n "$OPT_SUBCOMMAND" ]] || { _register_subcommands; dispatch_help; exit "$EXIT_ERROR"; }
+    case "$OPT_SUBCOMMAND" in
+        snapshot)      [[ -n "$OPT_VMID" ]] || die "snapshot requires VMID";      do_snapshot ;;
+        prep-uefi)     [[ -n "$OPT_VMID" ]] || die "prep-uefi requires VMID";     do_prep_uefi ;;
+        finalize-uefi) [[ -n "$OPT_VMID" ]] || die "finalize-uefi requires VMID"; do_finalize_uefi ;;
+        rollback)      [[ -n "$OPT_VMID" ]] || die "rollback requires VMID";      do_rollback ;;
+        help)          _register_subcommands; dispatch_help "$OPT_VMID"; exit 0 ;;
+        *)             die "unknown subcommand: $OPT_SUBCOMMAND (snapshot|prep-uefi|finalize-uefi|rollback)" ;;
+    esac
+}
+
+main "$@"

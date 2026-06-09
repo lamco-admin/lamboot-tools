@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""lamboot-nvram — UEFI NVRAM (Boot####) hygiene.
+
+Thin entry-point shim. All logic lives in the lamboot_nvram package, which
+shares lamboot_toolkit (the toolkit's Python infra: envelope, registry, exit
+codes). Both packages sit beside this script, so the resolved script directory
+is placed on sys.path and both import in every layout (source checkout,
+installed under $LIBDIR, or symlinked onto PATH).
+"""
+import os
+import sys
+
+
+def _bootstrap() -> None:
+    here = os.path.dirname(os.path.realpath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+
+
+def _require_python(major: int, minor: int) -> None:
+    if sys.version_info < (major, minor):
+        sys.stderr.write(
+            f"lamboot-nvram requires Python {major}.{minor} or newer "
+            f"(found {sys.version_info.major}.{sys.version_info.minor})\n"
+        )
+        raise SystemExit(7)  # EXIT_PREREQUISITE
+
+
+_require_python(3, 8)
+_bootstrap()
+
+from lamboot_nvram.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,5 +1,5 @@
 .\" lamboot-tools-schema(5) — unified JSON output reference
-.TH "LAMBOOT-TOOLS-SCHEMA" "5" "2026-04-22" "lamboot-tools 0.7.12" "lamboot-tools"
+.TH "LAMBOOT-TOOLS-SCHEMA" "5" "2026-06-08" "lamboot-tools 0.9.1" "lamboot-tools"
 .SH NAME
 lamboot-tools-schema \- unified JSON output schema v1 for lamboot-tools
 .SH DESCRIPTION
@@ -82,7 +82,7 @@ Each entry in \fBfindings[]\fR:
   "remediation": {
     "summary":   "<one-sentence plan>",
     "command":   "<suggested shell command>",
-    "doc_url":   "<https://lamboot.dev/tools/findings/.../...>"
+    "doc_url":   "<https://github.com/lamco-admin/lamboot-tools"
   }
 }
 .fi
@@ -141,7 +141,7 @@ subcommand may execute these after confirmation; not in v0.2 scope.
 .TP
 .B doc_url
 Always resolves to
-.UR https://lamboot.dev/tools/findings/
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 sub-path. Every dotted-path ID has a permanent URL.
 .SH ACTIONS
@@ -213,8 +213,8 @@ run (elided for brevity):
 {
   "schema_version": "v1",
   "tool": "lamboot-diagnose",
-  "version": "0.7.12",
-  "toolkit_version": "0.7.12",
+  "version": "0.7.3",
+  "toolkit_version": "0.9.1",
   "timestamp": "2026-04-22T14:37:22Z",
   "host": "laptop-01",
   "run_id": "2026-04-22T14-37-22-a1b2c3",
@@ -238,7 +238,7 @@ run (elided for brevity):
       "remediation": {
         "summary": "Remove stale kernel images to free space",
         "command": "sudo lamboot-esp clean --dry-run",
-        "doc_url": "https://lamboot.dev/tools/findings/esp/free_space"
+        "doc_url": "https://github.com/lamco-admin/lamboot-tools"
       }
     }
   ],

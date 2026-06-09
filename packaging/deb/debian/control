@@ -1,0 +1,47 @@
+Source: lamboot-tools
+Section: admin
+Priority: optional
+Maintainer: Lamco Development LLC <office@lamco.io>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Homepage: https://lamco.ai/products/lamboot-tools/
+Rules-Requires-Root: no
+Vcs-Browser: https://github.com/lamco-admin/lamboot-tools
+Vcs-Git: https://github.com/lamco-admin/lamboot-tools.git
+
+Package: lamboot-tools
+Architecture: amd64 arm64
+Depends: ${misc:Depends},
+         bash (>= 4.0),
+         python3,
+         gawk,
+         efibootmgr,
+         dosfstools
+Recommends: gdisk,
+            jq,
+            rsync,
+            file,
+            mokutil,
+            sbsigntool
+Suggests: qemu-utils,
+          tpm2-tools,
+          systemd-ukify
+Description: Linux UEFI boot toolkit: diagnose, repair, migrate
+ lamboot-tools is a CLI suite for diagnosing, repairing, migrating, and
+ maintaining UEFI boot configurations on Linux. It treats GRUB, systemd-boot,
+ rEFInd, Limine, and LamBoot as first-class peers and works on any UEFI system
+ regardless of the installed bootloader.
+ .
+ Tools: lamboot-diagnose (boot-chain scanner), lamboot-esp (ESP health and
+ cleanup), lamboot-backup (boot-config snapshot/restore), lamboot-repair
+ (online and offline repair), lamboot-migrate (BIOS to UEFI conversion),
+ lamboot-doctor (guided diagnose-repair-verify), lamboot-uki-build (Unified
+ Kernel Image builder), lamboot-signing-keys (Secure Boot key lifecycle),
+ lamboot-toolkit (suite dispatcher), and lamboot-inspect (LamBoot deep
+ introspection, Python). Every tool emits structured JSON on a stable schema.
+ .
+ This package bundles the prebuilt, statically linked component binaries
+ lamboot-capcheck (firmware and platform capability auditor) and lamboot-reader
+ (GRUB configuration reader). Because of those bundled binaries this package is
+ distributed from the Lamco apt repository only; it is not eligible for Debian
+ main, which requires building all binaries from source.

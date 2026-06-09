@@ -1,12 +1,12 @@
 #!/bin/bash
 # download-fixtures.sh — fetch fixture disk images from hosting
 #
-# Fetches images from $FIXTURES_BASE_URL (default: https://fixtures.lamboot.dev/)
+# Fetches images from $FIXTURES_BASE_URL (default: https://github.com/lamco-admin/lamboot-tools)
 # and verifies against tests/fixtures/fixtures.sha256. Re-run is idempotent:
 # already-present fixtures with matching SHA are skipped.
 #
 # Alternative sources (any one of these works):
-#   - FIXTURES_BASE_URL=https://fixtures.lamboot.dev   (public hosting, TBD)
+#   - FIXTURES_BASE_URL=https://github.com/lamco-admin/lamboot-tools   (public hosting, TBD)
 #   - FIXTURES_BASE_URL=rsync://pve.a.lamco.io/var/lib/lamboot-fixtures/  (internal)
 #   - FIXTURES_LOCAL_DIR=/var/lib/lamboot-fixtures     (copy from local path)
 #   - FIXTURES_SSH_HOST=pve.a.lamco.io + FIXTURES_SSH_PATH=/var/lib/lamboot-fixtures
@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-FIXTURES_BASE_URL="${FIXTURES_BASE_URL:-https://fixtures.lamboot.dev}"
+FIXTURES_BASE_URL="${FIXTURES_BASE_URL:-https://github.com/lamco-admin/lamboot-tools}"
 FIXTURES_LOCAL_DIR="${FIXTURES_LOCAL_DIR:-}"
 FIXTURES_SSH_HOST="${FIXTURES_SSH_HOST:-}"
 FIXTURES_SSH_PATH="${FIXTURES_SSH_PATH:-/var/lib/lamboot-fixtures}"

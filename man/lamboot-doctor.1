@@ -1,8 +1,8 @@
 .\" lamboot-doctor(1) — auto-generated from help registry
 .\" Source: tools/lamboot-doctor
-.\" Generated: 2026-06-03T23:49:38Z
+.\" Generated: 2026-06-09T07:04:57Z
 .\" DO NOT EDIT — regenerate via `make man` or `scripts/registry-to-man`.
-.TH "LAMBOOT-DOCTOR" "1" "2026-06-03" "lamboot-doctor 0.7.5" "lamboot-tools"
+.TH "LAMBOOT-DOCTOR" "1" "2026-06-09" "lamboot-doctor 0.8.0" "lamboot-tools"
 .SH NAME
 lamboot-doctor \- part of the lamboot-tools suite
 .SH SYNOPSIS
@@ -97,7 +97,138 @@ lamboot\-diagnose, lamboot\-repair, lamboot\-esp, lamboot\-migrate
 .B DOCUMENTATION URL
 .PP
 .RS 4
-.UR https://lamboot.dev/tools/doctor
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.RE
+.PP
+.SS clean
+.PP
+.I Guided, reversible cleanup of ESP and NVRAM (dry\-run by default)
+.PP
+.B Category:
+Maintenance
+.br
+.B Maturity:
+draft
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-doctor clean [\-\-apply] [\-\-only esp,nvram,boot] [\-\-category CAT] [\-\-backup\-dir DIR] [\-\-json] [\-\-yes]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B \-\-apply
+Perform the cleanup (default: preview only)
+.TP
+.B \-\-only LIST
+Restrict to surfaces: esp, nvram, boot (default: esp,nvram)
+.TP
+.B \-\-category CAT
+Pass a hygiene category through to the worker (e.g. duplicate)
+.TP
+.B \-\-backup\-dir DIR
+Override the backup directory (default: /var/backups/lamboot\-doctor\-<ts>)
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+lamboot\-doctor clean
+sudo lamboot\-doctor clean \-\-only nvram \-\-apply
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Orchestrates lamboot\-nvram clean (NVRAM) and lamboot\-esp clean (ESP files). Backs up before \-\-apply (NVRAM via lamboot\-nvram; ESP files copied into the backup dir by doctor) and logs every action to /var/log/lamboot/. Reverse with \'lamboot\-doctor restore\'. /boot kernel removal is package\-manager\-deferential (reported, never auto\-removed). Never removes the running kernel, active bootloader, or current/default boot entry.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Requires root (sudo)
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+restore, lamboot\-nvram, lamboot\-esp
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://github.com/lamco-admin/lamboot-tools
+.UE
+.RE
+.PP
+.SS restore
+.PP
+.I Reverse a previous \'clean\' from its backup directory
+.PP
+.B Category:
+Maintenance
+.br
+.B Maturity:
+draft
+.PP
+.B SYNTAX
+.PP
+.RS 4
+.nf
+lamboot\-doctor restore [\-\-backup\-dir DIR] [\-\-only esp,nvram] [\-\-json] [\-\-yes]
+.fi
+.RE
+.PP
+.B ARGUMENTS
+.PP
+.RS 4
+.TP
+.B \-\-backup\-dir DIR
+Backup to restore (default: most recent /var/backups/lamboot\-doctor\-*)
+.TP
+.B \-\-only LIST
+Restrict restore to surfaces: esp, nvram
+.RE
+.PP
+.B EXAMPLES
+.PP
+.RS 4
+.nf
+sudo lamboot\-doctor restore
+.fi
+.RE
+.PP
+.B NOTES
+.PP
+.RS 4
+Reads MANIFEST.json in the backup dir, copies removed ESP files back, and runs \'lamboot\-nvram restore\' to re\-create removed boot entries. Idempotent; logs every action.
+.RE
+.PP
+.B OFFLINE:
+No \- requires online system
+.br
+.B PRIVILEGE:
+Requires root (sudo)
+.PP
+.B SEE ALSO
+.PP
+.RS 4
+clean
+.RE
+.PP
+.B DOCUMENTATION URL
+.PP
+.RS 4
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 .RE
 .PP
@@ -199,7 +330,7 @@ When set (to any value), disables ANSI color (freedesktop convention).
 .BR lamboot-signing-keys (1)
 .PP
 Full documentation at
-.UR https://lamboot.dev/tools/
+.UR https://github.com/lamco-admin/lamboot-tools
 .UE
 .SH AUTHORS
 The lamboot-tools suite is developed by
